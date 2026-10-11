@@ -1,7 +1,10 @@
 """OpenAI-compatible streaming TTS server for VoxCPM2, built around voice cloning.
 
-    NANOVLLM_VOXCPM2_TURBO='{...}' python -m nanovllm_voxcpm.entrypoints.openai_server \
-        --model /path/to/VoxCPM2 --voice-dir /path/to/voices --port 8092
+    python -m nanovllm_voxcpm.entrypoints.openai_server --model <model dir or repo id> \
+        --dit <distilled LocDiT, path or repo:file> --voice-dir /path/to/voices --port 8092
+
+(or NANOVLLM_VOXCPM2_TURBO='{...}' for a configuration of its own). A model with an ``adapters/`` directory serves its
+adapters (see LoRA below).
 
 Endpoints (request shapes follow vLLM-Omni's, so one client can drive both servers):
 
@@ -44,6 +47,8 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, ValidationError
+
+from nanovllm_voxcpm.dialect_tts import DEFAULT_MODEL, adapters_lora_config, find_adapters, resolve, turbo_config
 
 CLONE_MODES = ("prompt_ref", "ref", "prompt")
 VOICE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # voice names are also file names in --voice-dir
@@ -130,51 +135,6 @@ class SpeechRequest(BaseModel):
     dialect: str | None = None  # alias of lora
 
 
-def find_adapters(lora_dir: str | None, extra: list[str]) -> dict[str, str]:
-    """Adapter name -> directory: the subdirectories of ``lora_dir`` holding ``lora_weights.safetensors``, plus
-    ``NAME=PATH`` items."""
-    out: dict[str, str] = {}
-    if lora_dir:
-        for name in sorted(os.listdir(lora_dir)):
-            path = os.path.join(lora_dir, name)
-            if os.path.isfile(os.path.join(path, "lora_weights.safetensors")):
-                out[name] = path
-    for item in extra:
-        name, sep, path = item.partition("=")
-        if not sep or not name or not os.path.isdir(path):
-            raise SystemExit(f"--lora expects NAME=DIRECTORY, got {item!r}")
-        out[name] = path
-    return out
-
-
-def adapters_lora_config(adapters: dict[str, str], max_rank: int | None):
-    """The engine's LoRAConfig for ``adapters`` (None without any): every adapter resident (max_loras = their
-    number), the largest rank, and the targets of their ``lora_config.json`` (they must agree)."""
-    if not adapters:
-        return None
-    from nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig
-
-    keys = ("enable_lm", "enable_dit", "enable_proj", "target_modules_lm", "target_modules_dit", "target_proj_modules")
-    shared, ranks = None, []
-    for name, path in adapters.items():
-        cfg = json.load(open(os.path.join(path, "lora_config.json"), encoding="utf-8")).get("lora_config", {})
-        ranks.append(int(cfg.get("r", cfg.get("rank", 0)) or 0))
-        targets = {k: sorted(cfg[k]) if isinstance(cfg.get(k), list) else cfg.get(k) for k in keys if k in cfg}
-        if shared is None:
-            shared = targets
-        elif targets != shared:
-            raise SystemExit(f"LoRA adapter {name!r} targets other modules than the others: {targets} vs {shared}")
-    fields = {k: v for k, v in (shared or {}).items() if v is not None}
-    # q/k/v in their natural order: the qkv LoRA expands straight into the packed output
-    for k in ("target_modules_lm", "target_modules_dit"):
-        if k in fields:
-            order = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-            fields[k] = sorted(fields[k], key=lambda t: order.index(t) if t in order else len(order))
-    if not fields.get("enable_proj"):
-        fields.pop("target_proj_modules", None)
-    return LoRAConfig(max_loras=len(adapters), max_lora_rank=max_rank or max(ranks) or 32, **fields)
-
-
 def pcm16(chunk: np.ndarray) -> bytes:
     if chunk.dtype == np.int16:  # engine started with pcm16_output (the default here)
         return chunk.tobytes()
@@ -225,13 +185,19 @@ def build_app(args: argparse.Namespace):
         if args.kv_blocks:
             os.environ["NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"] = str(args.kv_blocks)
         turbo = json.loads(os.environ.get("NANOVLLM_VOXCPM2_TURBO") or "{}")
+        if args.dit and not turbo:  # the low-latency configuration around the distilled LocDiT
+            turbo = turbo_config(args.dit, args.head_tokens)
         turbo.setdefault("pcm16_output", True)  # int16 from the GPU: half the bytes per chunk, no conversion here
         os.environ["NANOVLLM_VOXCPM2_TURBO"] = json.dumps(turbo)
-        adapters = find_adapters(args.lora_dir, args.lora)
+        model_path = resolve(args.model)
+        lora_dir = args.lora_dir
+        if lora_dir is None and os.path.isdir(os.path.join(model_path, "adapters")):  # e.g. one adapter per dialect
+            lora_dir = os.path.join(model_path, "adapters")
+        adapters = find_adapters(lora_dir, args.lora)
         if args.default_lora and args.default_lora not in adapters:
             raise SystemExit(f"--default-lora {args.default_lora!r} is not among the adapters {sorted(adapters)}")
         pool = VoxCPM.from_pretrained(
-            model=args.model,
+            model=model_path,
             devices=[0],
             inference_timesteps=args.inference_timesteps,
             max_num_seqs=args.max_num_seqs,
@@ -435,7 +401,10 @@ def build_app(args: argparse.Namespace):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--model", required=True, help="VoxCPM2 model directory or Hugging Face repo id")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="VoxCPM2 model directory or Hugging Face repo id")
+    ap.add_argument("--dit", help="distilled LocDiT checkpoint (path or repo:file): the low-latency configuration, "
+                                  "unless NANOVLLM_VOXCPM2_TURBO is set")
+    ap.add_argument("--head-tokens", type=int, default=8, help="with --dit: head start length in tokens (0 = off)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8092)
     ap.add_argument("--voices", help="JSON list of {id, wav, text?} registered at startup (if not in --voice-dir)")
@@ -449,7 +418,8 @@ def main():
     ap.add_argument("--kv-blocks", type=int, default=600, help="KV-cache blocks (0 = automatic sizing)")
     ap.add_argument("--inference-timesteps", type=int, default=10)
     ap.add_argument("--max-tokens", type=int, default=600, help="default cap on generated patches per sentence")
-    ap.add_argument("--lora-dir", help="register every subdirectory with a lora_weights.safetensors as an adapter")
+    ap.add_argument("--lora-dir", help="register every subdirectory with a lora_weights.safetensors as an adapter "
+                                       "(default: the model's adapters/)")
     ap.add_argument("--lora", action="append", default=[], metavar="NAME=PATH", help="register one more adapter")
     ap.add_argument("--default-lora", help="adapter for requests that name none (default: the base model)")
     ap.add_argument("--max-lora-rank", type=int, help="LoRA slot rank (default: the largest adapter rank)")
