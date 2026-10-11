@@ -3,14 +3,21 @@
 Fast voice-cloning text-to-speech for 11 Arabic dialects, built on [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2)
 and [`VoxCPM-Kernel/VoxCPM2-Arabic-Dialects`](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Dialects).
 
-## Speed
+## Results
 
-200 requests sent at the same time, each a different sentence, dialect and cloned voice (one NVIDIA A10):
+200 different Arabic dialect sentences sent at the same time, one NVIDIA A10:
 
-| | time to first audio (p95) |
-|---|---:|
-| base VoxCPM2 inference | 2174 ms |
-| **this library, voice cloning** | **~96 ms** |
+| | TTFA, 1 request | TTFA p95, 200 at once | WER | CER | speaker similarity | UTMOS |
+|---|---:|---:|---:|---:|---:|---:|
+| base VoxCPM2 | 93 ms | 2174 ms | 16.0 % | 6.3 % | – | 2.67 |
+| this library | 22 ms | 96 ms | 16.8 % | 6.9 % | – | 2.58 |
+| base VoxCPM2, voice cloning | 94 ms | 4464 ms | 17.1 % | 6.3 % | 0.95 | 2.96 |
+| **this library, voice cloning** | **23 ms** | **96 ms** | **14.7 %** | **6.0 %** | **0.92** | **2.95** |
+| this library, voice cloning with the reference transcript | 22 ms | 430 ms | 18.5 % | 7.7 % | 0.94 | 2.82 |
+
+TTFA: time to first audio. WER / CER: Whisper large-v3 on the 200 outputs (rows without cloning: mean of 4-8 runs).
+Speaker similarity: WavLM-SV to the reference clip; the cloning rows clone the same voice. Base VoxCPM2: the
+original inference (bf16, 6 CFG steps); with cloning it needed smaller batches to fit 200 requests in memory.
 
 ## Install
 
