@@ -20,6 +20,16 @@ Speaker similarity: WavLM-SV to the reference clip; the cloning rows clone the s
 `VoxCPM-Kernel/voxcpm-inference` (dq_engine, bf16, 6 CFG steps) on nano-vllm-voxcpm 2.0.4; with cloning it needed
 smaller batches to fit 200 requests in memory.
 
+Time to first audio (p95) with voice cloning, by the number of requests sent at the same time:
+
+| simultaneous requests | 1 | 8 | 16 | 64 | 128 | 256 |
+|---|---:|---:|---:|---:|---:|---:|
+| base inference | 93 ms | 188 ms | 364 ms | 1455 ms | 2838 ms | 5708 ms |
+| **this library** | **21 ms** | **24 ms** | **27 ms** | **43 ms** | **67 ms** | **123 ms** |
+
+Median over the measured rounds after a first warm-up round; this library clones 5 voices mixed, the base inference
+one voice.
+
 ## Install
 
 ```bash
