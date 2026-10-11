@@ -9,15 +9,16 @@ and [`VoxCPM-Kernel/VoxCPM2-Arabic-Dialects`](https://huggingface.co/VoxCPM-Kern
 
 | | TTFA, 1 request | TTFA p95, 200 at once | WER | CER | speaker similarity | UTMOS |
 |---|---:|---:|---:|---:|---:|---:|
-| base VoxCPM2 | 93 ms | 2174 ms | 16.0 % | 6.3 % | – | 2.67 |
+| base inference | 93 ms | 2174 ms | 16.0 % | 6.3 % | – | 2.67 |
 | this library | 22 ms | 96 ms | 16.8 % | 6.9 % | – | 2.58 |
-| base VoxCPM2, voice cloning | 94 ms | 4464 ms | 17.1 % | 6.3 % | 0.95 | 2.96 |
+| base inference, voice cloning | 94 ms | 4464 ms | 17.1 % | 6.3 % | 0.95 | 2.96 |
 | **this library, voice cloning** | **23 ms** | **96 ms** | **14.7 %** | **6.0 %** | **0.92** | **2.95** |
 | this library, voice cloning with the reference transcript | 22 ms | 430 ms | 18.5 % | 7.7 % | 0.94 | 2.82 |
 
 TTFA: time to first audio. WER / CER: Whisper large-v3 on the 200 outputs (rows without cloning: mean of 4-8 runs).
-Speaker similarity: WavLM-SV to the reference clip; the cloning rows clone the same voice. Base VoxCPM2: the
-original inference (bf16, 6 CFG steps); with cloning it needed smaller batches to fit 200 requests in memory.
+Speaker similarity: WavLM-SV to the reference clip; the cloning rows clone the same voice. Base inference:
+`VoxCPM-Kernel/voxcpm-inference` (dq_engine, bf16, 6 CFG steps) on nano-vllm-voxcpm 2.0.4; with cloning it needed
+smaller batches to fit 200 requests in memory.
 
 ## Install
 
