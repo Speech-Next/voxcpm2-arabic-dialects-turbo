@@ -31,6 +31,9 @@ LoRA adapters (e.g. one per dialect of a fine-tuned model): ``--lora-dir DIR`` r
 picks one with ``"lora"`` (alias ``"dialect"``) or by naming it as ``"model"`` (vLLM's convention; ``/v1/models``
 lists them); ``--default-lora`` serves requests that name none. A burst may mix adapters: every row of a step uses
 its own request's adapter. The voices' reference-prefix KV cache is kept per adapter (the adapter changes the KV).
+
+A model with a ``dialects.json`` (one model for all dialects, see DialectTags) has no adapters: ``"dialect"`` names a
+dialect (``/v1/models`` lists them), whose tag token is put in front of the text.
 """
 
 import argparse
@@ -48,7 +51,9 @@ import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, ValidationError
 
-from nanovllm_voxcpm.dialect_tts import DEFAULT_MODEL, adapters_lora_config, find_adapters, resolve, turbo_config
+from nanovllm_voxcpm.arabic_text import normalize as normalize_text
+from nanovllm_voxcpm.dialect_tts import (DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters, resolve,
+                                         turbo_config)
 
 CLONE_MODES = ("prompt_ref", "ref", "prompt")
 VOICE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # voice names are also file names in --voice-dir
@@ -132,7 +137,8 @@ class SpeechRequest(BaseModel):
     max_tokens: int | None = None  # latent patches to generate at most per sentence (160 ms of audio each)
     split: bool = True  # long input: sentence by sentence into one stream
     lora: str | None = None  # a registered LoRA adapter (--lora-dir / --lora)
-    dialect: str | None = None  # alias of lora
+    dialect: str | None = None  # alias of lora; a tagged model's dialect
+    normalize: bool = True  # digits, times, amounts, percentages as Arabic words (nanovllm_voxcpm.arabic_text)
 
 
 def pcm16(chunk: np.ndarray) -> bytes:
@@ -152,7 +158,7 @@ def wav_bytes(pcm: bytes, sample_rate: int) -> bytes:
 
 
 def build_app(args: argparse.Namespace):
-    state: dict = {"voices": {}}
+    state: dict = {"voices": {}, "tags": None}
 
     async def warm_up(names: list[str]) -> None:
         """One short generation per voice and clone mode: fills the voice's caches (prefix KV, LocEnc embeddings,
@@ -174,9 +180,15 @@ def build_app(args: argparse.Namespace):
         await state["pool"].register_voice(name, latents, text or None)
         if args.voice_dir:
             save_voice(args.voice_dir, name, latents, text or None, audio, audio_format)
-        state["voices"][name] = {"text": text or None, "created_at": int(time.time())}
+        state["voices"][name] = voice_entry(latents, text or None, int(time.time()))
         await warm_up([name])
         return {"name": name, "has_transcript": bool(text), "created_at": state["voices"][name]["created_at"]}
+
+    def voice_entry(latents: bytes, text: str | None, created_at) -> dict:
+        v = {"text": text, "created_at": created_at}
+        if state["tags"] is not None and text:
+            v["latents"] = latents  # its per-dialect copies are registered from these
+        return v
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -190,8 +202,9 @@ def build_app(args: argparse.Namespace):
         turbo.setdefault("pcm16_output", True)  # int16 from the GPU: half the bytes per chunk, no conversion here
         os.environ["NANOVLLM_VOXCPM2_TURBO"] = json.dumps(turbo)
         model_path = resolve(args.model)
+        state["tags"] = DialectTags.of_model(model_path)
         lora_dir = args.lora_dir
-        if lora_dir is None and os.path.isdir(os.path.join(model_path, "adapters")):  # e.g. one adapter per dialect
+        if lora_dir is None and state["tags"] is None and os.path.isdir(os.path.join(model_path, "adapters")):
             lora_dir = os.path.join(model_path, "adapters")
         adapters = find_adapters(lora_dir, args.lora)
         if args.default_lora and args.default_lora not in adapters:
@@ -215,7 +228,7 @@ def build_app(args: argparse.Namespace):
         if args.voice_dir:  # voices registered in earlier runs: latents are on disk, no re-encoding
             for meta, latents in load_voices(args.voice_dir):
                 await pool.register_voice(meta["name"], latents, meta.get("text"))
-                state["voices"][meta["name"]] = {"text": meta.get("text"), "created_at": meta.get("created_at")}
+                state["voices"][meta["name"]] = voice_entry(latents, meta.get("text"), meta.get("created_at"))
             await warm_up(list(state["voices"]))
         if args.voices:
             for v in json.load(open(args.voices, encoding="utf-8")):
@@ -223,7 +236,8 @@ def build_app(args: argparse.Namespace):
                     with open(v["wav"], "rb") as f:
                         await register(v["id"], f.read(), os.path.splitext(v["wav"])[1].lstrip(".") or "wav",
                                        v.get("text"))
-        print(f"[server] ready: {len(state['voices'])} voices, {len(state['adapters'])} LoRA adapters, "
+        dialects = f"{len(state['tags'].names)} dialects (tagged model), " if state["tags"] else ""
+        print(f"[server] ready: {len(state['voices'])} voices, {dialects}{len(state['adapters'])} LoRA adapters, "
               f"sample rate {state['sample_rate']}", flush=True)
         import gc
 
@@ -252,6 +266,8 @@ def build_app(args: argparse.Namespace):
     @app.get("/v1/models")
     async def models():
         base = [{"id": args.served_model_name, "object": "model", "owned_by": "local"}]
+        if state["tags"] is not None:
+            base[0]["dialects"] = state["tags"].names
         loras = [{"id": name, "object": "model", "owned_by": "local", "parent": args.served_model_name}
                  for name in state.get("adapters", [])]
         return {"object": "list", "data": base + loras}
@@ -279,6 +295,8 @@ def build_app(args: argparse.Namespace):
         if state["voices"].pop(name, None) is None:
             raise HTTPException(404, f"voice '{name}' not found")
         await state["pool"].unregister_voice(name)
+        if state["tags"] is not None:
+            await state["tags"].drop_voice(state["pool"], name)
         if args.voice_dir:
             delete_voice_files(args.voice_dir, name)
         return {"deleted": name}
@@ -298,10 +316,19 @@ def build_app(args: argparse.Namespace):
             raise HTTPException(400, f"clone_mode '{mode}' needs a voice registered with ref_text")
         return {"voice": req.voice, "clone_mode": mode}
 
+    def dialect_tag(req: SpeechRequest) -> str | None:
+        """A tagged model: the token of the request's dialect (None: no dialect)."""
+        if state["tags"] is None or req.dialect is None:
+            return None
+        try:
+            return state["tags"].tag(req.dialect)
+        except ValueError as e:
+            raise HTTPException(404, str(e)) from e
+
     def lora_kwargs(req: SpeechRequest) -> dict:
-        if req.lora and req.dialect and req.lora != req.dialect:
+        if state["tags"] is None and req.lora and req.dialect and req.lora != req.dialect:
             raise HTTPException(400, "lora and dialect name different adapters")
-        name = req.lora or req.dialect
+        name = req.lora if state["tags"] is not None else req.lora or req.dialect
         if name is None and req.model in state["adapters"]:
             name = req.model  # vLLM's convention: an adapter is selected as the model
         name = name or args.default_lora
@@ -319,12 +346,25 @@ def build_app(args: argparse.Namespace):
                     "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
         await send({"type": "http.response.body", "body": body})
 
-    async def synthesize(req: SpeechRequest, vk: dict):
-        """Audio chunks of the whole input: one engine request per sentence, in order."""
-        parts = split_text(req.input, args.split_max_chars) if req.split else [req.input]
+    async def synthesize(req: SpeechRequest, vk: dict, tag: str | None = None):
+        """Audio chunks of the whole input: one engine request per sentence, in order. tag: a tagged model's dialect
+        token, in front of every sentence (or of the transcript: prompt_ref clones the voice's copy for the tag)."""
+        text = req.input
+        if req.normalize:
+            dialect = state["tags"].canonical(req.dialect) if tag is not None else req.dialect
+            text = normalize_text(text, "msa" if dialect == "msa" else "colloquial")
+        parts = split_text(text, args.split_max_chars) if req.split else [text]
+        prefix = ""
+        if tag is not None:
+            if vk.get("clone_mode") in ("prompt_ref", "prompt"):  # the transcript comes first: the tag leads it
+                v = state["voices"][vk["voice"]]
+                vk = {**vk, "voice": await state["tags"].voice_copy(state["pool"], vk["voice"], tag, v["latents"],
+                                                                    v["text"])}
+            else:
+                prefix = tag
         for k, part in enumerate(parts):
             gen = state["pool"].generate(
-                target_text=part,
+                target_text=prefix + part,
                 cfg_value=req.cfg_value,
                 seed=None if req.seed is None else req.seed + k,
                 max_generate_length=req.max_tokens or args.max_tokens,
@@ -354,7 +394,7 @@ def build_app(args: argparse.Namespace):
                 raise HTTPException(400, "response_format must be 'pcm' or 'wav'")
             if not req.input.strip():
                 raise HTTPException(400, "input is empty")
-            gen = synthesize(req, {**voice_kwargs(req), **lora_kwargs(req)})
+            gen = synthesize(req, {**voice_kwargs(req), **lora_kwargs(req)}, dialect_tag(req))
             try:
                 first = await gen.__anext__()  # errors (e.g. a prompt too long) become HTTP errors
             except StopAsyncIteration:

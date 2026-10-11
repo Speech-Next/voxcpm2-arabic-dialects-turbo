@@ -1,7 +1,8 @@
 """Voice cloning with a model's dialect adapters, in the low-latency configuration.
 
 One engine holds every adapter of the model's ``adapters/`` directory; a voice is registered once from a reference
-clip and then cloned by name, mixed with any dialect in the same batch::
+clip and then cloned by name, mixed with any dialect in the same batch. A model with a ``dialects.json`` instead
+(one model for all dialects) is steered by a dialect tag token in front of the text, with no adapters::
 
     tts = await DialectTTS.load()                              # VoxCPM-Kernel/VoxCPM2-Arabic-Dialects
     await tts.add_voice("speaker", "reference.wav")            # text="<transcript>": prompt + reference cloning
@@ -13,6 +14,7 @@ clip and then cloned by name, mixed with any dialect in the same batch::
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import AsyncIterator
@@ -36,12 +38,14 @@ def resolve(spec: str) -> str:
     return snapshot_download(spec)
 
 
-def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | None = None) -> dict:
+def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | None = None, w8a8: bool = True) -> dict:
     """The measured low-latency configuration: distilled 2-step LocDiT (``dit``), int8 layers, head start of
     ``head_tokens`` tokens (0 = off), int16 audio chunks. dit_cache: with the original LocDiT (``dit`` None), reuse
-    its middle layers on some solver steps ("light", "medium" or a plan, see models/voxcpm2/dit_cache.py)."""
-    cfg = {"w8a8": True, "w8a8_targets": ["base_lm", "residual_lm", "feat_encoder", "feat_decoder"],
-           "pcm16_output": True, "head_tokens": head_tokens, "head_patches": 3}
+    its middle layers on some solver steps ("light", "medium" or a plan, see models/voxcpm2/dit_cache.py).
+    w8a8=False: bf16 layers (quality measurements of a model whose SmoothQuant statistics were not calibrated)."""
+    cfg = {"pcm16_output": True, "head_tokens": head_tokens, "head_patches": 3}
+    if w8a8:
+        cfg.update(w8a8=True, w8a8_targets=["base_lm", "residual_lm", "feat_encoder", "feat_decoder"])
     if dit and dit_cache:
         raise ValueError("dit_cache is for the original LocDiT (dit=None): the distilled one has no step to spare")
     if dit:
@@ -98,19 +102,73 @@ def adapters_lora_config(adapters: dict[str, str], max_rank: int | None = None):
     return LoRAConfig(max_loras=len(adapters), max_lora_rank=max_rank or max(ranks) or 32, **fields)
 
 
+class DialectTags:
+    """A tagged model's dialects (its ``dialects.json``: {"tags": {dialect: token}, "aliases": {name: dialect}}).
+
+    The dialect's tag token leads the text. A voice cloned with its transcript (``prompt_ref``, ``prompt``) has it
+    before the text, so there the tag leads the transcript instead: one copy of the voice per dialect,
+    ``<voice>@<tag>``, registered on first use."""
+
+    def __init__(self, spec: dict):
+        self.tags: dict[str, str] = spec["tags"]
+        self.aliases: dict[str, str] = spec.get("aliases", {})
+        self.names = sorted(self.tags) + sorted(self.aliases)
+        self._copies: dict[str, asyncio.Future] = {}  # copy name -> its registration (shared by concurrent requests)
+
+    @classmethod
+    def of_model(cls, path: str) -> "DialectTags | None":
+        spec = os.path.join(path, "dialects.json")
+        return cls(json.load(open(spec, encoding="utf-8"))) if os.path.exists(spec) else None
+
+    def canonical(self, dialect: str) -> str:
+        if dialect not in self.tags and dialect not in self.aliases:
+            raise ValueError(f"unknown dialect {dialect!r}; dialects: {', '.join(self.names)}")
+        return self.aliases.get(dialect, dialect)
+
+    def tag(self, dialect: str) -> str:
+        return self.tags[self.canonical(dialect)]
+
+    async def voice_copy(self, server, voice: str, tag: str, latents: bytes, transcript: str) -> str:
+        """The name of ``voice``'s copy whose transcript follows ``tag``, registered with the engine once."""
+        copy = f"{voice}@{tag}"
+        fut = self._copies.get(copy)
+        if fut is None:
+            fut = self._copies[copy] = asyncio.ensure_future(server.register_voice(copy, latents, tag + transcript))
+        try:
+            await asyncio.shield(fut)
+        except Exception:
+            if self._copies.get(copy) is fut:  # a failed registration is tried again by the next request
+                del self._copies[copy]
+            raise
+        return copy
+
+    async def drop_voice(self, server, voice: str) -> None:
+        """Unregister ``voice``'s copies."""
+        for copy in [c for c in self._copies if c.startswith(voice + "@")]:
+            fut = self._copies.pop(copy)
+            try:
+                await fut
+            except Exception:
+                continue
+            await server.unregister_voice(copy)
+
+
 class DialectTTS:
     """A running engine with a model's dialect adapters registered, and the voices added to it."""
 
-    def __init__(self, server, dialects: list[str], sample_rate: int):
+    def __init__(self, server, dialects: list[str], sample_rate: int, tags: dict | None = None):
+        """tags: a tagged model's dialects.json ({"tags": {dialect: token}, "aliases": {name: dialect}})."""
         self.server = server
-        self.dialects = dialects
         self.sample_rate = sample_rate
+        self.tags = DialectTags(tags) if tags else None
+        self.dialects = self.tags.names if tags else dialects
         self.voices: dict[str, bool] = {}  # name -> registered with a transcript
+        self._voice_src: dict[str, tuple[bytes, str]] = {}  # tagged models: latents and transcript of prompt_ref voices
 
     @classmethod
     async def load(cls, model: str = DEFAULT_MODEL, dit: str | None = DEFAULT_DIT, *, max_concurrency: int = 256,
                    head_tokens: int = 8, dit_cache: str | dict | None = None, gpu_memory_utilization: float = 0.85,
-                   kv_blocks: int = 600, device: int = 0) -> "DialectTTS":
+                   kv_blocks: int = 600, device: int = 0, w8a8: bool = True) -> "DialectTTS":
         """Start the engine on ``model`` (local directory or Hugging Face repo with ``adapters/<dialect>/``).
 
         dit: the distilled 2-step LocDiT (path or ``repo:file``; None = the model's own LocDiT, slower).
@@ -118,13 +176,16 @@ class DialectTTS:
         dit_cache: with dit=None, "light" or "medium": reuse the LocDiT's middle layers on 2 or 4 of its 9 steps.
         """
         # the engine process reads its configuration from the environment when it starts
-        os.environ["NANOVLLM_VOXCPM2_TURBO"] = json.dumps(turbo_config(dit, head_tokens, dit_cache))
+        os.environ["NANOVLLM_VOXCPM2_TURBO"] = json.dumps(turbo_config(dit, head_tokens, dit_cache, w8a8))
         if kv_blocks:
             os.environ["NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"] = str(kv_blocks)
         from nanovllm_voxcpm import VoxCPM
 
         path = resolve(model)
-        adapters = find_adapters(os.path.join(path, "adapters") if os.path.isdir(os.path.join(path, "adapters")) else None)
+        tags_path = os.path.join(path, "dialects.json")
+        tags = json.load(open(tags_path, encoding="utf-8")) if os.path.exists(tags_path) else None
+        adapters = {} if tags else find_adapters(
+            os.path.join(path, "adapters") if os.path.isdir(os.path.join(path, "adapters")) else None)
         server = VoxCPM.from_pretrained(
             model=path, devices=[device], max_num_seqs=max_concurrency, max_model_len=1024, max_num_batched_tokens=4096,
             gpu_memory_utilization=gpu_memory_utilization, lora_config=adapters_lora_config(adapters),
@@ -139,7 +200,7 @@ class DialectTTS:
 
         gc.collect()
         gc.freeze()
-        return cls(server, sorted(adapters), sample_rate)
+        return cls(server, sorted(adapters), sample_rate, tags)
 
     async def add_voice(self, name: str, audio: str | bytes, text: str | None = None, audio_format: str = "wav") -> None:
         """Register a voice from a reference clip (a file path or its bytes). With ``text`` (the clip's transcript)
@@ -152,24 +213,43 @@ class DialectTTS:
         latents = await self.server.encode_latents(audio, audio_format)
         await self.server.register_voice(name, latents, text or None)
         self.voices[name] = bool(text)
+        if self.tags is not None and text:
+            self._voice_src[name] = (latents, text)
 
     async def remove_voice(self, name: str) -> None:
         await self.server.unregister_voice(name)
         self.voices.pop(name, None)
+        self._voice_src.pop(name, None)
+        if self.tags is not None:
+            await self.tags.drop_voice(self.server, name)
 
     async def stream(self, text: str, dialect: str | None = None, voice: str | None = None, *,
                      clone_mode: str | None = None, seed: int | None = None, cfg_value: float = 2.0,
-                     max_patches: int = 600) -> AsyncIterator[np.ndarray]:
+                     max_patches: int = 600, normalize: bool = True) -> AsyncIterator[np.ndarray]:
         """Audio chunks (float32 in [-1, 1], ``sample_rate``) of ``text`` in ``dialect`` (None: the base model),
-        cloning ``voice`` (None: no cloning). max_patches: at most this many 160 ms patches."""
+        cloning ``voice`` (None: no cloning). max_patches: at most this many 160 ms patches. normalize: digits,
+        times, amounts and percentages read as words (arabic_text), formal for MSA, colloquial otherwise."""
         if dialect is not None and dialect not in self.dialects:
             raise ValueError(f"unknown dialect {dialect!r}; dialects: {', '.join(self.dialects)}")
+        if normalize:
+            from nanovllm_voxcpm.arabic_text import normalize as normalize_text
+
+            text = normalize_text(text, "msa" if dialect == "msa" else "colloquial")
         kw = {}
         if voice is not None:
             if voice not in self.voices:
                 raise ValueError(f"voice {voice!r} is not registered (add_voice)")
             kw = {"voice": voice, "clone_mode": clone_mode or ("prompt_ref" if self.voices[voice] else "ref")}
-        async for chunk in self.server.generate(target_text=text, lora_name=dialect, seed=seed, cfg_value=cfg_value,
+        lora = dialect
+        if self.tags is not None:
+            lora = None
+            if dialect is not None:
+                tag = self.tags.tag(dialect)
+                if kw.get("clone_mode") in ("prompt_ref", "prompt"):  # the transcript comes first: the tag leads it
+                    kw["voice"] = await self.tags.voice_copy(self.server, voice, tag, *self._voice_src[voice])
+                else:
+                    text = tag + text
+        async for chunk in self.server.generate(target_text=text, lora_name=lora, seed=seed, cfg_value=cfg_value,
                                                 max_generate_length=max_patches, **kw):
             # one pass to float32 (a burst's 200 first chunks reach their streams one after another)
             yield np.multiply(chunk, _INT16_SCALE, dtype=np.float32) if chunk.dtype == np.int16 else chunk

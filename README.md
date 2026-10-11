@@ -86,6 +86,10 @@ if __name__ == "__main__":  # the engine runs in a spawned process
 `audio` is 48 kHz mono float32; `tts.stream(...)` yields it chunk by chunk as it is generated. Dialects: `ab`,
 `egyptian`, `emirati`, `hejazi`, `hindi_english`, `iraqi`, `jordanian`, `najdi`, `palestinian`, `qatari`, `saudi`.
 
+Digits, decimals, times, amounts, percentages and phone numbers are read as Arabic words before synthesis ("الساعة
+3:30" → "الساعة ثلاثة وثلاثين دقيقة"; formal for `msa`, colloquial otherwise); `normalize=False` (server: `"normalize": false`)
+passes the text as it is.
+
 From the command line:
 
 ```bash

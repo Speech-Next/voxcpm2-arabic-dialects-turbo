@@ -149,6 +149,8 @@ class VoxCPM2Runner(BaseModelRunner):
             if turbo.dit_t_span is None and "schedule" in ckpt:
                 t_span = [float(ckpt["schedule"][0][0])] + [float(t - dt) for t, dt in ckpt["schedule"]]
                 self.model.feat_decoder.set_t_span(t_span)
+            if ckpt.get("mean_mode"):  # a student trained with its step sizes as input (the estimator's dt)
+                self.model.feat_decoder.mean_mode = True
             print(f"[turbo] loaded {n} distilled LocDiT tensors from {turbo.dit_checkpoint}", flush=True)
         if turbo.dit_first_t_span is not None:
             self.model.feat_decoder.first_t_span_override = torch.tensor(turbo.dit_first_t_span, dtype=torch.float32)

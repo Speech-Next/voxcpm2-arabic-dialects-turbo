@@ -18,6 +18,7 @@ from nanovllm_voxcpm.models.voxcpm2.utils import mask_multichar_chinese_tokens
 
 _SILENCE_RMS = 10 ** (-50 / 20)  # -50 dBFS
 _CJK = re.compile("[\u4e00-\u9fff]")  # the tokenizer wrapper splits multi-character Chinese tokens
+_LEADING_TAG = re.compile(r"<reserved_\d+>")  # a tagged model's dialect tag in front of the text
 
 
 def _is_silent(wave) -> bool:
@@ -470,6 +471,9 @@ class VoxCPM2Engine(LLMEngineBase):
         if offs is None:
             return None
         start = len(prompt_text)
+        tag = _LEADING_TAG.match(text, start)
+        if tag is not None:  # the head counts text, not the dialect tag in front of it
+            start = tag.end()
         first = next((k for k, o in enumerate(offs) if o[1] > start), len(ids))  # first token of the target
         if len(ids) - first <= self.head_tokens + self.head_min_rest:
             return None
