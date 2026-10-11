@@ -4,7 +4,7 @@
 
 --voice-text "<the reference's transcript>" clones by continuing the reference (prompt_ref) instead of from its
 timbre alone (ref). --model / --dit: local paths or Hugging Face ids (defaults: the dialect model and the distilled
-LocDiT).
+LocDiT). --dit-cache light|medium: the original LocDiT with block caching instead of the distilled one.
 """
 
 import argparse
@@ -17,7 +17,8 @@ from nanovllm_voxcpm.dialect_tts import DEFAULT_DIT, DEFAULT_MODEL
 
 
 async def main(args):
-    async with await DialectTTS.load(args.model, args.dit, max_concurrency=16) as tts:
+    dit = None if args.dit_cache else args.dit
+    async with await DialectTTS.load(args.model, dit, dit_cache=args.dit_cache, max_concurrency=16) as tts:
         await tts.add_voice("speaker", args.voice, text=args.voice_text)
         audio = await tts.synthesize(args.text, dialect=args.dialect, voice="speaker")
         sf.write(args.out, audio, tts.sample_rate)
@@ -34,4 +35,5 @@ if __name__ == "__main__":
     ap.add_argument("--out", default="out.wav")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--dit", default=DEFAULT_DIT)
+    ap.add_argument("--dit-cache", choices=["light", "medium"])
     asyncio.run(main(ap.parse_args()))

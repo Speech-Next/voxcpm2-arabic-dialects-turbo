@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -144,6 +144,9 @@ class TurboConfig(BaseModel):
     dit_t_span: Optional[List[float]] = None  # e.g. [1.0, 0.7071, 0.0]; read from the checkpoint if None
     # the first patch's grid (prefill), e.g. [1.0, 0.0]: fewer LocDiT solves before the first audio
     dit_first_t_span: Optional[List[float]] = None
+    # block caching across the LocDiT solver's steps (cache-dit's DBCache with a static step mask + TaylorSeer), e.g.
+    # {"fn": 2, "bn": 2, "mask": [1, 1, 0, 1, 0, 1, 0, 1, 1], "taylor": true}; see models/voxcpm2/dit_cache.py
+    dit_cache: Optional[Dict[str, Any]] = None
     # Head start (0 = off): a request whose text has more than head_tokens + head_min_rest tokens first generates
     # head_patches patches from a head of its text (a word-boundary prefix of at most head_tokens tokens; a clause
     # boundary when there is one), then continues with the whole text: the head's patches become prompt audio of a

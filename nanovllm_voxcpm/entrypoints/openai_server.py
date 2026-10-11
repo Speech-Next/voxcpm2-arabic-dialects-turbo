@@ -185,8 +185,8 @@ def build_app(args: argparse.Namespace):
         if args.kv_blocks:
             os.environ["NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"] = str(args.kv_blocks)
         turbo = json.loads(os.environ.get("NANOVLLM_VOXCPM2_TURBO") or "{}")
-        if args.dit and not turbo:  # the low-latency configuration around the distilled LocDiT
-            turbo = turbo_config(args.dit, args.head_tokens)
+        if (args.dit or args.dit_cache) and not turbo:  # the low-latency configuration
+            turbo = turbo_config(args.dit, args.head_tokens, args.dit_cache)
         turbo.setdefault("pcm16_output", True)  # int16 from the GPU: half the bytes per chunk, no conversion here
         os.environ["NANOVLLM_VOXCPM2_TURBO"] = json.dumps(turbo)
         model_path = resolve(args.model)
@@ -405,6 +405,9 @@ def main():
     ap.add_argument("--dit", help="distilled LocDiT checkpoint (path or repo:file): the low-latency configuration, "
                                   "unless NANOVLLM_VOXCPM2_TURBO is set")
     ap.add_argument("--head-tokens", type=int, default=8, help="with --dit: head start length in tokens (0 = off)")
+    ap.add_argument("--dit-cache", choices=["light", "medium"],
+                    help="instead of --dit: the original LocDiT, its middle layers reused on 2 (light) or 4 (medium) "
+                         "of its 9 steps")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8092)
     ap.add_argument("--voices", help="JSON list of {id, wav, text?} registered at startup (if not in --voice-dir)")

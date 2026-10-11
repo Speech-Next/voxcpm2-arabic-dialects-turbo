@@ -36,13 +36,20 @@ def resolve(spec: str) -> str:
     return snapshot_download(spec)
 
 
-def turbo_config(dit: str | None, head_tokens: int = 8) -> dict:
+def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | None = None) -> dict:
     """The measured low-latency configuration: distilled 2-step LocDiT (``dit``), int8 layers, head start of
-    ``head_tokens`` tokens (0 = off), int16 audio chunks."""
+    ``head_tokens`` tokens (0 = off), int16 audio chunks. dit_cache: with the original LocDiT (``dit`` None), reuse
+    its middle layers on some solver steps ("light", "medium" or a plan, see models/voxcpm2/dit_cache.py)."""
     cfg = {"w8a8": True, "w8a8_targets": ["base_lm", "residual_lm", "feat_encoder", "feat_decoder"],
            "pcm16_output": True, "head_tokens": head_tokens, "head_patches": 3}
+    if dit and dit_cache:
+        raise ValueError("dit_cache is for the original LocDiT (dit=None): the distilled one has no step to spare")
     if dit:
         cfg["dit_checkpoint"] = resolve(dit)
+    if dit_cache:
+        from nanovllm_voxcpm.models.voxcpm2.dit_cache import plan
+
+        cfg["dit_cache"] = plan(dit_cache)
     return cfg
 
 
@@ -102,15 +109,16 @@ class DialectTTS:
 
     @classmethod
     async def load(cls, model: str = DEFAULT_MODEL, dit: str | None = DEFAULT_DIT, *, max_concurrency: int = 256,
-                   head_tokens: int = 8, gpu_memory_utilization: float = 0.85, kv_blocks: int = 600,
-                   device: int = 0) -> "DialectTTS":
+                   head_tokens: int = 8, dit_cache: str | dict | None = None, gpu_memory_utilization: float = 0.85,
+                   kv_blocks: int = 600, device: int = 0) -> "DialectTTS":
         """Start the engine on ``model`` (local directory or Hugging Face repo with ``adapters/<dialect>/``).
 
         dit: the distilled 2-step LocDiT (path or ``repo:file``; None = the model's own LocDiT, slower).
         head_tokens: the first audio comes from the text's first <= head_tokens tokens (0 = from the whole text).
+        dit_cache: with dit=None, "light" or "medium": reuse the LocDiT's middle layers on 2 or 4 of its 9 steps.
         """
         # the engine process reads its configuration from the environment when it starts
-        os.environ["NANOVLLM_VOXCPM2_TURBO"] = json.dumps(turbo_config(dit, head_tokens))
+        os.environ["NANOVLLM_VOXCPM2_TURBO"] = json.dumps(turbo_config(dit, head_tokens, dit_cache))
         if kv_blocks:
             os.environ["NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"] = str(kv_blocks)
         from nanovllm_voxcpm import VoxCPM

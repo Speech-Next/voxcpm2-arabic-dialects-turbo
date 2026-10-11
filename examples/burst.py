@@ -39,7 +39,8 @@ async def burst(tts, texts, voices, shift=0) -> np.ndarray:
 async def main(args):
     sentences = [s.strip() for s in open(TEXTS, encoding="utf-8") if s.strip()]
     texts = [sentences[i % len(sentences)] for i in range(args.n)]
-    async with await DialectTTS.load(args.model, args.dit, max_concurrency=max(args.n, 16)) as tts:
+    dit = None if args.dit_cache else args.dit
+    async with await DialectTTS.load(args.model, dit, dit_cache=args.dit_cache, max_concurrency=max(args.n, 16)) as tts:
         voices = sorted(f[:-4] for f in os.listdir(args.voice_dir) if f.endswith(".wav"))
         for v in voices:
             await tts.add_voice(v, os.path.join(args.voice_dir, f"{v}.wav"))
@@ -56,4 +57,5 @@ if __name__ == "__main__":
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--dit", default=DEFAULT_DIT)
+    ap.add_argument("--dit-cache", choices=["light", "medium"], help="the original LocDiT with block caching instead")
     asyncio.run(main(ap.parse_args()))

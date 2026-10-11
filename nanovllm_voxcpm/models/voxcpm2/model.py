@@ -327,10 +327,14 @@ class Cpm4Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
-        self, input_embeds: torch.Tensor, positions: torch.Tensor, last_rows: torch.Tensor | None = None
+        self, input_embeds: torch.Tensor, positions: torch.Tensor, last_rows: torch.Tensor | None = None,
+        cache=None,
     ) -> torch.Tensor:
         """last_rows: return the output only at these rows (one per sequence, its last token). With fused layers
-        the last layer then computes K/V for every row but everything after attention only for these rows."""
+        the last layer then computes K/V for every row but everything after attention only for these rows.
+        cache: a DiTCache (the LocDiT across solver steps): the middle layers may reuse an earlier step's."""
+        if cache is not None:
+            return self.norm(cache.run(self.layers, positions, input_embeds))
         hidden_states = input_embeds
         residual = None
         last = getattr(self.layers[-1].forward, "last_rows", None) if last_rows is not None else None
@@ -364,6 +368,8 @@ class TimestepEmbedding(nn.Module):
 
 
 class VoxCPM2LocDiT(nn.Module):
+    dit_cache = None  # a DiTCache while UnifiedCFM solves with TurboConfig.dit_cache
+
     def __init__(self, config: MiniCPM4Config, in_channels: int = 64, lora_config: Optional[LoRAConfig] = None):
         super().__init__()
         self.in_channels = in_channels
@@ -409,7 +415,7 @@ class VoxCPM2LocDiT(nn.Module):
         mu = mu.view(x.size(0), -1, x.size(-1))
         hidden = torch.cat([mu, t.unsqueeze(1), cond, x], dim=1)
         position_ids = torch.arange(0, hidden.size(1), dtype=torch.long, device=hidden.device)
-        hidden = self.decoder(hidden, position_ids)
+        hidden = self.decoder(hidden, position_ids, cache=self.dit_cache)
         hidden = self.out_proj(hidden[:, prefix + mu.size(1) + 1 :, :])
         return hidden.transpose(1, 2).contiguous()
 
@@ -418,6 +424,7 @@ class UnifiedCFM(nn.Module):
     # turbo knobs; class defaults = the original solver (also for instances built without __init__)
     first_patch = False
     first_t_span_override = None  # the first patch's grid (TurboConfig.dit_first_t_span)
+    dit_cache_config = None  # TurboConfig.dit_cache: block caching across the solver's steps (dit_cache.py)
     cfg_steps = -1
     first_cfg_steps = -1
     t_span_override = None
@@ -447,6 +454,7 @@ class UnifiedCFM(nn.Module):
             self.set_t_span(turbo.dit_t_span)
         self.mean_mode = mean_mode
         self.estimator = estimator
+        self.dit_cache_config = turbo.dit_cache
 
     def set_t_span(self, t_span: list[float]) -> None:
         """Explicit Euler grid for a distilled estimator: every step evaluated, no CFG."""
@@ -496,7 +504,15 @@ class UnifiedCFM(nn.Module):
             cfg_steps=self.first_cfg_steps if self.first_patch else self.cfg_steps,
             zero_init_steps=0 if self.t_span_override is not None else -1,
         )
-        return solve_euler(inputs, config, self)
+        if not self.dit_cache_config:
+            return solve_euler(inputs, config, self)
+        from nanovllm_voxcpm.models.voxcpm2.dit_cache import DiTCache
+
+        self.estimator.dit_cache = DiTCache.from_config(self.dit_cache_config)
+        try:
+            return solve_euler(inputs, config, self)
+        finally:
+            self.estimator.dit_cache = None
 
 
 class VoxCPM2LocEnc(nn.Module):
