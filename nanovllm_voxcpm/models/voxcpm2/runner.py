@@ -145,6 +145,9 @@ class VoxCPM2Runner(BaseModelRunner):
         turbo = model_config.turbo
         if turbo.dit_checkpoint:
             ckpt = torch.load(turbo.dit_checkpoint, map_location="cpu", weights_only=True)
+            if ckpt.get("dit_layers"):  # a student with fewer decoder layers (some of the teacher's, renumbered)
+                dec = self.model.feat_decoder.estimator.decoder
+                dec.layers = torch.nn.ModuleList(list(dec.layers)[: int(ckpt["dit_layers"])])
             n = load_state_dict_into(self.model, ckpt["state_dict"], prefix="feat_decoder.estimator.")
             if turbo.dit_t_span is None and "schedule" in ckpt:
                 t_span = [float(ckpt["schedule"][0][0])] + [float(t - dt) for t, dt in ckpt["schedule"]]
