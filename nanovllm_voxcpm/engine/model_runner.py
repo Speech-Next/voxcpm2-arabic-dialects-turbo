@@ -1051,7 +1051,8 @@ class BaseModelRunner:
             from voxcpm_kernels.seg_gemm import SEG_TABLES
 
             SEG_TABLES.reserve(LM_LORA_DOMAIN, max_bs, max_lora_buckets)
-            SEG_TABLES.reserve(DIT_LORA_DOMAIN, max_dit_lora_rows, max_lora_buckets)
+            SEG_TABLES.reserve(DIT_LORA_DOMAIN, max_dit_lora_rows, max_lora_buckets,
+                               segments=max_lora_buckets * self.cfg_branches)  # CFG: each branch grouped by adapter
         self.graphs = {"base": {}, "lora": {}}
         self.graph_pool = None
         capture_lora_graphs = bool(config.lora_config is not None and is_lora_available())

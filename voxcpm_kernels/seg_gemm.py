@@ -48,10 +48,16 @@ class SegTables:
     def __init__(self) -> None:
         self.bufs: dict[tuple[str, int], torch.Tensor] = {}
         self.staging: dict[tuple[str, int], torch.Tensor] = {}
+        # row segments a step of the domain may have (default: one per weight); CFG lays the LocDiT's rows out as
+        # [conditional batch][unconditional batch], each grouped by adapter: twice as many segments
+        self.segments: dict[str, int] = {}
+
+    def max_segments(self, domain: str, n_weights: int) -> int:
+        return max(n_weights, self.segments.get(domain, 0))
 
     def get(self, domain: str, block_m: int, rows: int, n_weights: int) -> torch.Tensor:
         key = (domain, block_m)
-        need = max_tiles(rows, block_m, n_weights)
+        need = max_tiles(rows, block_m, self.max_segments(domain, n_weights))
         buf = self.bufs.get(key)
         if buf is None or buf.shape[0] < need:
             assert not torch.cuda.is_current_stream_capturing(), "SegTables.reserve() before capturing"
@@ -60,7 +66,9 @@ class SegTables:
             self.staging[key] = torch.zeros(need, 3, dtype=torch.int32, device="cpu", pin_memory=True)
         return buf
 
-    def reserve(self, domain: str, rows: int, n_weights: int, block_ms=(64, 128)) -> None:
+    def reserve(self, domain: str, rows: int, n_weights: int, block_ms=(64, 128), segments: int | None = None) -> None:
+        if segments:
+            self.segments[domain] = segments
         for bm in block_ms:
             self.get(domain, bm, rows, n_weights)
 
@@ -69,7 +77,7 @@ class SegTables:
         grids cover ``max_tiles`` (a segment per weight): rows not grouped by adapter would leave rows uncomputed,
         so that is refused."""
         s = np.asarray(slots, dtype=np.int32)
-        if s.size and int((s[1:] != s[:-1]).sum()) + 1 > n_weights:
+        if s.size and int((s[1:] != s[:-1]).sum()) + 1 > self.max_segments(domain, n_weights):
             raise ValueError("LoRA rows are not grouped by adapter (the scheduler orders a step's sequences)")
         for (dom, bm), buf in self.bufs.items():
             if dom != domain:
@@ -218,7 +226,7 @@ def tiles_for(slots_host, M: int, domain: str, n_weights: int, cache: dict | Non
     bm = _block_m(M)
     if torch.cuda.is_current_stream_capturing():
         buf = SEG_TABLES.get(domain, bm, M, n_weights)
-        return buf, max_tiles(M, bm, n_weights), bm
+        return buf, max_tiles(M, bm, SEG_TABLES.max_segments(domain, n_weights)), bm
     key = (bm, M)
     if cache is not None and key in cache:
         return cache[key]

@@ -13,6 +13,7 @@ and [`VoxCPM-Kernel/VoxCPM2-Arabic-Dialects`](https://huggingface.co/VoxCPM-Kern
 | this library | 22 ms | 96 ms | 16.8 % | 6.9 % | – | 2.58 |
 | base inference, voice cloning | 94 ms | 4464 ms | 17.1 % | 6.3 % | 0.95 | 2.96 |
 | **this library, voice cloning** | **23 ms** | **96 ms** | **14.7 %** | **6.0 %** | **0.92** | **2.95** |
+| this library, voice cloning, without the distilled LocDiT | 30 ms | 294 ms | 14.4 % | 6.1 % | 0.93 | 3.13 |
 | this library, voice cloning with the reference transcript | 22 ms | 430 ms | 18.5 % | 7.7 % | 0.94 | 2.82 |
 
 TTFA: time to first audio. WER / CER: Whisper large-v3 on the 200 outputs (rows without cloning: mean of 4-8 runs).
@@ -26,9 +27,12 @@ Time to first audio (p95) with voice cloning, by the number of requests sent at 
 |---|---:|---:|---:|---:|---:|---:|
 | base inference | 93 ms | 188 ms | 364 ms | 1455 ms | 2838 ms | 5708 ms |
 | **this library** | **21 ms** | **24 ms** | **27 ms** | **43 ms** | **67 ms** | **123 ms** |
+| this library without the distilled LocDiT | 30 ms | 47 ms | 73 ms | 118 ms | 195 ms | 344 ms |
 
 Median over the measured rounds after a first warm-up round; this library clones 5 voices mixed, the base inference
-one voice.
+one voice. Without the distilled LocDiT (`DialectTTS.load(dit=None)`: the original one, 10 steps with CFG) the audio
+scores higher (UTMOS +0.18) at the same WER / CER, the first audio comes ~3x later, and from 128 simultaneous requests
+on, generation falls behind playback (mean stall 0.6 s at 128, 3.7 s at 256; ~0.1 s with the distilled LocDiT).
 
 ## Install
 
