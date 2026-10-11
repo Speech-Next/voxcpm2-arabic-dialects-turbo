@@ -53,7 +53,7 @@ from pydantic import BaseModel, ValidationError
 
 from nanovllm_voxcpm.arabic_text import normalize as normalize_text
 from nanovllm_voxcpm.dialect_tts import (DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters, resolve,
-                                         turbo_config)
+                                         turbo_config, use_model_calibration)
 
 CLONE_MODES = ("prompt_ref", "ref", "prompt")
 VOICE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # voice names are also file names in --voice-dir
@@ -202,6 +202,8 @@ def build_app(args: argparse.Namespace):
         turbo.setdefault("pcm16_output", True)  # int16 from the GPU: half the bytes per chunk, no conversion here
         os.environ["NANOVLLM_VOXCPM2_TURBO"] = json.dumps(turbo)
         model_path = resolve(args.model)
+        if turbo.get("w8a8"):
+            use_model_calibration(model_path)
         state["tags"] = DialectTags.of_model(model_path)
         lora_dir = args.lora_dir
         if lora_dir is None and state["tags"] is None and os.path.isdir(os.path.join(model_path, "adapters")):

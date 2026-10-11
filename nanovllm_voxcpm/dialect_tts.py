@@ -57,6 +57,17 @@ def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | 
     return cfg
 
 
+def use_model_calibration(model_path: str) -> str | None:
+    """A model directory's own SmoothQuant statistics (``smooth_stats.pt``, recorded with VOXCPM_KERNELS_CALIBRATE)
+    for the int8 layers of the engine started next; VOXCPM_KERNELS_SMOOTH, when set, still wins. Without them the
+    engine smooths with base VoxCPM2's statistics, which a fine-tuned model's activations may not match."""
+    stats = os.path.join(model_path, "smooth_stats.pt")
+    if os.path.exists(stats) and "VOXCPM_KERNELS_SMOOTH" not in os.environ:
+        os.environ["VOXCPM_KERNELS_SMOOTH"] = stats  # read by the engine process when it starts
+        return stats
+    return None
+
+
 def find_adapters(lora_dir: str | None, extra: list[str] = ()) -> dict[str, str]:
     """Adapter name -> directory: the subdirectories of ``lora_dir`` holding ``lora_weights.safetensors``, plus
     ``NAME=PATH`` items."""
@@ -182,6 +193,8 @@ class DialectTTS:
         from nanovllm_voxcpm import VoxCPM
 
         path = resolve(model)
+        if w8a8:
+            use_model_calibration(path)
         tags_path = os.path.join(path, "dialects.json")
         tags = json.load(open(tags_path, encoding="utf-8")) if os.path.exists(tags_path) else None
         adapters = {} if tags else find_adapters(
