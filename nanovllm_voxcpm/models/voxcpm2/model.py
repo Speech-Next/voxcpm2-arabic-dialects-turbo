@@ -1,0 +1,787 @@
+from typing import Optional
+
+import torch
+from torch import nn
+
+from nanovllm_voxcpm.layers.activation import SiluAndMul
+from nanovllm_voxcpm.layers.attention import Attention
+from nanovllm_voxcpm.layers.embed_head import VocabParallelEmbedding
+from nanovllm_voxcpm.layers.layernorm import RMSNorm
+from nanovllm_voxcpm.layers.linear import MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from nanovllm_voxcpm.layers.lora import (
+    LoRALinear,
+    LoRAMergedColumnParallelLinear,
+    LoRAQKVParallelLinear,
+    LoRARowParallelLinear,
+)
+from nanovllm_voxcpm.models.voxcpm2.config import CfmConfig, LoRAConfig, MiniCPM4Config, TurboConfig, VoxCPM2Config
+from nanovllm_voxcpm.models.voxcpm2.model_utils import (
+    EulerSolverConfig,
+    EulerSolverInputs,
+    apply_rotary_emb,
+    build_cfm_t_span,
+    build_rope_cos_sin_cache,
+    build_rope_inv_freq,
+    compute_attention_sizes,
+    compute_optimized_scale,
+    compute_rope_scaling_factor,
+    parse_gate_up_lora_targets,
+    parse_qkv_lora_targets,
+    sinusoidal_pos_emb,
+    solve_euler,
+)
+from nanovllm_voxcpm.utils.context import (
+    DIT_LORA_DOMAIN,
+    LM_LORA_DOMAIN,
+    PROJ_LORA_DOMAIN,
+    get_context,
+)
+from nanovllm_voxcpm.utils.distributed import get_tp_world_size
+
+
+class MiniCPMLongRoPE(nn.Module):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        short_factor=None,
+        long_factor=None,
+        original_max_position_embeddings=None,
+    ) -> None:
+        super().__init__()
+        self.dim = head_size
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.short_factor = short_factor or [1.0] * (head_size // 2)
+        self.long_factor = long_factor or [1.0] * (head_size // 2)
+        self.original_max_position_embeddings = original_max_position_embeddings or max_position_embeddings
+        self.scaling_factor = compute_rope_scaling_factor(
+            self.max_position_embeddings, self.original_max_position_embeddings
+        )
+        inv_freq = build_rope_inv_freq(self.dim, self.base)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._set_cos_sin_cache(max_position_embeddings, self.inv_freq.device, torch.float32)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        cos_cache, sin_cache = build_rope_cos_sin_cache(
+            seq_len=seq_len,
+            inv_freq=self.inv_freq.to(device=device),
+            scaling_factor=self.scaling_factor,
+            short_factor=self.short_factor,
+            long_factor=self.long_factor,
+            original_max_position_embeddings=self.original_max_position_embeddings,
+            dtype=dtype,
+        )
+        self.register_buffer("cos_cached", cos_cache, persistent=False)
+        self.register_buffer("sin_cached", sin_cache, persistent=False)
+
+    def _apply_rotary_emb(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        return apply_rotary_emb(x, cos, sin)
+
+    def forward(
+        self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = positions.size(0)
+        cos = self.cos_cached[positions]
+        sin = self.sin_cached[positions]
+        query_shape = query.shape
+        key_shape = key.shape
+        query = self._apply_rotary_emb(query.reshape(num_tokens, -1, self.dim), cos, sin).view(query_shape)
+        key = self._apply_rotary_emb(key.reshape(num_tokens, -1, self.dim), cos, sin).view(key_shape)
+        return query, key
+
+
+def get_cpm4_rope(head_size: int, rotary_dim: int, max_position: int, base: float, rope_scaling=None):
+    return MiniCPMLongRoPE(
+        head_size=head_size,
+        rotary_dim=rotary_dim,
+        max_position_embeddings=max_position,
+        base=base,
+        short_factor=rope_scaling.short_factor if rope_scaling else None,
+        long_factor=rope_scaling.long_factor if rope_scaling else None,
+        original_max_position_embeddings=(rope_scaling.original_max_position_embeddings if rope_scaling else None),
+    )
+
+
+class Cpm4Attention(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        max_position: int = 32768,
+        head_dim: int | None = None,
+        rms_norm_eps: float = 1e-06,
+        is_causal: bool = True,
+        qkv_bias: bool = False,
+        rope_theta: float = 10000,
+        rope_scaling=None,
+        use_rope: bool = True,
+        apply_qk_norm: bool = False,
+        lora_config: Optional[LoRAConfig] = None,
+        lora_domain: str = LM_LORA_DOMAIN,
+    ) -> None:
+        super().__init__()
+        tp_size = get_tp_world_size()
+        self.total_num_heads = num_heads
+        self.total_num_kv_heads = num_kv_heads
+        sizes = compute_attention_sizes(hidden_size, num_heads, num_kv_heads, head_dim, tp_size)
+        self.num_heads = sizes["num_heads"]
+        self.num_kv_heads = sizes["num_kv_heads"]
+        self.head_dim = sizes["head_dim"]
+        self.q_size = sizes["q_size"]
+        self.kv_size = sizes["kv_size"]
+        self.scaling = sizes["scaling"]
+        self.max_position = max_position
+        self.use_rope = use_rope
+        self.apply_qk_norm = apply_qk_norm
+        self.is_causal = is_causal
+
+        max_loras = lora_config.max_loras if lora_config else 1
+        max_lora_rank = lora_config.max_lora_rank if lora_config else 0
+        lora_targets = lora_config.target_modules_lm if lora_config else []
+        qkv_lora_targets = parse_qkv_lora_targets(lora_targets)
+        if max_lora_rank > 0 and qkv_lora_targets:
+            self.qkv_proj = LoRAQKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=qkv_bias,
+                lora_targets=qkv_lora_targets,
+                max_loras=max_loras,
+                max_lora_rank=max_lora_rank,
+                lora_domain=lora_domain,
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=qkv_bias,
+            )
+
+        if max_lora_rank > 0 and "o_proj" in lora_targets:
+            self.o_proj = LoRARowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=qkv_bias,
+                max_loras=max_loras,
+                max_lora_rank=max_lora_rank,
+                lora_domain=lora_domain,
+            )
+        else:
+            self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim, hidden_size, bias=qkv_bias)
+
+        self.rotary_emb = (
+            get_cpm4_rope(self.head_dim, self.head_dim, self.max_position, rope_theta, rope_scaling)
+            if self.use_rope
+            else None
+        )
+        self.attn = Attention(self.num_heads, self.head_dim, self.scaling, self.num_kv_heads, is_causal=self.is_causal)
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps) if self.apply_qk_norm else None
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps) if self.apply_qk_norm else None
+
+    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        rotary_emb = self.rotary_emb
+        if self.is_causal:
+            if self.q_norm is not None:
+                q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(q.shape)
+                k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(k.shape)
+            if rotary_emb is not None:
+                q, k = rotary_emb(positions, q, k)
+            q = q.view(-1, self.num_heads, self.head_dim)
+            k = k.view(-1, self.num_kv_heads, self.head_dim)
+            v = v.view(-1, self.num_kv_heads, self.head_dim)
+        else:
+            bsz = q.size(0)
+            if self.q_norm is not None:
+                q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(q.shape)
+                k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(k.shape)
+            if rotary_emb is not None:
+                q, k = rotary_emb(positions.repeat(bsz), q, k)
+            q = q.view(bsz, -1, self.num_heads, self.head_dim)
+            k = k.view(bsz, -1, self.num_kv_heads, self.head_dim)
+            v = v.view(bsz, -1, self.num_kv_heads, self.head_dim)
+        out = self.attn(q, k, v)
+        out = out.view(
+            (-1, self.num_heads * self.head_dim) if self.is_causal else (bsz, -1, self.num_heads * self.head_dim)
+        )
+        return self.o_proj(out)
+
+
+class Cpm4MLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        lora_config: Optional[LoRAConfig] = None,
+        lora_domain: str = LM_LORA_DOMAIN,
+    ) -> None:
+        super().__init__()
+        max_loras = lora_config.max_loras if lora_config else 1
+        max_lora_rank = lora_config.max_lora_rank if lora_config else 0
+        lora_targets = lora_config.target_modules_lm if lora_config else []
+        gate_up_lora_targets = parse_gate_up_lora_targets(lora_targets)
+        if max_lora_rank > 0 and gate_up_lora_targets:
+            self.gate_up_proj = LoRAMergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+                lora_targets=gate_up_lora_targets,
+                max_loras=max_loras,
+                max_lora_rank=max_lora_rank,
+                lora_domain=lora_domain,
+            )
+        else:
+            self.gate_up_proj = MergedColumnParallelLinear(hidden_size, [intermediate_size] * 2, bias=False)
+        self.down_proj = (
+            LoRARowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                max_loras=max_loras,
+                max_lora_rank=max_lora_rank,
+                lora_domain=lora_domain,
+            )
+            if max_lora_rank > 0 and "down_proj" in lora_targets
+            else RowParallelLinear(intermediate_size, hidden_size, bias=False)
+        )
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_up_proj(x)))
+
+
+class Cpm4DecoderLayer(nn.Module):
+    def __init__(
+        self,
+        config: MiniCPM4Config,
+        is_causal: bool = True,
+        lora_config: Optional[LoRAConfig] = None,
+        use_rope: bool = True,
+        lora_domain: str = LM_LORA_DOMAIN,
+    ) -> None:
+        super().__init__()
+        self.self_attn = Cpm4Attention(
+            hidden_size=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            max_position=config.max_position_embeddings,
+            rms_norm_eps=config.rms_norm_eps,
+            is_causal=is_causal,
+            qkv_bias=getattr(config, "attention_bias", False),
+            head_dim=getattr(config, "kv_channels", None),
+            rope_theta=getattr(config, "rope_theta", 10000),
+            rope_scaling=getattr(config, "rope_scaling", None),
+            use_rope=use_rope,
+            apply_qk_norm=getattr(config, "apply_qk_norm", False),
+            lora_config=lora_config,
+            lora_domain=lora_domain,
+        )
+        self.mlp = Cpm4MLP(
+            config.hidden_size,
+            config.intermediate_size,
+            lora_config=lora_config,
+            lora_domain=lora_domain,
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, residual: torch.Tensor | None):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = residual + self.self_attn(positions, hidden_states)
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + self.mlp(hidden_states)
+        return hidden_states, residual
+
+
+class Cpm4Model(nn.Module):
+    def __init__(
+        self,
+        config: MiniCPM4Config,
+        is_causal: bool = True,
+        lora_config: Optional[LoRAConfig] = None,
+        use_rope: bool = True,
+        lora_domain: str = LM_LORA_DOMAIN,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.embed_tokens = (
+            VocabParallelEmbedding(config.vocab_size, config.hidden_size) if config.vocab_size > 0 else nn.Identity()
+        )
+        self.layers = nn.ModuleList(
+            [
+                Cpm4DecoderLayer(config, is_causal, lora_config, use_rope=use_rope, lora_domain=lora_domain)
+                for _ in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self, input_embeds: torch.Tensor, positions: torch.Tensor, last_rows: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """last_rows: return the output only at these rows (one per sequence, its last token). With fused layers
+        the last layer then computes K/V for every row but everything after attention only for these rows."""
+        hidden_states = input_embeds
+        residual = None
+        last = getattr(self.layers[-1].forward, "last_rows", None) if last_rows is not None else None
+        for layer in self.layers[:-1] if last is not None else self.layers:
+            hidden_states, residual = layer(positions, hidden_states, residual)
+        if last is not None:
+            return self.norm(last(positions, hidden_states, last_rows))
+        out = self.norm(hidden_states)
+        return out if last_rows is None else out[last_rows]
+
+
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x, scale=1000):
+        return sinusoidal_pos_emb(x, self.dim, scale=float(scale))
+
+
+class TimestepEmbedding(nn.Module):
+    def __init__(self, in_channels: int, time_embed_dim: int, out_dim: int | None = None):
+        super().__init__()
+        time_embed_dim_out = out_dim if out_dim is not None else time_embed_dim
+        self.linear_1 = nn.Linear(in_channels, time_embed_dim, bias=True)
+        self.act = nn.SiLU()
+        self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim_out, bias=True)
+
+    def forward(self, sample):
+        return self.linear_2(self.act(self.linear_1(sample)))
+
+
+class VoxCPM2LocDiT(nn.Module):
+    def __init__(self, config: MiniCPM4Config, in_channels: int = 64, lora_config: Optional[LoRAConfig] = None):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = in_channels
+        self.in_proj = nn.Linear(in_channels, config.hidden_size, bias=True)
+        self.cond_proj = nn.Linear(in_channels, config.hidden_size, bias=True)
+        self.out_proj = nn.Linear(config.hidden_size, self.out_channels, bias=True)
+        self.time_embeddings = SinusoidalPosEmb(config.hidden_size)
+        self.time_mlp = TimestepEmbedding(config.hidden_size, config.hidden_size)
+        self.delta_time_mlp = TimestepEmbedding(config.hidden_size, config.hidden_size)
+        dit_lora_config = None
+        if lora_config and lora_config.enable_dit:
+            dit_lora_config = LoRAConfig(
+                enable_lm=True,
+                enable_dit=False,
+                max_loras=lora_config.max_loras,
+                max_lora_rank=lora_config.max_lora_rank,
+                target_modules_lm=lora_config.target_modules_dit,
+                target_modules_dit=[],
+                target_proj_modules=[],
+            )
+        self.decoder = Cpm4Model(
+            config,
+            is_causal=False,
+            lora_config=dit_lora_config,
+            lora_domain=DIT_LORA_DOMAIN,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mu: torch.Tensor,
+        t: torch.Tensor,
+        cond: torch.Tensor,
+        dt: torch.Tensor,
+    ):
+        x = self.in_proj(x.transpose(1, 2).contiguous())
+        cond = self.cond_proj(cond.transpose(1, 2).contiguous())
+        prefix = cond.size(1)
+        t = self.time_mlp(self.time_embeddings(t).to(x.dtype))
+        dt = self.delta_time_mlp(self.time_embeddings(dt).to(x.dtype))
+        t = t + dt
+        mu = mu.view(x.size(0), -1, x.size(-1))
+        hidden = torch.cat([mu, t.unsqueeze(1), cond, x], dim=1)
+        position_ids = torch.arange(0, hidden.size(1), dtype=torch.long, device=hidden.device)
+        hidden = self.decoder(hidden, position_ids)
+        hidden = self.out_proj(hidden[:, prefix + mu.size(1) + 1 :, :])
+        return hidden.transpose(1, 2).contiguous()
+
+
+class UnifiedCFM(nn.Module):
+    # turbo knobs; class defaults = the original solver (also for instances built without __init__)
+    first_patch = False
+    first_t_span_override = None  # the first patch's grid (TurboConfig.dit_first_t_span)
+    cfg_steps = -1
+    first_cfg_steps = -1
+    t_span_override = None
+
+    def __init__(
+        self,
+        in_channels,
+        patch_size: int,
+        inference_timesteps: int,
+        cfm_params: CfmConfig,
+        estimator: VoxCPM2LocDiT,
+        mean_mode: bool = False,
+        turbo: TurboConfig | None = None,
+    ):
+        super().__init__()
+        turbo = turbo or TurboConfig()
+        self.in_channels = in_channels
+        self.patch_size = patch_size
+        self.inference_timesteps = inference_timesteps
+        self.first_steps = turbo.first_steps or inference_timesteps
+        self.cfg_steps = turbo.cfg_steps
+        self.first_cfg_steps = turbo.first_cfg_steps
+        # Set by the runner while it captures / runs the first-patch (prefill) diffusion.
+        self.first_patch = False
+        self.t_span_override = None
+        if turbo.dit_t_span is not None:
+            self.set_t_span(turbo.dit_t_span)
+        self.mean_mode = mean_mode
+        self.estimator = estimator
+
+    def set_t_span(self, t_span: list[float]) -> None:
+        """Explicit Euler grid for a distilled estimator: every step evaluated, no CFG."""
+        self.t_span_override = torch.tensor(t_span, dtype=torch.float32)
+        self.cfg_steps = 0
+        self.first_cfg_steps = 0
+
+    def forward(
+        self,
+        mu: torch.Tensor,
+        cond: torch.Tensor,
+        temperature: torch.Tensor,
+        cfg_value: torch.Tensor,
+        z_noise: torch.Tensor | None = None,
+    ):
+        bsz = mu.shape[0]
+        if z_noise is not None:
+            z = z_noise
+        else:
+            z = torch.randn((bsz, self.in_channels, self.patch_size), device=mu.device, dtype=mu.dtype)
+
+        z = z * temperature[:, None, None]
+        if self.first_patch and self.first_t_span_override is not None:
+            t_span = self.first_t_span_override.to(device=mu.device, dtype=mu.dtype)
+        elif self.t_span_override is not None:
+            t_span = self.t_span_override.to(device=mu.device, dtype=mu.dtype)
+        else:
+            steps = self.first_steps if self.first_patch else self.inference_timesteps
+            t_span = build_cfm_t_span(steps, device=mu.device).to(dtype=mu.dtype)
+        return self.solve_euler(z, t_span=t_span, mu=mu, cond=cond, cfg_value=cfg_value)
+
+    def optimized_scale(self, positive_flat, negative_flat):
+        return compute_optimized_scale(positive_flat, negative_flat)
+
+    def solve_euler(
+        self,
+        x: torch.Tensor,
+        t_span: torch.Tensor,
+        mu: torch.Tensor,
+        cond: torch.Tensor,
+        cfg_value: torch.Tensor,
+    ):
+        inputs = EulerSolverInputs(x=x, t_span=t_span, mu=mu, cond=cond, cfg_value=cfg_value)
+        config = EulerSolverConfig(
+            in_channels=self.in_channels,
+            mean_mode=self.mean_mode,
+            cfg_steps=self.first_cfg_steps if self.first_patch else self.cfg_steps,
+            zero_init_steps=0 if self.t_span_override is not None else -1,
+        )
+        return solve_euler(inputs, config, self)
+
+
+class VoxCPM2LocEnc(nn.Module):
+    def __init__(self, config: MiniCPM4Config, input_dim: int = 64):
+        super().__init__()
+        self.special_token = nn.Parameter(torch.empty(1, 1, 1, config.hidden_size))
+        self.in_proj = nn.Linear(input_dim, config.hidden_size, bias=True)
+        self.encoder = Cpm4Model(config, is_causal=False)
+
+    def forward(self, x):
+        t, _, _ = x.size()
+        x = self.in_proj(x)
+        special_tokens = self.special_token[0].expand(t, 1, -1)
+        x = torch.cat([special_tokens, x], dim=1)
+        position_ids = torch.arange(0, x.size(1), dtype=torch.long, device=x.device)
+        outputs = self.encoder(x, position_ids)
+        return outputs[:, 0, :].view(t, -1)
+
+
+class ScalarQuantizationLayer(nn.Module):
+    def __init__(self, in_dim, out_dim, latent_dim: int = 64, scale: int = 9):
+        super().__init__()
+        self.in_proj = nn.Linear(in_dim, latent_dim)
+        self.out_proj = nn.Linear(latent_dim, out_dim)
+        self.scale = scale
+
+    def forward(self, hidden):
+        hidden = torch.tanh(self.in_proj(hidden))
+        hidden = torch.round(hidden * self.scale) / self.scale
+        return self.out_proj(hidden)
+
+
+class VoxCPM2Model(nn.Module):
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
+    def __init__(self, config: VoxCPM2Config, inference_timesteps: int, lora_config: Optional[LoRAConfig] = None):
+        super().__init__()
+        self.config = config
+        self.lora_config = lora_config
+        self.feat_dim = config.feat_dim
+        self.patch_size = config.patch_size
+        assert not self.config.lm_config.use_mup, "mup inference is not supported now"
+
+        lm_lora_config = lora_config if (lora_config and lora_config.enable_lm) else None
+        self.base_lm = Cpm4Model(config.lm_config, lora_config=lm_lora_config)
+
+        residual_lm_config = config.lm_config.model_copy(deep=True)
+        residual_lm_config.num_hidden_layers = config.residual_lm_num_layers
+        residual_lm_config.vocab_size = 0
+        self.residual_lm = Cpm4Model(
+            residual_lm_config,
+            lora_config=lm_lora_config,
+            use_rope=not config.residual_lm_no_rope,
+        )
+
+        encoder_config = config.lm_config.model_copy(deep=True)
+        encoder_config.hidden_size = config.encoder_config.hidden_dim
+        encoder_config.intermediate_size = config.encoder_config.ffn_dim
+        encoder_config.num_attention_heads = config.encoder_config.num_heads
+        encoder_config.num_hidden_layers = config.encoder_config.num_layers
+        encoder_config.kv_channels = config.encoder_config.kv_channels
+        encoder_config.vocab_size = 0
+        self.feat_encoder = VoxCPM2LocEnc(encoder_config, input_dim=config.feat_dim)
+
+        decoder_config = config.lm_config.model_copy(deep=True)
+        decoder_config.hidden_size = config.dit_config.hidden_dim
+        decoder_config.intermediate_size = config.dit_config.ffn_dim
+        decoder_config.num_attention_heads = config.dit_config.num_heads
+        decoder_config.num_hidden_layers = config.dit_config.num_layers
+        decoder_config.kv_channels = config.dit_config.kv_channels
+        decoder_config.vocab_size = 0
+        self.feat_decoder = UnifiedCFM(
+            in_channels=config.feat_dim,
+            patch_size=config.patch_size,
+            inference_timesteps=inference_timesteps,
+            cfm_params=config.dit_config.cfm_config,
+            estimator=VoxCPM2LocDiT(decoder_config, in_channels=config.feat_dim, lora_config=lora_config),
+            mean_mode=config.dit_mean_mode,
+            turbo=config.turbo,
+        )
+        self.skip_text_locenc = config.turbo.skip_text_locenc
+        # True while the runner captures / replays the text-only prefill graph: no LocEnc at all.
+        self.prefill_no_audio = False
+
+        self.fsq_layer = ScalarQuantizationLayer(
+            config.lm_config.hidden_size,
+            config.lm_config.hidden_size,
+            config.scalar_quantization_latent_dim,
+            config.scalar_quantization_scale,
+        )
+
+        proj_lora_enabled = bool(lora_config and lora_config.enable_proj)
+        proj_max_loras = lora_config.max_loras if lora_config else 1
+        proj_max_lora_rank = lora_config.max_lora_rank if lora_config else 0
+        proj_targets = lora_config.target_proj_modules if lora_config else []
+        self.enc_to_lm_proj = (
+            LoRALinear(
+                config.encoder_config.hidden_dim,
+                config.lm_config.hidden_size,
+                max_loras=proj_max_loras,
+                max_lora_rank=proj_max_lora_rank,
+                lora_domain=LM_LORA_DOMAIN,
+            )
+            if proj_lora_enabled and proj_max_lora_rank > 0 and "enc_to_lm_proj" in proj_targets
+            else nn.Linear(config.encoder_config.hidden_dim, config.lm_config.hidden_size)
+        )
+        self.lm_to_dit_proj = (
+            LoRALinear(
+                config.lm_config.hidden_size,
+                config.dit_config.hidden_dim,
+                max_loras=proj_max_loras,
+                max_lora_rank=proj_max_lora_rank,
+                lora_domain=PROJ_LORA_DOMAIN,
+            )
+            if proj_lora_enabled and proj_max_lora_rank > 0 and "lm_to_dit_proj" in proj_targets
+            else nn.Linear(config.lm_config.hidden_size, config.dit_config.hidden_dim)
+        )
+        self.res_to_dit_proj = (
+            LoRALinear(
+                config.lm_config.hidden_size,
+                config.dit_config.hidden_dim,
+                max_loras=proj_max_loras,
+                max_lora_rank=proj_max_lora_rank,
+                lora_domain=PROJ_LORA_DOMAIN,
+            )
+            if proj_lora_enabled and proj_max_lora_rank > 0 and "res_to_dit_proj" in proj_targets
+            else nn.Linear(config.lm_config.hidden_size, config.dit_config.hidden_dim)
+        )
+        self.fusion_concat_proj = (
+            LoRALinear(
+                config.lm_config.hidden_size * 2,
+                config.lm_config.hidden_size,
+                max_loras=proj_max_loras,
+                max_lora_rank=proj_max_lora_rank,
+                lora_domain=LM_LORA_DOMAIN,
+            )
+            if proj_lora_enabled and proj_max_lora_rank > 0 and "fusion_concat_proj" in proj_targets
+            else nn.Linear(config.lm_config.hidden_size * 2, config.lm_config.hidden_size)
+        )
+
+        self.stop_proj = nn.Linear(config.lm_config.hidden_size, config.lm_config.hidden_size)
+        self.stop_actn = nn.SiLU()
+        self.stop_head = nn.Linear(config.lm_config.hidden_size, 2, bias=False)
+
+    def forward_backbone(
+        self,
+        positions: torch.Tensor,
+        text_tokens: torch.Tensor,
+        feat: torch.Tensor,
+        feat_mask: torch.Tensor,
+        temperature: torch.Tensor,
+        cfg_value: torch.Tensor,
+        z_noise: torch.Tensor | None = None,
+        enc_pos: torch.Tensor | None = None,
+        enc_rows: torch.Tensor | None = None,
+        enc_miss: torch.Tensor | None = None,
+        enc_cache: torch.Tensor | None = None,
+        feat_embeds_in: torch.Tensor | None = None,
+    ):
+        if feat_embeds_in is not None:  # prefill CUDA graph: LocEnc embeddings computed before the replay
+            feat_embeds = feat_embeds_in
+        elif self.prefill_no_audio and get_context().is_prefill:
+            feat_embeds = torch.zeros(
+                feat.size(0), self.config.lm_config.hidden_size, device=feat.device, dtype=feat.dtype
+            )
+        elif enc_cache is not None and get_context().is_prefill:
+            # LocEnc embedding cache (runner): encode first-seen patches into their rows, then gather every
+            # audio position's row
+            feat_embeds = torch.zeros(
+                feat.size(0), self.config.lm_config.hidden_size, device=feat.device, dtype=feat.dtype
+            )
+            if enc_miss.numel() > 0:
+                miss_pos = enc_pos[enc_miss]
+                enc_cache[enc_rows[enc_miss]] = self.enc_to_lm_proj(self.feat_encoder(feat[miss_pos]))
+            if enc_pos.numel() > 0:
+                feat_embeds[enc_pos] = enc_cache[enc_rows]
+        elif self.skip_text_locenc and get_context().is_prefill:
+            # Text positions' LocEnc output is masked out below; encode audio positions only.
+            audio_idx = feat_mask.nonzero(as_tuple=True)[0]
+            feat_embeds = torch.zeros(
+                feat.size(0), self.config.lm_config.hidden_size, device=feat.device, dtype=feat.dtype
+            )
+            if audio_idx.numel() > 0:
+                feat_embeds[audio_idx] = self.enc_to_lm_proj(self.feat_encoder(feat[audio_idx]))
+        else:
+            feat_embeds = self.enc_to_lm_proj(self.feat_encoder(feat))
+            feat_embeds = torch.masked_fill(feat_embeds, feat_mask.unsqueeze(-1).logical_not(), 0)
+        text_embeds = self.base_lm.embed_tokens(text_tokens)
+        combined_embeds = torch.where(feat_mask.unsqueeze(-1), feat_embeds, text_embeds)
+        enc_outputs = self.base_lm(combined_embeds, positions)
+        enc_outputs = torch.where(feat_mask.unsqueeze(-1), self.fsq_layer(enc_outputs), enc_outputs)
+
+        context = get_context()
+        if context.is_prefill:
+            last_indices = context.cu_seqlens_q[1:] - 1
+            lm_hidden = enc_outputs[last_indices].contiguous()
+        else:
+            lm_hidden = enc_outputs
+
+        proj = self.fusion_concat_proj
+        if type(proj) is nn.Linear:
+            # proj([enc, feat]) as two GEMMs into one output, without the concatenated copy; feat_embeds is zero on
+            # text positions on every path above, so it needs no masking here
+            h = enc_outputs.size(-1)
+            residual_inputs = torch.addmm(proj.bias, enc_outputs, proj.weight[:, :h].t())
+            residual_inputs.addmm_(feat_embeds, proj.weight[:, h:].t())
+        else:
+            residual_inputs = proj(torch.cat([enc_outputs, torch.where(feat_mask.unsqueeze(-1), feat_embeds, 0)], dim=-1))
+        if context.is_prefill:
+            # only the last position of each sequence is used: the residual LM's last layer runs for those rows only
+            last_indices = context.cu_seqlens_q[1:] - 1
+            ralm_hidden = self.residual_lm(residual_inputs, positions, last_rows=last_indices).contiguous()
+            prefix_feat_cond = feat[last_indices].contiguous()
+        else:
+            ralm_hidden = self.residual_lm(residual_inputs, positions)
+            prefix_feat_cond = feat
+
+        dit_hidden = torch.cat([self.lm_to_dit_proj(lm_hidden), self.res_to_dit_proj(ralm_hidden)], dim=-1)
+        stop_flag = self.stop_head(self.stop_actn(self.stop_proj(lm_hidden))).argmax(dim=-1)
+        return (
+            {
+                "mu": dit_hidden,
+                "cond": prefix_feat_cond.transpose(1, 2).contiguous(),
+                "temperature": temperature,
+                "cfg_value": cfg_value,
+                "z_noise": z_noise,
+            },
+            {"stop_flag": stop_flag},
+        )
+
+    def set_first_patch(self, enabled: bool) -> None:
+        self.feat_decoder.first_patch = enabled
+
+    def forward_diffusion(
+        self,
+        mu: torch.Tensor,
+        cond: torch.Tensor,
+        temperature: torch.Tensor,
+        cfg_value: torch.Tensor,
+        z_noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.feat_decoder(
+            mu=mu,
+            cond=cond,
+            temperature=temperature,
+            cfg_value=cfg_value,
+            z_noise=z_noise,
+        ).transpose(1, 2)
+
+    def make_dummy_diffusion_inputs(self, batch_size: int) -> dict[str, torch.Tensor]:
+        return {
+            "mu": torch.zeros(batch_size, 2 * self.config.dit_config.hidden_dim),
+            "cond": torch.zeros(batch_size, self.feat_dim, self.patch_size),
+            "temperature": torch.zeros(batch_size),
+            "cfg_value": torch.zeros(batch_size),
+            "z_noise": torch.zeros(batch_size, self.feat_dim, self.patch_size),
+        }
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        text_tokens: torch.Tensor,
+        feat: torch.Tensor,
+        feat_mask: torch.Tensor,
+        temperature: torch.Tensor,
+        cfg_value: torch.Tensor,
+        z_noise: torch.Tensor | None = None,
+        **enc_inputs,
+    ):
+        self.set_first_patch(get_context().is_prefill)
+        diffusion_inputs, outputs = self.forward_backbone(
+            positions=positions,
+            text_tokens=text_tokens,
+            feat=feat,
+            feat_mask=feat_mask,
+            temperature=temperature,
+            cfg_value=cfg_value,
+            z_noise=z_noise,
+            **enc_inputs,
+        )
+        outputs["latents"] = self.forward_diffusion(**diffusion_inputs)
+        return outputs
