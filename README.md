@@ -1,118 +1,169 @@
-# VoxCPM2 Arabic Dialects
+# VoxCPM2 Arabic Dialects (Turbo)
 
-Fast voice-cloning text-to-speech for 11 Arabic dialects, built on [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2)
-and [`VoxCPM-Kernel/VoxCPM2-Arabic-Dialects`](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Dialects).
+Fast Arabic dialect text-to-speech with voice cloning, built on [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2). One
+NVIDIA A10 answers 200 simultaneous requests with the first audio in under 100 ms.
 
 ## Results
 
-200 different Arabic dialect sentences sent at the same time, one NVIDIA A10:
+Voice cloning on one NVIDIA A10. Each request is one Arabic dialect sentence of about 7 words, and all requests are
+sent at the same instant.
 
-| | TTFA, 1 request | TTFA p95, 200 at once | WER | CER | speaker similarity | UTMOS |
-|---|---:|---:|---:|---:|---:|---:|
-| base inference | 93 ms | 2174 ms | 16.0 % | 6.3 % | – | 2.67 |
-| this library | 22 ms | 96 ms | 16.8 % | 6.9 % | – | 2.58 |
-| base inference, voice cloning | 94 ms | 4464 ms | 17.1 % | 6.3 % | 0.95 | 2.96 |
-| **this library, voice cloning** | **23 ms** | **96 ms** | **14.7 %** | **6.0 %** | **0.92** | **2.95** |
-| this library, voice cloning, without the distilled LocDiT | 30 ms | 294 ms | 14.4 % | 6.1 % | 0.93 | 3.13 |
-| the same + cache-dit light | 30 ms | 258 ms | 14.0 % | 5.6 % | 0.92 | 3.13 |
-| the same + cache-dit medium | 27 ms | 210 ms | 16.8 % | 7.6 % | 0.92 | 3.09 |
-| this library, voice cloning with the reference transcript | 22 ms | 430 ms | 18.5 % | 7.7 % | 0.94 | 2.82 |
+| requests at once | first audio, average | first audio, p95 | whole sentence ready, average |
+|---:|---:|---:|---:|
+| 1 | 31 ms | 69 ms | 0.37 s |
+| 16 | 28 ms | 28 ms | 0.65 s |
+| 64 | 44 ms | 44 ms | 0.98 s |
+| 128 | 67 ms | 68 ms | 1.45 s |
+| 200 | 97 ms | 98 ms | 1.96 s |
+| 256 | 123 ms | 124 ms | 2.43 s |
 
-TTFA: time to first audio. WER / CER: Whisper large-v3 on the 200 outputs (rows without cloning: mean of 4-8 runs).
-Speaker similarity: WavLM-SV to the reference clip; the cloning rows clone the same voice. Base inference:
-`VoxCPM-Kernel/voxcpm-inference` (dq_engine, bf16, 6 CFG steps) on nano-vllm-voxcpm 2.0.4; with cloning it needed
-smaller batches to fit 200 requests in memory.
+- The median at 1 request is 22 ms. Its p95 is the slowest of 10 measurements.
+- A sentence is about 3.7 s of audio, so even at 256 requests it is generated faster than it plays.
+- For comparison, base VoxCPM2 inference needs 2.2 s (4.5 s with voice cloning) for the first audio at 200 requests.
 
-Time to first audio (p95) with voice cloning, by the number of requests sent at the same time:
+Two modes, chosen with `dit` (see Usage):
 
-| simultaneous requests | 1 | 8 | 16 | 64 | 128 | 256 |
-|---|---:|---:|---:|---:|---:|---:|
-| base inference | 93 ms | 188 ms | 364 ms | 1455 ms | 2838 ms | 5708 ms |
-| **this library** | **21 ms** | **25 ms** | **29 ms** | **43 ms** | **66 ms** | **122 ms** |
-| without the distilled LocDiT, cache-dit medium | 27 ms | 38 ms | 53 ms | 87 ms | 140 ms | 254 ms |
-| without the distilled LocDiT, cache-dit light | 30 ms | 44 ms | 62 ms | 103 ms | 166 ms | 297 ms |
-| without the distilled LocDiT | 30 ms | 49 ms | 72 ms | 118 ms | 194 ms | 344 ms |
+| mode | first audio p95, 200 requests | WER | CER | naturalness (UTMOS) |
+|---|---:|---:|---:|---:|
+| fast (default) | 98 ms | 17.5 % | 7.6 % | 2.49 |
+| quality (`dit=None`) | 294 ms | 13.6 % | 5.5 % | 2.80 |
 
-Quality of the same runs (all 473 outputs of the six bursts):
+WER / CER: Whisper large-v3 over 473 outputs, 5 cloned voices.
 
-| | WER | CER | speaker similarity | UTMOS | mean stall, 128 / 256 requests |
-|---|---:|---:|---:|---:|---:|
-| this library | 17.5 % | 7.6 % | 0.91 | 2.49 | 0.0 / 0.3 s |
-| without the distilled LocDiT, cache-dit medium | 13.9 % | 5.5 % | 0.93 | 2.79 | 0.1 / 1.8 s |
-| without the distilled LocDiT, cache-dit light | 13.6 % | 5.3 % | 0.93 | 2.83 | 0.2 / 2.8 s |
-| without the distilled LocDiT | 13.6 % | 5.5 % | 0.93 | 2.80 | 0.6 / 3.7 s |
+## Models
 
-Median over the measured rounds after a first warm-up round; this library clones 5 voices mixed, the base inference
-one voice. Stall: time a stream waited for audio after it started playing. The distilled 2-step LocDiT (the default)
-is the only configuration that keeps the first audio under 100 ms at 200 requests; it costs quality, more with some
-voices than others (with the voice of the 200-request table its WER was within noise of the original LocDiT, over these
-5 voices it is 4 points higher). Without it (`DialectTTS.load(dit=None)`: the original LocDiT, 10 steps with CFG),
-cache-dit brings the first audio 14 % (light) or 26 % (medium) earlier and shortens the stalls; light keeps the
-original's quality, medium cost 2 points of WER with one voice and nothing measurable over the 5.
+| model | what | dialects |
+|---|---|---|
+| `VoxCPM-Kernel/VoxCPM2-Arabic-Dialects` (default) | VoxCPM2 + one LoRA adapter per dialect | ab, egyptian, emirati, hejazi, hindi_english, iraqi, jordanian, najdi, palestinian, qatari, saudi |
+| `VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v2` | one model, the dialect chosen by a tag token | msa, egyptian, palestinian, lebanese, syrian, iraqi, saudi, najdi, hejazi, gulf, bahraini, yemeni, sudanese, libyan, tunisian, algerian, moroccan |
+| `kadirnar/VoxCPM2-Turbo-distilled-DiT` | the 2-step distilled LocDiT of the fast mode | — |
 
-### cache-dit
+Run `VoxCPM2-Arabic-Teacher-v2` in quality mode (`dit=None, w8a8=False`): the fast mode is not tuned for it yet.
 
-Block caching across the original LocDiT's solver steps, after [cache-dit](https://github.com/vipshop/cache-dit)
-(DBCache + TaylorSeer): the first and last decoder layers run on every step; on the cached steps the middle layers are
-skipped and their contribution is extrapolated from the last two computed steps. The plan is fixed (light: 2 of the 9
-steps cached, medium: 4), the same for every request, so batches and CUDA graphs are unaffected. It does not combine
-with the distilled LocDiT, which has no step to spare (WER 54 %).
+## Requirements
 
-```python
-tts = await DialectTTS.load(dit=None, dit_cache="medium")
-```
+- Linux with an NVIDIA GPU (tested: A10 24 GB, driver 570).
+- Python 3.10-3.12 (tested 3.12).
+- The CUDA toolkit with `nvcc` (tested 12.9) and `ninja`: one CUDA kernel is compiled the first time the engine
+  starts.
+- About 12 GB of disk for the models.
+- Read access to the Hugging Face repos above (they are private).
+
+Tested versions: torch 2.9.1 (CUDA 12.8 build), triton 3.5.1, flash-attn 2.8.3, transformers 5.19.
 
 ## Install
 
 ```bash
-pip install -e ".[server]"
+git clone https://github.com/Speech-Next/voxcpm2-arabic-dialects-turbo
+cd voxcpm2-arabic-dialects-turbo
+
+uv venv --python 3.12 && source .venv/bin/activate
+uv pip install torch==2.9.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+uv pip install -e ".[server]"      # builds flash-attn against the installed torch (several minutes)
 ```
 
-## Voice cloning
+With plain pip, install flash-attn first with `pip install flash-attn --no-build-isolation`, then
+`pip install -e ".[server]"`.
+
+Log in to Hugging Face once, with an account that can read the private repos:
+
+```bash
+hf auth login        # or: export HF_TOKEN=...
+```
+
+Models are downloaded on first use. To keep them in a local folder instead (then pass the folder as `model` / `dit`):
+
+```bash
+hf download VoxCPM-Kernel/VoxCPM2-Arabic-Dialects --local-dir models/VoxCPM2-Arabic-Dialects
+hf download kadirnar/VoxCPM2-Turbo-distilled-DiT student_k2_dmd.pt --local-dir models/distilled-dit
+```
+
+## Usage
 
 ```python
 import asyncio
 from nanovllm_voxcpm import DialectTTS
 
 async def main():
-    async with await DialectTTS.load() as tts:
-        await tts.add_voice("speaker", "reference.wav")
-        audio = await tts.synthesize("هلا والله، كيف حالك اليوم؟", dialect="najdi", voice="speaker")
+    async with await DialectTTS.load() as tts:               # fast mode, VoxCPM2-Arabic-Dialects
+        await tts.add_voice("ahmed", "ahmed.wav")             # the voice to clone, once
 
-if __name__ == "__main__":  # the engine runs in a spawned process
+        audio = await tts.synthesize("هلا والله، كيف حالك اليوم؟", dialect="najdi", voice="ahmed")
+
+        async for chunk in tts.stream("إزيك عامل إيه؟", dialect="egyptian", voice="ahmed"):
+            ...                                               # audio while it is generated
+
+if __name__ == "__main__":      # required: the engine runs in a separate process
     asyncio.run(main())
 ```
 
-`audio` is 48 kHz mono float32; `tts.stream(...)` yields it chunk by chunk as it is generated. Dialects: `ab`,
-`egyptian`, `emirati`, `hejazi`, `hindi_english`, `iraqi`, `jordanian`, `najdi`, `palestinian`, `qatari`, `saudi`.
+- **Audio:** 48 kHz mono float32.
+- **Dialect:** `dialect` picks the dialect. Requests in different dialects run together in the same batch.
+  `dialect=None` speaks plain VoxCPM2.
+- **Numbers:** digits, times, amounts and percentages are read as Arabic words; `normalize=False` turns this off.
 
-Digits, decimals, times, amounts, percentages and phone numbers are read as Arabic words before synthesis ("الساعة
-3:30" → "الساعة ثلاثة وثلاثين دقيقة"; formal for `msa`, colloquial otherwise); `normalize=False` (server: `"normalize": false`)
-passes the text as it is.
+Options of `DialectTTS.load`:
 
-From the command line:
+| option | default | |
+|---|---|---|
+| `model` | `VoxCPM-Kernel/VoxCPM2-Arabic-Dialects` | Hugging Face id or local folder |
+| `dit` | the distilled LocDiT | `None`: the model's own LocDiT (quality mode) |
+| `w8a8` | `True` | `False`: bf16 instead of int8 |
+| `head_tokens` | `8` | `0`: the first audio waits for the whole text |
+| `dit_cache` | `None` | with `dit=None`: `"light"` or `"medium"`, a faster quality mode |
+| `max_concurrency` | `256` | most requests at once |
+
+The tag model:
+
+```python
+tts = await DialectTTS.load("VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v2", dit=None, w8a8=False)
+```
+
+## Command line
 
 ```bash
-python examples/voice_clone.py --voice reference.wav --dialect najdi --text "هلا والله، كيف حالك اليوم؟"
+python examples/voice_clone.py --voice ahmed.wav --dialect najdi --text "هلا والله، كيف حالك اليوم؟" --out out.wav
 ```
 
 ## Server
 
-```bash
-python -m nanovllm_voxcpm.entrypoints.openai_server --dit kadirnar/VoxCPM2-Turbo-distilled-DiT:student_k2_dmd.pt
-# or, without the distilled LocDiT: --dit-cache medium
+An OpenAI-style HTTP server on port 8092:
 
-curl -F name=speaker -F audio_sample=@reference.wav localhost:8092/v1/audio/voices
+```bash
+NANOVLLM_BUSY_POLL_S=600 python -m nanovllm_voxcpm.entrypoints.openai_server \
+    --dit kadirnar/VoxCPM2-Turbo-distilled-DiT:student_k2_dmd.pt
+
+curl -F name=ahmed -F audio_sample=@ahmed.wav localhost:8092/v1/audio/voices
 curl localhost:8092/v1/audio/speech -H 'Content-Type: application/json' \
-  -d '{"input": "هلا والله، كيف حالك اليوم؟", "dialect": "najdi", "voice": "speaker", "response_format": "wav"}' > out.wav
+  -d '{"input": "هلا والله، كيف حالك اليوم؟", "dialect": "najdi", "voice": "ahmed", "response_format": "wav"}' > out.wav
 ```
 
-Set `NANOVLLM_BUSY_POLL_S=600` to keep latency low after idle periods (uses one extra CPU core).
+`NANOVLLM_BUSY_POLL_S=600` keeps the engine awake for 10 minutes after the last request, so latency stays low after
+idle periods. It uses one extra CPU core.
 
-## Samples
+## Benchmark
 
-50 voice-cloned samples with Whisper large-v3 WER / CER:
-[`VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Samples`](https://huggingface.co/datasets/VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Samples).
+The results table comes from:
+
+```bash
+NANOVLLM_BUSY_POLL_S=30 python examples/benchmark.py --voice-dir voices/
+```
+
+- **`voices/`:** a folder of reference clips (`.wav`, 5-10 s each); the requests clone them in turn. The table above
+  used 5 Arabic voices.
+- **Run:** per level, one warm-up burst, then 3 measured bursts (10 at 1 request).
+- **Output:** the table, in Markdown.
+- **Options:**
+  - `--levels 1,16,200` picks the levels.
+  - `--dit none` measures the quality mode.
+- **Conditions:** the GPU must be otherwise idle.
+
+## Notes
+
+- **First start:** compiling the CUDA kernel and capturing CUDA graphs takes 1-2 minutes. Later starts are faster
+  (the kernel is cached in `~/.cache/torch_extensions`).
+- **Memory:** the engine takes 85 % of the GPU memory by default (`gpu_memory_utilization`).
+- **Script names:** do not name a script `concurrent.py`; it hides Python's own `concurrent` module.
 
 ## License
 
