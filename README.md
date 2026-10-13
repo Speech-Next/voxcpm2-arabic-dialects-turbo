@@ -9,6 +9,18 @@ Fast Arabic dialect TTS with voice cloning, built on [VoxCPM2](https://huggingfa
 | 200 | 97 ms | 98 ms | 1.96 s |
 | 256 | 123 ms | 124 ms | 2.43 s |
 
+The configuration measured:
+
+| | |
+|---|---|
+| model | `VoxCPM-Kernel/VoxCPM2-Arabic-Dialects` (VoxCPM2 + dialect LoRAs, mixed in one batch) |
+| LocDiT | `kadirnar/VoxCPM2-Turbo-distilled-DiT:student_k2_dmd.pt`: 2 steps, no CFG |
+| precision | int8 W8A8 (`w8a8=True`) |
+| head start | first audio from the first 8 text tokens (`head_tokens=8`) |
+| requests | voice cloning from reference audio of 5 voices, one sentence each (~7 words) |
+| command | `NANOVLLM_BUSY_POLL_S=30 python examples/benchmark.py --voice-dir voices/` |
+| hardware | one NVIDIA A10, nothing else on the GPU |
+
 ## Setup
 
 **Requirements**
