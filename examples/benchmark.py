@@ -3,10 +3,12 @@
     NANOVLLM_BUSY_POLL_S=30 python examples/benchmark.py --voice-dir voices/
 
 Per level: one warm-up burst, then --rounds bursts of N voice-cloned requests sent at once (10 for N = 1). Request i
-speaks sentence i of ar_dialects.txt, in dialect i (in turn), cloning voice i (in turn) from the .wav files of
---voice-dir. The warm-up pairs each sentence with another dialect and voice: the engine caches a voice's first
-request, text included, and repeating it would measure the cache. Prints, per level, TTFB average / p50 / p95 and the
-average time until the last audio chunk.
+clones voice i (in turn) of the .wav files of --voice-dir. A voice whose file name starts with a dialect
+("JordanianAnas.wav", "SaudiReem.wav", "HindiPooja.wav" for hindi_english) speaks in that dialect; other voices take
+the dialects in turn. Arabic requests speak sentence i of ar_dialects.txt, hindi_english ones hi_sentences.txt. The
+warm-up pairs each request with another voice: the engine caches a voice's first request, text included, and
+repeating it would measure the cache. Prints, per level, TTFB average / p50 / p95 and the average time until the last
+audio chunk.
 """
 
 import argparse
@@ -19,40 +21,52 @@ import numpy as np
 from nanovllm_voxcpm import DialectTTS
 from nanovllm_voxcpm.dialect_tts import DEFAULT_DIT, DEFAULT_MODEL
 
-TEXTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ar_dialects.txt")
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-async def burst(tts, texts, voices, shift=0):
+def lines(name):
+    return [s.strip() for s in open(os.path.join(HERE, name), encoding="utf-8") if s.strip()]
+
+
+def requests(n, voices, dialects, shift=0):
+    """(voice, dialect, text) of request i = 0..n-1."""
+    ar, hi = lines("ar_dialects.txt"), lines("hi_sentences.txt")
+    out = []
+    for i in range(n):
+        v = voices[(i + shift) % len(voices)]
+        d = next((d for d in dialects if v.lower().startswith(d.split("_")[0])), dialects[i % len(dialects)])
+        out.append((v, d, (hi if d == "hindi_english" else ar)[i % len(hi if d == "hindi_english" else ar)]))
+    return out
+
+
+async def burst(tts, reqs):
     """(first audio s, last audio s) of every request, from the instant all were submitted."""
     t0 = time.perf_counter()
 
-    async def one(i, text):
-        k = i + shift
+    async def one(i, voice, dialect, text):
         first = last = None
-        async for _ in tts.stream(text, dialect=tts.dialects[k % len(tts.dialects)], voice=voices[k % len(voices)],
-                                  seed=1000 + i, max_patches=400):
+        async for _ in tts.stream(text, dialect=dialect, voice=voice, seed=1000 + i, max_patches=400):
             last = time.perf_counter() - t0
             first = first if first is not None else last
         return first, last
 
-    return await asyncio.gather(*[one(i, t) for i, t in enumerate(texts)])
+    return await asyncio.gather(*[one(i, *r) for i, r in enumerate(reqs)])
 
 
 async def main(args):
-    sentences = [s.strip() for s in open(TEXTS, encoding="utf-8") if s.strip()]
     levels = [int(x) for x in args.levels.split(",")]
-    async with await DialectTTS.load(args.model, args.dit, max_concurrency=max(levels)) as tts:
+    async with await DialectTTS.load(args.model, args.dit, max_concurrency=max(levels),
+                                     gpu_memory_utilization=args.gpu_memory_utilization) as tts:
         voices = sorted(f[:-4] for f in os.listdir(args.voice_dir) if f.endswith(".wav"))
         for v in voices:
             await tts.add_voice(v, os.path.join(args.voice_dir, f"{v}.wav"))
         print("| requests at once | TTFB avg | TTFB p50 | TTFB p95 | whole sentence, avg |")
         print("|---:|---:|---:|---:|---:|")
         for n in levels:
-            texts = [sentences[i % len(sentences)] for i in range(n)]
-            await burst(tts, texts, voices, shift=1)  # warm-up, see above
+            await burst(tts, requests(n, voices, tts.dialects, shift=7))  # warm-up, see above
             res = []
             for _ in range(10 if n == 1 else args.rounds):
-                res += await burst(tts, texts, voices)
+                res += await burst(tts, requests(n, voices, tts.dialects))
             ttfb = np.array([r[0] for r in res]) * 1000
             total = np.array([r[1] for r in res])
             print(f"| {n} | {ttfb.mean():.1f} ms | {np.percentile(ttfb, 50):.1f} ms | {np.percentile(ttfb, 95):.1f} ms | "
@@ -66,6 +80,8 @@ if __name__ == "__main__":
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--dit", default=DEFAULT_DIT, help="'none' for the model's own LocDiT")
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.85,
+                    help="0.8 for --dit none at 200 requests (its CUDA graphs are larger)")
     args = ap.parse_args()
     args.dit = None if args.dit == "none" else args.dit
     asyncio.run(main(args))

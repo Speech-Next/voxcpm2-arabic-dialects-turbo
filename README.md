@@ -2,24 +2,65 @@
 
 Fast Arabic dialect TTS with voice cloning, built on [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2).
 
-| requests at once (one A10) | first audio, avg | first audio, p95 | whole sentence, avg |
-|---:|---:|---:|---:|
-| 1 | 31 ms | 69 ms | 0.37 s |
-| 64 | 44 ms | 44 ms | 0.98 s |
-| 200 | 97 ms | 98 ms | 1.96 s |
-| 256 | 123 ms | 124 ms | 2.43 s |
+## Results
 
-The configuration measured:
+Tested with the 32 voices of
+[`VoxCPM-Kernel/Arabic-Dialects-and-Hindi-Voice-Samples`](https://huggingface.co/datasets/VoxCPM-Kernel/Arabic-Dialects-and-Hindi-Voice-Samples).
+Each voice is cloned in its own dialect's LoRA of `VoxCPM-Kernel/VoxCPM2-Arabic-Dialects`:
 
-| | |
+| voices | LoRA |
 |---|---|
-| model | `VoxCPM-Kernel/VoxCPM2-Arabic-Dialects` (VoxCPM2 + dialect LoRAs, mixed in one batch) |
-| LocDiT | `kadirnar/VoxCPM2-Turbo-distilled-DiT:student_k2_dmd.pt`: 2 steps, no CFG |
-| precision | int8 W8A8 (`w8a8=True`) |
-| head start | first audio from the first 8 text tokens (`head_tokens=8`) |
-| requests | voice cloning from reference audio of 5 voices, one sentence each (~7 words) |
-| command | `NANOVLLM_BUSY_POLL_S=30 python examples/benchmark.py --voice-dir voices/` |
-| hardware | one NVIDIA A10, nothing else on the GPU |
+| 17 Jordanian | `jordanian` |
+| 5 Palestinian | `palestinian` |
+| 3 Qatari | `qatari` |
+| 3 Saudi | `saudi` |
+| 4 Hindi | `hindi_english` |
+
+Everything runs on one NVIDIA A10 with int8 W8A8 and an 8-token head start.
+
+**Speed, fast mode:** distilled LocDiT, 2 steps, no CFG. All requests are sent at the same instant, each one sentence
+of about 7 words.
+
+| requests at once | first audio, avg | first audio, p95 | whole sentence, avg |
+|---:|---:|---:|---:|
+| 1 | 31 ms | 77 ms | 0.36 s |
+| 16 | 28 ms | 35 ms | 0.46 s |
+| 64 | 37 ms | 39 ms | 0.86 s |
+| 128 | 62 ms | 64 ms | 1.34 s |
+| 200 | 92 ms | 94 ms | 1.92 s |
+| 256 | 119 ms | 120 ms | 2.37 s |
+
+- At 1 request the median is 21 ms; its p95 is the slowest of 10 measurements.
+- Quality mode at 200 requests: first audio p95 277 ms, whole sentence 5.47 s.
+
+**Quality, fast mode:** 6 sentences per voice.
+
+| dialect | CER | WER | naturalness (UTMOS) | speaker similarity |
+|---|---:|---:|---:|---:|
+| jordanian | 5.8 % | 15.8 % | 2.34 | 0.95 |
+| palestinian | 3.4 % | 10.4 % | 2.25 | 0.91 |
+| qatari | 1.8 % | 7.8 % | 2.80 | 0.94 |
+| saudi | 2.6 % | 11.4 % | 2.65 | 0.97 |
+| **Arabic, all** | **4.6 %** | **13.5 %** | **2.41** | **0.95** |
+| hindi_english | 8.9 % | 13.5 % | 2.02 | 0.95 |
+
+**Quality, quality mode** (`dit=None`): the model's own LocDiT, 10 steps with CFG.
+
+| dialect | CER | WER | naturalness (UTMOS) | speaker similarity |
+|---|---:|---:|---:|---:|
+| jordanian | 5.3 % | 14.6 % | 2.76 | 0.96 |
+| palestinian | 3.3 % | 10.4 % | 2.59 | 0.93 |
+| qatari | 2.5 % | 9.9 % | 2.97 | 0.93 |
+| saudi | 1.5 % | 6.8 % | 2.97 | 0.97 |
+| **Arabic, all** | **4.2 %** | **12.5 %** | **2.77** | **0.95** |
+| hindi_english | 10.9 % | 13.9 % | 2.22 | 0.94 |
+
+How the quality was measured:
+- **Arabic CER / WER:** the better of Whisper large-v3 and Cohere Transcribe Arabic. The sentences are held-out
+  dialect sentences (Levantine for jordanian / palestinian, Gulf for qatari, Saudi for saudi).
+- **Hindi:** Whisper large-v3 on 6 simple Hindi sentences (`examples/hi_sentences.txt`), a rough number.
+- **Speaker similarity:** WavLM-SV against the reference clip.
+- **Small samples:** each voice has 6 sentences, so differences between single voices are noise.
 
 ## Setup
 
@@ -86,8 +127,8 @@ if __name__ == "__main__":
 
 | model id | `dit` | LocDiT steps | first audio p95, 200 req. | WER |
 |---|---|---|---:|---:|
-| `VoxCPM-Kernel/VoxCPM2-Arabic-Dialects` | `kadirnar/VoxCPM2-Turbo-distilled-DiT:student_k2_dmd.pt` | 2, no CFG | 98 ms | 17.5 % |
-| `VoxCPM-Kernel/VoxCPM2-Arabic-Dialects` | `None` | 10, with CFG | 294 ms | 13.6 % |
+| `VoxCPM-Kernel/VoxCPM2-Arabic-Dialects` | `kadirnar/VoxCPM2-Turbo-distilled-DiT:student_k2_dmd.pt` | 2, no CFG | 94 ms | 13.5 % |
+| `VoxCPM-Kernel/VoxCPM2-Arabic-Dialects` | `None` | 10, with CFG | 277 ms | 12.5 % |
 | `VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v2` (also pass `w8a8=False`) | `None` | 10, with CFG | not measured | not measured |
 
 - **VoxCPM2-Arabic-Dialects:** ab, egyptian, emirati, hejazi, hindi_english, iraqi, jordanian, najdi, palestinian,
@@ -112,10 +153,16 @@ curl localhost:8092/v1/audio/speech -H 'Content-Type: application/json' \
 
 ## Benchmark
 
+The speed table:
+
 ```bash
-NANOVLLM_BUSY_POLL_S=30 python examples/benchmark.py --voice-dir voices/   # a folder of reference .wav clips
+hf download VoxCPM-Kernel/Arabic-Dialects-and-Hindi-Voice-Samples --repo-type dataset --local-dir voices
+NANOVLLM_BUSY_POLL_S=30 python examples/benchmark.py --voice-dir voices/ --levels 1,16,64,128,200,256
+NANOVLLM_BUSY_POLL_S=30 python examples/benchmark.py --voice-dir voices/ --levels 200 --dit none --gpu-memory-utilization 0.8
 ```
 
-This prints the table at the top: per level, one warm-up burst and 3 measured bursts. Run it on an otherwise idle GPU.
+- **Dialects:** a voice whose file name starts with a dialect (`Jordanian…`, `Saudi…`, `Hindi…`) speaks in it.
+- **Run:** per level, one warm-up burst, then 3 measured bursts.
+- **Conditions:** run it on an otherwise idle GPU. Results vary by a few ms between runs.
 
 License: MIT. VoxCPM2 weights: Apache-2.0.
