@@ -1,9 +1,11 @@
 """Time to first audio (TTFB) and time to the whole sentence, by the number of requests sent at the same instant.
 
-    NANOVLLM_BUSY_POLL_S=30 python examples/benchmark.py --voice-dir voices/
+    NANOVLLM_BUSY_POLL_S=30 python examples/benchmark.py
+
+The model, the distilled LocDiT and the reference voices are downloaded from Hugging Face on first use.
 
 Per level: one warm-up burst, then --rounds bursts of N voice-cloned requests sent at once (10 for N = 1). Request i
-clones voice i (in turn) of the .wav files of --voice-dir. A voice whose file name starts with a dialect
+clones voice i (in turn) of the .wav files of --voices (a folder or a Hugging Face dataset id). A voice whose file name starts with a dialect
 ("JordanianAnas.wav", "SaudiReem.wav", "HindiPooja.wav" for hindi_english) speaks in that dialect; other voices take
 the dialects in turn. Arabic requests speak sentence i of ar_dialects.txt, hindi_english ones hi_sentences.txt. The
 warm-up pairs each request with another voice: the engine caches a voice's first request, text included, and
@@ -22,6 +24,16 @@ from nanovllm_voxcpm import DialectTTS
 from nanovllm_voxcpm.dialect_tts import DEFAULT_DIT, DEFAULT_MODEL
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+VOICES = "VoxCPM-Kernel/Arabic-Dialects-and-Hindi-Voice-Samples"
+
+
+def voice_folder(spec: str) -> str:
+    """A local folder as is; otherwise a Hugging Face dataset id, downloaded (its .wav files) on first use."""
+    if os.path.isdir(spec):
+        return spec
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(spec, repo_type="dataset", allow_patterns=["*.wav"])
 
 
 def lines(name):
@@ -57,9 +69,12 @@ async def main(args):
     levels = [int(x) for x in args.levels.split(",")]
     async with await DialectTTS.load(args.model, args.dit, max_concurrency=max(levels),
                                      gpu_memory_utilization=args.gpu_memory_utilization) as tts:
-        voices = sorted(f[:-4] for f in os.listdir(args.voice_dir) if f.endswith(".wav"))
+        folder = voice_folder(args.voices)
+        voices = sorted(f[:-4] for f in os.listdir(folder) if f.endswith(".wav"))
         for v in voices:
-            await tts.add_voice(v, os.path.join(args.voice_dir, f"{v}.wav"))
+            await tts.add_voice(v, os.path.join(folder, f"{v}.wav"))
+        # every voice once: a voice's first request also encodes its reference, which no measured burst should pay
+        await burst(tts, requests(len(voices), voices, tts.dialects, shift=3))
         print("| requests at once | TTFB avg | TTFB p50 | TTFB p95 | whole sentence, avg |")
         print("|---:|---:|---:|---:|---:|")
         for n in levels:
@@ -75,7 +90,8 @@ async def main(args):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--voice-dir", required=True, help="reference clips (.wav) of the voices to clone")
+    ap.add_argument("--voices", default=VOICES, help="reference clips (.wav) to clone: a folder or a Hugging Face "
+                                                    "dataset id")
     ap.add_argument("--levels", default="1,8,16,32,64,128,200,256", help="requests sent at once, per level")
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--model", default=DEFAULT_MODEL)
