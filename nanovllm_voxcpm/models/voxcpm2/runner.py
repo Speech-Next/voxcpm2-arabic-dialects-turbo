@@ -10,13 +10,13 @@ import xxhash
 from torch.nn.utils import remove_weight_norm
 
 from nanovllm_voxcpm.config import Config
-from nanovllm_voxcpm.engine.model_runner import BaseModelRunner, RunnerTask
+from nanovllm_voxcpm.engine.model_runner import BaseModelRunner, HostPack, RunnerTask
 from nanovllm_voxcpm.layers.audio_vae_v2 import AudioVAEV2
 from nanovllm_voxcpm.models.voxcpm2.config import VoxCPM2Config
 from nanovllm_voxcpm.models.voxcpm2.model import VoxCPM2Model
 from nanovllm_voxcpm.utils.loader import load_model, load_state_dict_into
 from nanovllm_voxcpm.utils.profile import StepProfile
-from nanovllm_voxcpm.utils.seed import derive_step_seed
+from nanovllm_voxcpm.utils.seed import _UINT64_MASK, derive_step_seed, derive_step_seeds
 
 
 def _to_host(t: torch.Tensor) -> np.ndarray:
@@ -69,9 +69,11 @@ def _dump_kernel_trace(trace) -> None:
 
 @dataclass
 class VoxCPM2Payload:
-    text_tokens: np.ndarray | None = None
+    # prefill: the uncached tail's ids / masks / LocEnc keys as lists or arrays (the runner converts the whole step's
+    # at once); decode: arrays
+    text_tokens: np.ndarray | list | None = None
     feats: np.ndarray | None = None
-    feat_masks: np.ndarray | None = None
+    feat_masks: np.ndarray | list | None = None
     temperature: float = 1.0
     cfg_value: float = 1.0
     padding_decode: np.ndarray | None = None
@@ -79,7 +81,7 @@ class VoxCPM2Payload:
     seed_step: int = 0
     prefix_src_block: int | None = None  # ref_prefix_cache hit: block holding the prefix KV
     prefix_len: int = 0
-    feat_keys: np.ndarray | None = None  # uint64 per position, LocEnc cache keys (0 = not cacheable)
+    feat_keys: np.ndarray | list | None = None  # uint64 per position, LocEnc cache keys (0 = not cacheable)
 
 
 _SILENCE_RMS = 10 ** (-50 / 20)  # -50 dBFS
@@ -277,13 +279,26 @@ class VoxCPM2Runner(BaseModelRunner):
 
     def _locenc_inputs(self, seqs: list[RunnerTask[VoxCPM2Payload]]) -> dict[str, torch.Tensor]:
         """Cache rows for every audio position of a prefill batch; LocEnc runs only for first-seen patches."""
-        pos, keys, off = [], [], 0
+        pack = HostPack(getattr(self, "pack_device", "cuda"))
+        finish = self._stage_locenc_inputs(seqs, pack)
+        return finish(pack.upload())
+
+    @staticmethod
+    def _step_feat_keys(seqs: list[RunnerTask[VoxCPM2Payload]]) -> np.ndarray:
+        """The step's LocEnc keys, one per position (0 where a sequence has none)."""
+        keys: list = []
         for seq in seqs:
             payload = seq.custom_payload
-            idx = np.flatnonzero(payload.feat_masks)
-            pos.append(idx + off)
-            off += len(payload.feat_masks)
-            keys.extend(payload.feat_keys[idx].tolist() if payload.feat_keys is not None else [0] * len(idx))
+            keys.extend(payload.feat_keys if payload.feat_keys is not None else [0] * len(payload.feat_masks))
+        return np.array(keys, dtype=np.uint64)
+
+    def _stage_locenc_inputs(self, seqs: list[RunnerTask[VoxCPM2Payload]], pack: HostPack, feat_mask=None):
+        """_locenc_inputs' index arrays staged in ``pack``; returns finish(uploaded) -> the inputs. feat_mask: the
+        step's concatenated masks (built here when not given)."""
+        if feat_mask is None:
+            feat_mask = np.array([m for seq in seqs for m in seq.custom_payload.feat_masks], dtype=np.bool_)
+        pos = np.flatnonzero(feat_mask)  # every audio position of the step
+        keys = self._step_feat_keys(seqs)[pos].tolist()
         cache = self._enc_rows
         for k in keys:  # hits first: they must survive this step's evictions
             if k in cache:
@@ -305,15 +320,11 @@ class VoxCPM2Runner(BaseModelRunner):
                 miss.append(i)
             rows.append(row)
 
-        def dev(values):
-            return torch.tensor(values, dtype=torch.long, device="cpu").pin_memory().cuda(non_blocking=True)
-
-        return {
-            "enc_pos": dev(np.concatenate(pos).tolist() if pos else []),
-            "enc_rows": dev(rows),
-            "enc_miss": dev(miss),
-            "enc_cache": self._enc_cache,
-        }
+        i_pos = pack.add(pos.astype(np.int64))
+        i_rows = pack.add(np.asarray(rows, dtype=np.int64))
+        i_miss = pack.add(np.asarray(miss, dtype=np.int64))
+        return lambda views: {"enc_pos": views[i_pos], "enc_rows": views[i_rows], "enc_miss": views[i_miss],
+                              "enc_cache": self._enc_cache}
 
     def run(self, seqs: list[RunnerTask[VoxCPM2Payload]], is_prefill: bool):
         trace = _kernel_trace(is_prefill, len(seqs))
@@ -325,15 +336,30 @@ class VoxCPM2Runner(BaseModelRunner):
         _dump_kernel_trace(trace)
         return out
 
+    def _noise_seeds(self, seqs: list[RunnerTask[VoxCPM2Payload]]) -> np.ndarray:
+        """Every row's noise seed for seeded_randn (& SEED_MASK, int64): derive_step_seed(seed, step) for seeded
+        requests (numpy, one pass: the per-row Python version was ~0.2 ms at 200 rows), random bits otherwise (drawn
+        in row order, as before)."""
+        from voxcpm_kernels.noise import SEED_MASK
+
+        payloads = [seq.custom_payload for seq in seqs]
+        seeded = [i for i, p in enumerate(payloads) if p.seed is not None and p.seed >= 0]
+        out = np.zeros(len(payloads), dtype=np.uint64)
+        if seeded:
+            out[seeded] = derive_step_seeds([int(payloads[i].seed) & _UINT64_MASK for i in seeded],
+                                            [int(payloads[i].seed_step) for i in seeded])
+        if len(seeded) < len(payloads):
+            ok = set(seeded)
+            for i in range(len(payloads)):
+                if i not in ok:
+                    out[i] = random.getrandbits(63)
+        return (out & np.uint64(SEED_MASK)).astype(np.int64)
+
     def _run(self, seqs: list[RunnerTask[VoxCPM2Payload]], is_prefill: bool):
-        prof = StepProfile(kind="prefill" if is_prefill else "decode", bs=len(seqs)).start()
         if is_prefill:
-            self._prefill_has_audio = any(bool(seq.custom_payload.feat_masks.any()) for seq in seqs)
-            hits = [(s.custom_payload.prefix_src_block, s.block_table[0], s.custom_payload.prefix_len)
-                    for s in seqs if s.custom_payload.prefix_src_block is not None]
-            if hits:  # cached reference prefixes -> this step's sequences, before they attend to them
-                self.copy_kv_blocks([(src, dst) for src, dst, _ in hits], [n for _, _, n in hits])
-        positions = self.prepare_prefill_context(seqs) if is_prefill else self.prepare_decode_context(seqs)
+            return self._run_prefill(seqs)
+        prof = StepProfile(kind="decode", bs=len(seqs)).start()
+        positions = self.prepare_decode_context(seqs)
         prof.mark("ctx")
         inputs = {"positions": positions}
 
@@ -361,21 +387,71 @@ class VoxCPM2Runner(BaseModelRunner):
         inputs["cfg_value"] = (
             torch.tensor(cfg_values, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True).to(self.dtype)
         )
-        if is_prefill and self._prefill_has_audio and getattr(self, "_enc_cache", None) is not None:
-            inputs.update(self._locenc_inputs(seqs))
         prof.mark("h2d")
+        return self._with_noise(seqs, inputs, False, prof)
 
+    def _run_prefill(self, seqs: list[RunnerTask[VoxCPM2Payload]]):
+        """A prefill step: the attention and LoRA contexts and every input (tokens, features, masks, sampling
+        parameters, LocEnc indices, noise seeds) are built on the host into one page-locked buffer and reach the GPU
+        in one copy (the per-tensor copies were ~17 before the first kernel). Same values, dtypes and shapes as the
+        per-tensor path: each input is a view into the one device buffer."""
+        prof = StepProfile(kind="prefill", bs=len(seqs)).start()
+        hits = [(s.custom_payload.prefix_src_block, s.block_table[0], s.custom_payload.prefix_len)
+                for s in seqs if s.custom_payload.prefix_src_block is not None]
+        if hits:  # cached reference prefixes -> this step's sequences, before they attend to them (unless the engine
+            # copied them at admission already: VoxCPM2Engine.on_prefill_admitted)
+            self.copy_kv_blocks([(src, dst) for src, dst, _ in hits], [n for _, _, n in hits])
+        pack = HostPack(getattr(self, "pack_device", "cuda"))
+        finish_ctx = self.stage_prefill_context(seqs, pack)
+        prof.mark("ctx")
+
+        # the tails' ids and masks of the whole step in one conversion each (the engine hands them over as lists)
+        text_tokens, feat_masks, feats, temperatures, cfg_values = [], [], [], [], []
+        for seq in seqs:
+            payload = seq.custom_payload
+            n = len(payload.text_tokens)
+            assert n == payload.feats.shape[0] and n == len(payload.feat_masks)
+            text_tokens.extend(payload.text_tokens)
+            feat_masks.extend(payload.feat_masks)
+            feats.append(payload.feats)
+            temperatures.append(payload.temperature)
+            cfg_values.append(payload.cfg_value)
+        feat_mask = np.array(feat_masks, dtype=np.bool_)
+        self._prefill_has_audio = bool(feat_mask.any())
+        i_tok = pack.add(np.array(text_tokens, dtype=np.int64))
+        i_feat, i_mask = pack.add_concat(feats), pack.add(feat_mask)
+        i_temp = pack.add(np.asarray(temperatures, dtype=np.float32))
+        i_cfg = pack.add(np.asarray(cfg_values, dtype=np.float32))
+        finish_enc = None
+        if self._prefill_has_audio and getattr(self, "_enc_cache", None) is not None:
+            finish_enc = self._stage_locenc_inputs(seqs, pack, feat_mask)
+        seeds = i_seed = None
+        if self._fast_noise:
+            seeds = self._noise_seeds(seqs)
+            i_seed = pack.add(seeds)
+        views = pack.upload()
+        inputs = {"positions": finish_ctx(views)}
+        inputs["text_tokens"] = views[i_tok]
+        inputs["feat"] = views[i_feat].to(self.dtype)
+        inputs["feat_mask"] = views[i_mask]
+        inputs["temperature"] = views[i_temp].to(self.dtype)
+        inputs["cfg_value"] = views[i_cfg].to(self.dtype)
+        if finish_enc is not None:
+            inputs.update(finish_enc(views))
+        prof.mark("h2d")
+        return self._with_noise(seqs, inputs, True, prof, seeds, views[i_seed] if i_seed is not None else None)
+
+    def _with_noise(self, seqs, inputs, is_prefill, prof, seeds=None, seed_t=None):
+        """The step's LocDiT noise (seeded per row), then the model."""
         bsz = len(seqs)
         if self._fast_noise:
             from voxcpm_kernels import seeded_randn
 
-            seeds = [
-                derive_step_seed(int(seq.custom_payload.seed), seq.custom_payload.seed_step)
-                if seq.custom_payload.seed is not None and seq.custom_payload.seed >= 0
-                else random.getrandbits(63)
-                for seq in seqs
-            ]
-            inputs["z_noise"] = seeded_randn(seeds, (self.feat_dim, self.patch_size), dtype=self.dtype)
+            if seeds is None:
+                seeds = self._noise_seeds(seqs)
+            if seed_t is None:
+                seed_t = torch.from_numpy(seeds).pin_memory().cuda(non_blocking=True)
+            inputs["z_noise"] = seeded_randn(seeds, (self.feat_dim, self.patch_size), dtype=self.dtype, seed_t=seed_t)
             return self._run_with_inputs(seqs, inputs, is_prefill, prof)
         seeded_rows = [
             (i, int(seq.custom_payload.seed), seq.custom_payload.seed_step)

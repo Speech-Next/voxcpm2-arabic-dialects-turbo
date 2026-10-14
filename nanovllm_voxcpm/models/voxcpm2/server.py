@@ -364,8 +364,25 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
     sched = getattr(getattr(srv, "llm", None), "scheduler", None)
     group = min(sched.max_num_seqs, getattr(sched, "max_prefill_seqs", sched.max_num_seqs)) if sched else first_chunk
 
-    def n_waiting() -> int:
-        return len(sched.waiting) if sched is not None else 0
+    def n_waiting() -> int:  # waiting for a prefill step, also when admitted to the next one already (prepare)
+        if sched is None:
+            return 0
+        return sched.num_queued if hasattr(sched, "num_queued") else len(sched.waiting)
+
+    # In the admission window the engine is idle and the next step is a prefill of what registers there. Whenever
+    # no request is pending, it admits what has registered so far into that step and builds their runner inputs
+    # (and starts their reference-prefix KV copies): the step that follows the last request only does that for the
+    # requests after the last idle moment. Requests that trickle in (HTTP) leave idle moments between them; a burst
+    # handed over at once does not, and runs exactly as before.
+    prepare_prefill = getattr(getattr(srv, "llm", None), "prepare_prefill", None)
+
+    def prepare() -> None:
+        if prepare_prefill is None or sched is None or not sched.waiting:
+            return
+        t0 = time.perf_counter()
+        n = prepare_prefill()
+        if _profile.StepProfile.enabled and n:
+            _profile.log(kind="prepare", t=t0, n=n, ms=(time.perf_counter() - t0) * 1000)
 
     window = {"n": 0, "end": False}  # commands of the current admission window, last message ended a client turn
 
@@ -466,9 +483,16 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
                 if remaining <= 0:
                     break
                 try:
-                    cmd = queue_in.get(timeout=remaining if more else min(remaining, gap_ms / 1000.0))
-                except Empty:
-                    break
+                    cmd = queue_in.get_nowait()
+                except Empty:  # idle until the next request: prepare the step for the ones registered so far
+                    gap_end = time.perf_counter() + gap_ms / 1000.0  # the gap counts from here, as before
+                    prepare()
+                    now = time.perf_counter()
+                    remaining = (hard if more else deadline) - now
+                    try:  # (a request that came during prepare() is taken even past the deadline)
+                        cmd = queue_in.get(timeout=max(0.0, remaining if more else min(remaining, gap_end - now)))
+                    except Empty:
+                        break
                 put(handle(cmd))
 
         if srv.is_finished():

@@ -19,13 +19,18 @@ def _seeded_randn(seed_ptr, out_ptr, n_per_row, BLOCK: tl.constexpr):
     tl.store(out_ptr + row.to(tl.int64) * n_per_row + offs, z.to(out_ptr.dtype.element_ty), mask=offs < n_per_row)
 
 
-def seeded_randn(seeds, row_shape, dtype=torch.float32, device="cuda") -> torch.Tensor:
-    """seeds: sequence of non-negative ints (< 2**63), one per row -> tensor [len(seeds), *row_shape]."""
+SEED_MASK = 0x7FFFFFFFFFFFFFFF
+
+
+def seeded_randn(seeds, row_shape, dtype=torch.float32, device="cuda", seed_t=None) -> torch.Tensor:
+    """seeds: sequence of non-negative ints (< 2**63), one per row -> tensor [len(seeds), *row_shape].
+    seed_t: the seeds (each & SEED_MASK) already on the device as int64, e.g. in a step's one host-to-device copy."""
     n = 1
     for d in row_shape:
         n *= d
-    seed_t = torch.tensor([int(s) & 0x7FFFFFFFFFFFFFFF for s in seeds], dtype=torch.int64, device="cpu", pin_memory=True)
-    seed_t = seed_t.to(device, non_blocking=True)
+    if seed_t is None:
+        seed_t = torch.tensor([int(s) & SEED_MASK for s in seeds], dtype=torch.int64, device="cpu", pin_memory=True)
+        seed_t = seed_t.to(device, non_blocking=True)
     out = torch.empty(len(seeds), *row_shape, device=device, dtype=dtype)
     _seeded_randn[(len(seeds),)](seed_t, out, n, BLOCK=triton.next_power_of_2(n))
     return out
