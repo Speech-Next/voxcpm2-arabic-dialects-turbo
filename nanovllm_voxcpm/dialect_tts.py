@@ -21,9 +21,21 @@ from typing import AsyncIterator
 
 import numpy as np
 
+from nanovllm_voxcpm.arabic_text import has_arabic, normalize as normalize_text
+
 DEFAULT_MODEL = "VoxCPM-Kernel/VoxCPM2-Arabic-Dialects"
 DEFAULT_DIT = "kadirnar/VoxCPM2-Turbo-distilled-DiT:student_k2_dmd.pt"
+NOT_ARABIC = frozenset({"hindi_english"})  # dialects whose text is not read as Arabic
 _INT16_SCALE = np.float32(1 / 32768)
+
+
+def read_as(text: str, dialect: str | None = None) -> str:
+    """``text`` as the model reads it in ``dialect`` (canonical name, aliases resolved; None: the base model or a
+    transcript without a dialect): arabic_text.normalize, formal for "msa", colloquial otherwise. Unchanged for a
+    NOT_ARABIC dialect and for text without Arabic script (Hindi, English: their digits are not Arabic words)."""
+    if dialect in NOT_ARABIC or not has_arabic(text):
+        return text
+    return normalize_text(text, "msa" if dialect == "msa" else "colloquial")
 
 
 def resolve(spec: str) -> str:
@@ -132,6 +144,7 @@ class DialectTags:
         return cls(json.load(open(spec, encoding="utf-8"))) if os.path.exists(spec) else None
 
     def canonical(self, dialect: str) -> str:
+        """The dialect an alias names (qatari -> gulf); a dialect itself as is."""
         if dialect not in self.tags and dialect not in self.aliases:
             raise ValueError(f"unknown dialect {dialect!r}; dialects: {', '.join(self.names)}")
         return self.aliases.get(dialect, dialect)
@@ -174,7 +187,8 @@ class DialectTTS:
         self.tags = DialectTags(tags) if tags else None
         self.dialects = self.tags.names if tags else dialects
         self.voices: dict[str, bool] = {}  # name -> registered with a transcript
-        self._voice_src: dict[str, tuple[bytes, str]] = {}  # tagged models: latents and transcript of prompt_ref voices
+        # tagged models: latents, transcript and its normalize flag of prompt_ref voices
+        self._voice_src: dict[str, tuple[bytes, str, bool]] = {}
 
     @classmethod
     async def load(cls, model: str = DEFAULT_MODEL, dit: str | None = DEFAULT_DIT, *, max_concurrency: int = 256,
@@ -215,19 +229,21 @@ class DialectTTS:
         gc.freeze()
         return cls(server, sorted(adapters), sample_rate, tags)
 
-    async def add_voice(self, name: str, audio: str | bytes, text: str | None = None, audio_format: str = "wav") -> None:
+    async def add_voice(self, name: str, audio: str | bytes, text: str | None = None, audio_format: str = "wav",
+                        normalize: bool = True) -> None:
         """Register a voice from a reference clip (a file path or its bytes). With ``text`` (the clip's transcript)
         the voice is cloned by continuing the reference (``prompt_ref``); without it, from its timbre (``ref``: the
-        fastest under load, its KV cached once per voice and dialect)."""
+        fastest under load, its KV cached once per voice and dialect). normalize: the transcript is read like target
+        text (read_as: colloquial; a tagged model's copy of the voice per dialect in that dialect's style)."""
         if isinstance(audio, str):
             audio_format = os.path.splitext(audio)[1].lstrip(".") or audio_format
             with open(audio, "rb") as f:
                 audio = f.read()
         latents = await self.server.encode_latents(audio, audio_format)
-        await self.server.register_voice(name, latents, text or None)
+        await self.server.register_voice(name, latents, (read_as(text) if normalize else text) if text else None)
         self.voices[name] = bool(text)
         if self.tags is not None and text:
-            self._voice_src[name] = (latents, text)
+            self._voice_src[name] = (latents, text, normalize)
 
     async def remove_voice(self, name: str) -> None:
         await self.server.unregister_voice(name)
@@ -240,14 +256,16 @@ class DialectTTS:
                      clone_mode: str | None = None, seed: int | None = None, cfg_value: float = 2.0,
                      max_patches: int = 600, normalize: bool = True) -> AsyncIterator[np.ndarray]:
         """Audio chunks (float32 in [-1, 1], ``sample_rate``) of ``text`` in ``dialect`` (None: the base model),
-        cloning ``voice`` (None: no cloning). max_patches: at most this many 160 ms patches. normalize: digits,
-        times, amounts and percentages read as words (arabic_text), formal for MSA, colloquial otherwise."""
+        cloning ``voice`` (None: no cloning). max_patches: at most this many 160 ms patches. normalize: Arabic text
+        read as the model was trained on it (read_as: digits, dates, times, amounts as words; formal when the dialect,
+        aliases resolved, is msa); hindi_english and text without Arabic script stay as they are."""
         if dialect is not None and dialect not in self.dialects:
             raise ValueError(f"unknown dialect {dialect!r}; dialects: {', '.join(self.dialects)}")
+        canonical = self.tags.canonical(dialect) if self.tags is not None and dialect is not None else dialect
         if normalize:
-            from nanovllm_voxcpm.arabic_text import normalize as normalize_text
-
-            text = normalize_text(text, "msa" if dialect == "msa" else "colloquial")
+            text = read_as(text, canonical)
+        if not text.strip():
+            raise ValueError("text is empty" + (" after normalization" if normalize else ""))
         kw = {}
         if voice is not None:
             if voice not in self.voices:
@@ -259,7 +277,9 @@ class DialectTTS:
             if dialect is not None:
                 tag = self.tags.tag(dialect)
                 if kw.get("clone_mode") in ("prompt_ref", "prompt"):  # the transcript comes first: the tag leads it
-                    kw["voice"] = await self.tags.voice_copy(self.server, voice, tag, *self._voice_src[voice])
+                    latents, transcript, norm = self._voice_src[voice]
+                    kw["voice"] = await self.tags.voice_copy(self.server, voice, tag, latents,
+                                                             read_as(transcript, canonical) if norm else transcript)
                 else:
                     text = tag + text
         async for chunk in self.server.generate(target_text=text, lora_name=lora, seed=seed, cfg_value=cfg_value,

@@ -8,11 +8,12 @@ adapters (see LoRA below).
 
 Endpoints (request shapes follow vLLM-Omni's, so one client can drive both servers):
 
-    POST   /v1/audio/voices         multipart: audio_sample (file), name, ref_text (optional), consent (ignored)
+    POST   /v1/audio/voices         multipart: audio_sample (file), name, ref_text (optional), consent (ignored),
+                                    normalize (default true)
     GET    /v1/audio/voices
     DELETE /v1/audio/voices/{name}
     POST   /v1/audio/speech         JSON: input, voice, stream, response_format ("pcm" | "wav"), clone_mode,
-                                    seed, cfg_value, max_tokens, split
+                                    seed, cfg_value, max_tokens, split, normalize (default true)
     GET    /v1/models, /health
 
 A voice is encoded to latents once, when it is registered (or preloaded with --voices), and kept inside the engine
@@ -34,6 +35,10 @@ its own request's adapter. The voices' reference-prefix KV cache is kept per ada
 
 A model with a ``dialects.json`` (one model for all dialects, see DialectTags) has no adapters: ``"dialect"`` names a
 dialect (``/v1/models`` lists them), whose tag token is put in front of the text.
+
+Arabic input and ref_text are read as the model was trained on them (dialect_tts.read_as: digits, dates, times, amounts
+as words; formal when the request's dialect or adapter, aliases resolved, is msa); hindi_english and text without
+Arabic script stay as they are. ``"normalize": false`` sends the text as written.
 """
 
 import argparse
@@ -51,9 +56,8 @@ import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, ValidationError
 
-from nanovllm_voxcpm.arabic_text import normalize as normalize_text
-from nanovllm_voxcpm.dialect_tts import (DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters, resolve,
-                                         turbo_config, use_model_calibration)
+from nanovllm_voxcpm.dialect_tts import (DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters, read_as,
+                                         resolve, turbo_config, use_model_calibration)
 
 CLONE_MODES = ("prompt_ref", "ref", "prompt")
 VOICE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # voice names are also file names in --voice-dir
@@ -95,13 +99,15 @@ def _join(a: str, b: str) -> str:
     return a + b if a[-1] in "。！？；，、" else f"{a} {b}"  # no space after CJK punctuation
 
 
-def save_voice(voice_dir: str, name: str, latents: bytes, text: str | None, audio: bytes, audio_format: str) -> None:
+def save_voice(voice_dir: str, name: str, latents: bytes, text: str | None, audio: bytes, audio_format: str,
+               normalize: bool = True) -> None:
     os.makedirs(voice_dir, exist_ok=True)
     with open(os.path.join(voice_dir, f"{name}.latents"), "wb") as f:
         f.write(latents)
     with open(os.path.join(voice_dir, f"{name}.{audio_format}"), "wb") as f:
         f.write(audio)
-    meta = {"name": name, "text": text, "audio": f"{name}.{audio_format}", "created_at": int(time.time())}
+    meta = {"name": name, "text": text, "normalize": normalize, "audio": f"{name}.{audio_format}",
+            "created_at": int(time.time())}  # text: the transcript as written
     with open(os.path.join(voice_dir, f"{name}.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False)
 
@@ -138,7 +144,7 @@ class SpeechRequest(BaseModel):
     split: bool = True  # long input: sentence by sentence into one stream
     lora: str | None = None  # a registered LoRA adapter (--lora-dir / --lora)
     dialect: str | None = None  # alias of lora; a tagged model's dialect
-    normalize: bool = True  # digits, times, amounts, percentages as Arabic words (nanovllm_voxcpm.arabic_text)
+    normalize: bool = True  # Arabic input read as the model was trained on it (dialect_tts.read_as)
 
 
 def pcm16(chunk: np.ndarray) -> bytes:
@@ -174,18 +180,22 @@ def build_app(args: argparse.Namespace):
             jobs += [run(name, m) for m in modes]
         await asyncio.gather(*jobs)
 
-    async def register(name: str, audio: bytes, audio_format: str, text: str | None) -> dict:
+    async def register(name: str, audio: bytes, audio_format: str, text: str | None, normalize: bool = True) -> dict:
         # encoded once and kept inside the engine: a request then sends only the voice name
         latents = await state["pool"].encode_latents(audio, audio_format)
-        await state["pool"].register_voice(name, latents, text or None)
+        await register_voice(name, latents, text or None, normalize)
         if args.voice_dir:
-            save_voice(args.voice_dir, name, latents, text or None, audio, audio_format)
-        state["voices"][name] = voice_entry(latents, text or None, int(time.time()))
+            save_voice(args.voice_dir, name, latents, text or None, audio, audio_format, normalize)
+        state["voices"][name] = voice_entry(latents, text or None, int(time.time()), normalize)
         await warm_up([name])
         return {"name": name, "has_transcript": bool(text), "created_at": state["voices"][name]["created_at"]}
 
-    def voice_entry(latents: bytes, text: str | None, created_at) -> dict:
-        v = {"text": text, "created_at": created_at}
+    async def register_voice(name: str, latents: bytes, text: str | None, normalize: bool) -> None:
+        """The engine gets the transcript as target text is read (no dialect: colloquial)."""
+        await state["pool"].register_voice(name, latents, read_as(text) if text and normalize else text)
+
+    def voice_entry(latents: bytes, text: str | None, created_at, normalize: bool = True) -> dict:
+        v = {"text": text, "created_at": created_at, "normalize": normalize}
         if state["tags"] is not None and text:
             v["latents"] = latents  # its per-dialect copies are registered from these
         return v
@@ -229,8 +239,9 @@ def build_app(args: argparse.Namespace):
         state["sample_rate"] = int((await pool.get_model_info())["sample_rate"])
         if args.voice_dir:  # voices registered in earlier runs: latents are on disk, no re-encoding
             for meta, latents in load_voices(args.voice_dir):
-                await pool.register_voice(meta["name"], latents, meta.get("text"))
-                state["voices"][meta["name"]] = voice_entry(latents, meta.get("text"), meta.get("created_at"))
+                norm = meta.get("normalize", True)
+                await register_voice(meta["name"], latents, meta.get("text"), norm)
+                state["voices"][meta["name"]] = voice_entry(latents, meta.get("text"), meta.get("created_at"), norm)
             await warm_up(list(state["voices"]))
         if args.voices:
             for v in json.load(open(args.voices, encoding="utf-8")):
@@ -280,13 +291,14 @@ def build_app(args: argparse.Namespace):
         audio_sample: UploadFile = File(...),
         ref_text: str | None = Form(None),
         consent: str | None = Form(None),
+        normalize: bool = Form(True),
     ):
         if not VOICE_NAME.match(name):
             raise HTTPException(400, "voice name: 1-64 characters from A-Z a-z 0-9 . _ -")
         if name in state["voices"]:
             raise HTTPException(409, f"voice '{name}' exists; DELETE /v1/audio/voices/{name} first")
         audio_format = os.path.splitext(audio_sample.filename or "")[1].lstrip(".") or "wav"
-        return await register(name, await audio_sample.read(), audio_format, ref_text)
+        return await register(name, await audio_sample.read(), audio_format, ref_text, normalize)
 
     @app.get("/v1/audio/voices")
     async def list_voices():
@@ -348,20 +360,25 @@ def build_app(args: argparse.Namespace):
                     "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
         await send({"type": "http.response.body", "body": body})
 
-    async def synthesize(req: SpeechRequest, vk: dict, tag: str | None = None):
-        """Audio chunks of the whole input: one engine request per sentence, in order. tag: a tagged model's dialect
-        token, in front of every sentence (or of the transcript: prompt_ref clones the voice's copy for the tag)."""
-        text = req.input
-        if req.normalize:
-            dialect = state["tags"].canonical(req.dialect) if tag is not None else req.dialect
-            text = normalize_text(text, "msa" if dialect == "msa" else "colloquial")
+    def request_dialect(req: SpeechRequest, lk: dict) -> str | None:
+        """The dialect the request is read in: its adapter (lora / dialect / model / --default-lora), or a tagged
+        model's dialect with aliases resolved."""
+        if state["tags"] is not None:
+            return state["tags"].canonical(req.dialect) if req.dialect is not None else None
+        return lk.get("lora_name")
+
+    async def synthesize(req: SpeechRequest, text: str, vk: dict, tag: str | None = None, dialect: str | None = None):
+        """Audio chunks of ``text`` (the input as read): one engine request per sentence, in order. tag: a tagged
+        model's dialect token, in front of every sentence (or of the transcript: prompt_ref clones the voice's copy for
+        the tag, its transcript read in ``dialect``)."""
         parts = split_text(text, args.split_max_chars) if req.split else [text]
         prefix = ""
         if tag is not None:
             if vk.get("clone_mode") in ("prompt_ref", "prompt"):  # the transcript comes first: the tag leads it
                 v = state["voices"][vk["voice"]]
+                transcript = read_as(v["text"], dialect) if v["normalize"] else v["text"]
                 vk = {**vk, "voice": await state["tags"].voice_copy(state["pool"], vk["voice"], tag, v["latents"],
-                                                                    v["text"])}
+                                                                    transcript)}
             else:
                 prefix = tag
         for k, part in enumerate(parts):
@@ -394,9 +411,12 @@ def build_app(args: argparse.Namespace):
             req = SpeechRequest.model_validate_json(body)
             if req.response_format not in ("pcm", "wav"):
                 raise HTTPException(400, "response_format must be 'pcm' or 'wav'")
-            if not req.input.strip():
+            vk, lk, tag = voice_kwargs(req), lora_kwargs(req), dialect_tag(req)
+            dialect = request_dialect(req, lk)
+            text = read_as(req.input, dialect) if req.normalize else req.input
+            if not text.strip():  # after normalization: tatweel or marks alone read as nothing
                 raise HTTPException(400, "input is empty")
-            gen = synthesize(req, {**voice_kwargs(req), **lora_kwargs(req)}, dialect_tag(req))
+            gen = synthesize(req, text, {**vk, **lk}, tag, dialect)
             try:
                 first = await gen.__anext__()  # errors (e.g. a prompt too long) become HTTP errors
             except StopAsyncIteration:

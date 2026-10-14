@@ -28,6 +28,8 @@ dependencies = [
 [project.optional-dependencies]
 # the OpenAI-compatible HTTP server (nanovllm_voxcpm.entrypoints.openai_server)
 server = ["fastapi", "uvicorn", "python-multipart"]
+# the tests: python -m pytest tests
+dev = ["pytest"]
 
 [tool.setuptools.packages.find]
 include = ["nanovllm_voxcpm*", "voxcpm_kernels*"]
