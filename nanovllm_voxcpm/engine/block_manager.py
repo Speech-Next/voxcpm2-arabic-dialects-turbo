@@ -32,6 +32,24 @@ Allocation uses the hash chain:
   token ids, we treat it as a cache hit and increase its reference count.
 - If there is any cache miss at block k, all subsequent blocks must be treated
   as misses as well (because their prefixes differ).
+- A LoRA adapter changes the KV of every position: the chain of an adapter's
+  sequence starts from a seed derived from its ``adapter_id`` (ids are never
+  reused), base-model sequences from none, so equal tokens in two adapters
+  never share a block.
+- The last block is never taken from the cache: the last token always runs
+  (its prefill produces the first output), and a block other sequences read is
+  never written.
+
+Hash-entry lifecycle
+--------------------
+``hash_to_block_id`` maps a rolling hash to the block that currently holds the
+matching content. An entry is created when a full block is registered as a
+cache candidate (:meth:`BlockManager._publish`) and dropped when the block is
+recycled for different content (:meth:`BlockManager._allocate_block`).
+Releasing a block intentionally keeps the entry: a freed block's KV stays
+intact until the block is handed to a new owner, so a later request with the
+same prefix can "resurrect" it as a cache hit. A stale entry would otherwise
+point at a recycled block whose new content has equal tokens but another prefix.
 
 Reference counting
 ------------------
@@ -108,13 +126,29 @@ class BlockManager:
                 h.update(it)
         return h.intdigest()
 
+    @staticmethod
+    def chain_seed(seq: Sequence) -> int:
+        """The hash chain's start for ``seq``: its LoRA adapter's (-1 = none, the base model)."""
+        adapter_id = getattr(seq, "adapter_id", None)
+        if adapter_id is None:
+            return -1
+        return xxhash.xxh64_intdigest(b"lora-adapter" + int(adapter_id).to_bytes(8, "little", signed=True))
+
     def _allocate_block(self, block_id: int) -> Block:
+        """Take a free block into use; a recycled block's old content (and its hash entry) ends here."""
         block = self.blocks[block_id]
         assert block.ref_count == 0
+        if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
+            self.hash_to_block_id.pop(block.hash)
         block.reset()
         self.free_block_ids.remove(block_id)
         self.used_block_ids.add(block_id)
         return self.blocks[block_id]
+
+    def _publish(self, block: Block, hash: int, token_ids: list[int | bytes]) -> None:
+        """Register a full block as a prefix-cache candidate (the only writer of ``hash_to_block_id``)."""
+        block.update(hash, token_ids)
+        self.hash_to_block_id[hash] = block.block_id
 
     def _deallocate_block(self, block_id: int) -> None:
         assert self.blocks[block_id].ref_count == 0
@@ -126,13 +160,15 @@ class BlockManager:
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
-        h = -1
+        h = self.chain_seed(seq)
         cache_miss = False
+        last = seq.num_blocks - 1
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
             block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            # the last block is computed: a fully cached prompt still prefills (and owns) the block of its last token
+            if block_id == -1 or i == last or self.blocks[block_id].token_ids != token_ids:
                 cache_miss = True
             if cache_miss:
                 block_id = self.free_block_ids[0]
@@ -145,8 +181,7 @@ class BlockManager:
                 else:
                     block = self._allocate_block(block_id)
             if h != -1:
-                block.update(h, token_ids)
-                self.hash_to_block_id[h] = block_id
+                self._publish(block, h, token_ids)
             seq.block_table.append(block_id)
 
     def deallocate(self, seq: Sequence):
@@ -172,9 +207,8 @@ class BlockManager:
         elif len(seq) % self.block_size == 0:
             if last_block.hash == -1:
                 token_ids = seq.block(seq.num_blocks - 1)
-                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else self.chain_seed(seq)
                 h = self.compute_hash(token_ids, prefix)
-                last_block.update(h, token_ids)
-                self.hash_to_block_id[h] = last_block.block_id
+                self._publish(last_block, h, token_ids)
         else:
             assert last_block.hash == -1

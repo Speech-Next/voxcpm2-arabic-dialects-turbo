@@ -93,6 +93,9 @@ class Sequence(Generic[PlayloadType]):
         self.lora_name = lora_name
         self.adapter_id = adapter_id
         self.stoped = False
+        # holds a stream's model-side state (the VAE decoder's slot) from its first step until it ends, also while
+        # preempted or as a head start's continuation: the scheduler keeps at most max_num_seqs such sequences
+        self.has_stream = False
 
     def __len__(self):
         return self.num_tokens

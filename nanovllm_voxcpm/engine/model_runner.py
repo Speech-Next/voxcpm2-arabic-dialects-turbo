@@ -990,12 +990,15 @@ class BaseModelRunner:
 
     def _set_graph_lora_context(self, graph_vars: dict, domain: str, context: LoRAContext) -> None:
         self._copy_lora_domain_to_graph_vars(graph_vars, domain, context)
-        if self._fused_lora_layers() and not context.no_lora_flag:  # segmented GEMMs' tile tables for this step
+        if self._fused_lora_layers():  # segmented GEMMs' tile tables for this step
             from voxcpm_kernels.seg_gemm import SEG_TABLES
 
             rows = graph_vars["lora_domains"][domain]["token_to_slot"].numel()
-            slots = list(context.host_token_to_slot or [])
-            SEG_TABLES.update(domain, slots + [-1] * (rows - len(slots)), self.max_loras + 1)
+            if context.no_lora_flag:  # a LoRA graph replayed for another domain's adapters reads these tables too
+                SEG_TABLES.update_base(domain, rows, self.max_loras + 1)
+            else:
+                slots = list(context.host_token_to_slot or [])
+                SEG_TABLES.update(domain, slots + [-1] * (rows - len(slots)), self.max_loras + 1)
         domain_vars = graph_vars["lora_domains"][domain]
         token_count = context.token_count
         num_lora_buckets = domain_vars["active_slot_ids"].size(0)

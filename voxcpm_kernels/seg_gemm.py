@@ -48,9 +48,12 @@ class SegTables:
     def __init__(self) -> None:
         self.bufs: dict[tuple[str, int], torch.Tensor] = {}
         self.staging: dict[tuple[str, int], torch.Tensor] = {}
+        # the pinned staging buffer's last H2D copy: it is rewritten only once that copy has run
+        self.copied: dict[tuple[str, int], torch.cuda.Event] = {}
         # row segments a step of the domain may have (default: one per weight); CFG lays the LocDiT's rows out as
         # [conditional batch][unconditional batch], each grouped by adapter: twice as many segments
         self.segments: dict[str, int] = {}
+        self.base: set[str] = set()  # domains whose tables hold the all-base layout (update_base)
 
     def max_segments(self, domain: str, n_weights: int) -> int:
         return max(n_weights, self.segments.get(domain, 0))
@@ -63,6 +66,7 @@ class SegTables:
             assert not torch.cuda.is_current_stream_capturing(), "SegTables.reserve() before capturing"
             buf = torch.zeros(need, 3, dtype=torch.int32, device="cuda")
             self.bufs[key] = buf
+            self.base.discard(domain)
             self.staging[key] = torch.zeros(need, 3, dtype=torch.int32, device="cpu", pin_memory=True)
         return buf
 
@@ -79,6 +83,7 @@ class SegTables:
         s = np.asarray(slots, dtype=np.int32)
         if s.size and int((s[1:] != s[:-1]).sum()) + 1 > self.max_segments(domain, n_weights):
             raise ValueError("LoRA rows are not grouped by adapter (the scheduler orders a step's sequences)")
+        self.base.discard(domain)
         for (dom, bm), buf in self.bufs.items():
             if dom != domain:
                 continue
@@ -86,10 +91,25 @@ class SegTables:
             if t.shape[0] > buf.shape[0]:
                 raise ValueError(f"{t.shape[0]} tiles exceed the captured table ({buf.shape[0]})")
             st = self.staging[(dom, bm)]
+            ev = self.copied.get((dom, bm))
+            if ev is not None:
+                ev.synchronize()  # the previous copy may still read this staging buffer
             st.zero_()
             if t.shape[0]:
                 st[: t.shape[0]].copy_(torch.from_numpy(t))
             buf.copy_(st, non_blocking=True)
+            if not torch.cuda.is_current_stream_capturing():
+                if ev is None:
+                    ev = self.copied[(dom, bm)] = torch.cuda.Event()
+                ev.record()
+
+    def update_base(self, domain: str, rows: int, n_weights: int) -> None:
+        """All ``rows`` on the base weights (a step without adapters in ``domain``): a LoRA graph replayed for the
+        other domains' adapters must not read this domain's last adapter layout. No-op while the tables hold it."""
+        if domain in self.base:
+            return
+        self.update(domain, np.full(rows, -1, dtype=np.int32), n_weights)
+        self.base.add(domain)
 
 
 SEG_TABLES = SegTables()

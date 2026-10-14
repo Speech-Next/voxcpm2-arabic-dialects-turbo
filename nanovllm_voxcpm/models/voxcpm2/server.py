@@ -724,9 +724,8 @@ class AsyncVoxCPM2Server:
                 if item.get("type") == "stream_shm":
                     try:
                         data = self._ring.read(item["off"], item["nb"], item["end"], item["dtype"], item["n"])
-                    except RuntimeError as e:  # overwritten: end the stream rather than play wrong audio
-                        print(f"[voxcpm2] {e}", flush=True)
-                        data = None
+                    except RuntimeError as e:  # overwritten: the stream fails (and is cancelled), no wrong audio
+                        data = e
                     items[k] = {"type": "stream", "id": item["id"], "data": data}
             if res.get("type") == "stream_shm":
                 res = items[0]
@@ -946,7 +945,8 @@ class AsyncVoxCPM2Server:
             while True:
                 data = await self.stream_table[seq_id].get()
                 if isinstance(data, BaseException):
-                    is_normal_exit = True  # nothing to cancel: the engine is gone
+                    # the engine is gone: nothing to cancel; otherwise (lost audio) the finally cancels the request
+                    is_normal_exit = data is self._engine_error
                     raise data
                 if data is None:
                     is_normal_exit = True

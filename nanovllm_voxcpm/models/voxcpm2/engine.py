@@ -299,27 +299,42 @@ class VoxCPM2Engine(LLMEngineBase):
         clone_mode: str | None = None,
         head_start: bool | None = None,
         text_tokens: list[int] | None = None,
-    ):
+        resume: bool = False,
+    ) -> Sequence[VoxCPM2SeqPayload]:
         """voice / clone_mode: a registered voice in "prompt_ref" (reference + continuation, the default with a
         transcript), "ref" (the default without one) or "prompt" mode, in place of latents and prompt_text.
         head_start: None = TurboConfig.head_tokens decides, False = never for this request.
-        text_tokens: the ids of prompt_text + target_text when the caller has them (head start, pretokenize())."""
+        text_tokens: the ids of prompt_text + target_text when the caller has them (head start, pretokenize()).
+        resume: a head start's continuation (internal): it keeps the head's stream and is queued first.
+        Returns the queued sequence (the head, with head start)."""
         if max_generate_length < 1:
             raise ValueError(f"max_generate_length must be >= 1, got {max_generate_length}")
         if head_start is not False and self.head_tokens > 0 and max_generate_length > self.head_patches:
             split = self._split_head(prompt_text, target_text, voice, clone_mode)
             if split is not None:
                 head_ids, full_ids = split
+                entry = self.voices.get(voice) if voice is not None else None
+                if voice is None or entry is not None:  # (an unknown voice: the head's add_request says so)
+                    # the whole request must fit now: its continuation is built only after the head's patches
+                    try:
+                        self._check_length(
+                            self._prompt_len(full_ids, prompt_latents, ref_audio_latents, entry, clone_mode),
+                            max_generate_length,
+                        )
+                    except ValueError:
+                        self._pretok_map.pop(prompt_text + target_text, None)
+                        raise
+                # voice_entry: the voice as the head saw it, also if it is unregistered before the continuation
                 chain = dict(target_text=target_text, prompt_text=prompt_text, prompt_latents=prompt_latents,
                              ref_audio_latents=ref_audio_latents, max_generate_length=max_generate_length,
                              temperature=temperature, cfg_value=cfg_value, lora_name=lora_name, seed=seed,
-                             voice=voice, clone_mode=clone_mode, text_ids=full_ids)
-                self.add_request(seq_id, target_text, prompt_text, prompt_latents, ref_audio_latents,
-                                 self.head_patches, temperature, cfg_value, lora_name, seed, voice, clone_mode,
-                                 head_start=False, text_tokens=head_ids)
-                self.scheduler.waiting[-1].custom_payload.chain = chain
+                             voice=voice, voice_entry=entry, clone_mode=clone_mode, text_ids=full_ids)
+                head = self.add_request(seq_id, target_text, prompt_text, prompt_latents, ref_audio_latents,
+                                        self.head_patches, temperature, cfg_value, lora_name, seed, voice, clone_mode,
+                                        head_start=False, text_tokens=head_ids)
+                head.custom_payload.chain = chain
                 self._pretok_map.pop(prompt_text + target_text, None)
-                return
+                return head
         ref = self.prepare_audio(ref_audio_latents) if ref_audio_latents is not None else None
         prompt = self.prepare_audio(prompt_latents) if prompt_latents is not None else None
         if voice is not None:
@@ -377,19 +392,7 @@ class VoxCPM2Engine(LLMEngineBase):
                 # continuation only: requests of this voice share the prompt-text tokens at the start
                 ref_key = xxhash.xxh64_intdigest(prompt.key.to_bytes(8, "little") + b"prompt")
 
-        prompt_len = len(hash_tokens)
-        total_len_upper_bound = prompt_len + max_generate_length
-        if prompt_len > self.max_model_len:
-            raise ValueError(
-                f"Prompt is too long for max_model_len: prompt_len={prompt_len} > max_model_len={self.max_model_len}"
-            )
-        if total_len_upper_bound > self.max_model_len:
-            raise ValueError(
-                "Request may exceed max_model_len: "
-                f"prompt_len({prompt_len}) + max_generate_length({max_generate_length}) = {total_len_upper_bound} "
-                f"> max_model_len({self.max_model_len}). "
-                "Reduce input length or max_generate_length, or increase max_model_len."
-            )
+        self._check_length(len(hash_tokens), max_generate_length)
 
         adapter_id = self.resolve_lora(lora_name)
         if ref_key is not None and adapter_id is not None:  # LoRA changes the KV
@@ -416,7 +419,38 @@ class VoxCPM2Engine(LLMEngineBase):
             lora_name=lora_name,
             adapter_id=adapter_id,
         )
-        self.add_sequence(seq)
+        seq.has_stream = resume  # a continuation carries on the head's stream (VAE state): ahead of new requests
+        self.add_sequence(seq, front=resume)
+        return seq
+
+    def _check_length(self, prompt_len: int, max_generate_length: int) -> None:
+        total_len_upper_bound = prompt_len + max_generate_length
+        if prompt_len > self.max_model_len:
+            raise ValueError(
+                f"Prompt is too long for max_model_len: prompt_len={prompt_len} > max_model_len={self.max_model_len}"
+            )
+        if total_len_upper_bound > self.max_model_len:
+            raise ValueError(
+                "Request may exceed max_model_len: "
+                f"prompt_len({prompt_len}) + max_generate_length({max_generate_length}) = {total_len_upper_bound} "
+                f"> max_model_len({self.max_model_len}). "
+                "Reduce input length or max_generate_length, or increase max_model_len."
+            )
+
+    def _prompt_len(self, text_ids, prompt_latents, ref_audio_latents, entry: RegisteredVoice | None,
+                    clone_mode: str | None) -> int:
+        """add_request's prompt length (hash tokens) without building the request: text ids + audio start,
+        [ref start] reference patches [ref end], prompt patches. A head start's continuation is at most this plus
+        the head's patches, which its max_generate_length gives up: the whole request's check covers it."""
+        per_patch = self.patch_size * self.feat_dim
+        n_ref = np.asarray(ref_audio_latents).size // per_patch if ref_audio_latents is not None else None
+        n_prompt = np.asarray(prompt_latents).size // per_patch if prompt_latents is not None else 0
+        if entry is not None:
+            mode = clone_mode or ("prompt_ref" if entry.text else "ref")
+            n = entry.audio.patches.shape[0]
+            n_prompt = n if mode != "ref" else 0
+            n_ref = n if mode != "prompt" else None
+        return len(text_ids) + 1 + (n_ref + 2 if n_ref is not None else 0) + n_prompt
 
     @property
     def _pretok_map(self) -> dict[str, tuple[list[int], list[tuple[int, int]]]]:
@@ -514,9 +548,8 @@ class VoxCPM2Engine(LLMEngineBase):
                 if feats else None)
         kw = dict(chain)
         prompt, prompt_text, ref = kw.pop("prompt_latents"), kw.pop("prompt_text"), kw.pop("ref_audio_latents")
-        voice, mode = kw.pop("voice"), kw.pop("clone_mode")
+        voice, mode, entry = kw.pop("voice"), kw.pop("clone_mode"), kw.pop("voice_entry")
         if voice is not None:  # resolve the registered voice into latents, as add_request does
-            entry = self.voices[voice]
             mode = mode or ("prompt_ref" if entry.text else "ref")
             frames = entry.audio.patches.reshape(-1, self.feat_dim)
             if mode != "ref":
@@ -529,22 +562,22 @@ class VoxCPM2Engine(LLMEngineBase):
             kw["prompt_latents"] = prompt
         kw["prompt_text"], kw["ref_audio_latents"], kw["max_generate_length"] = prompt_text, ref, rest
         kw["text_tokens"] = kw.pop("text_ids")
-        self.add_request(seq.seq_id, head_start=False, **kw)
-        new = self.scheduler.waiting[-1]
+        new = self.add_request(seq.seq_id, head_start=False, resume=True, **kw)
         new.custom_payload.seed_step = payload.seed_step
         return True
 
     def step(self):
-        seqs = super().step()
-        for seq in seqs:
-            if seq.stoped and seq.custom_payload.chain is not None:
-                try:
-                    seq.custom_payload.chained = self._continue_head(seq)
-                except ValueError:  # e.g. the continuation exceeds max_model_len: the stream ends with the head
-                    seq.custom_payload.chained = False
-                if not seq.custom_payload.chained:
-                    self.model_runner.call("release_sequence_state", seq.seq_id)
-        return seqs
+        with self.stepping():  # a cancel during the step runs after it: it also reaches a continuation queued here
+            seqs = super().step()
+            for seq in reversed(seqs):  # continuations go to the front of the queue, in this step's order
+                if seq.stoped and seq.custom_payload.chain is not None:
+                    try:
+                        seq.custom_payload.chained = self._continue_head(seq)
+                    except ValueError:  # e.g. its LoRA was unregistered meanwhile: the stream ends with the head
+                        seq.custom_payload.chained = False
+                    if not seq.custom_payload.chained:
+                        self.model_runner.call("release_sequence_state", seq.seq_id)
+            return seqs
 
     def on_seq_removed(self, seq: Sequence, *, was_running: bool) -> None:
         if seq.stoped and getattr(seq.custom_payload, "chain", None) is not None:
