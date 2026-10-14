@@ -20,7 +20,10 @@ The scheduler operates in two modes (returned as ``is_prefill``):
    - Pull from ``waiting`` in FIFO order.
    - Admit a sequence only if:
      * batched tokens would not exceed ``max_num_batched_tokens``
-     * :meth:`BlockManager.can_allocate` is true for the full prompt length.
+     * :meth:`BlockManager.can_allocate` is true for the full prompt length
+     * it holds stream state already (preempted, a head start's continuation), or fewer than ``max_num_seqs``
+       sequences do (``num_streams``): the runner's per-stream state (VAE slots) is sized for ``max_num_seqs``, so
+       ``running`` never exceeds it and every running sequence decodes each step.
    - Allocate KV blocks (:meth:`BlockManager.allocate`) and move the sequence to
      ``running``.
    - If prefix caching hits, ``Sequence.num_cached_tokens`` may be > 0, and only
@@ -68,11 +71,13 @@ from nanovllm_voxcpm.engine.block_manager import BlockManager
 
 
 def _by_adapter(seqs: list[Sequence]) -> list[Sequence]:
-    """A step's sequences grouped by LoRA adapter (stable; base-model sequences first): every adapter's rows are
-    one contiguous segment, which the segmented GEMMs of merged adapter weights (voxcpm_kernels.seg_gemm) need."""
+    """A step's sequences grouped by LoRA adapter (stable; base-model sequences last): every adapter's rows are
+    one contiguous segment, which the segmented GEMMs of merged adapter weights (voxcpm_kernels.seg_gemm) need.
+    Base rows last: a CUDA graph's padding rows (base, -1) then extend the base segment instead of adding one, so a
+    step with base rows and all max_loras adapters stays within the captured max_loras + 1 segments (2x for CFG)."""
     if len(seqs) < 2 or all(seq.adapter_id is None for seq in seqs):
         return seqs
-    return sorted(seqs, key=lambda seq: -1 if seq.adapter_id is None else seq.adapter_id)
+    return sorted(seqs, key=lambda seq: (seq.adapter_id is None, seq.adapter_id or 0))
 
 
 class Scheduler:
@@ -87,16 +92,24 @@ class Scheduler:
         self.callbacks = callbacks
 
         self._id_to_seq: dict[str, Sequence] = {}
+        # sequences holding stream state (Sequence.has_stream: running, preempted, head start continuations); the
+        # VAE decoder has max_num_seqs slots, so a new request waits while they are all taken
+        self.num_streams = 0
 
     def is_finished(self):
         return not self.waiting and not self.running
 
-    def add(self, seq: Sequence):
+    def add(self, seq: Sequence, front: bool = False):
+        """front: ahead of the queue (a head start's continuation, which carries on a stream already playing)."""
         self._id_to_seq[seq.seq_id] = seq
+        self.num_streams += seq.has_stream
         if self.callbacks is not None:
             self.callbacks.on_seq_added(seq)
 
-        self.waiting.append(seq)
+        if front:
+            self.waiting.appendleft(seq)
+        else:
+            self.waiting.append(seq)
 
     def cancel(self, seq_id: str):
         try:
@@ -105,6 +118,7 @@ class Scheduler:
             return
 
         self.block_manager.deallocate(seq)
+        self.num_streams -= seq.has_stream
         was_running = seq.status == SequenceStatus.RUNNING
         if seq.status == SequenceStatus.RUNNING:
             self.running.remove(seq)
@@ -127,6 +141,12 @@ class Scheduler:
             if not self.waiting or num_seqs >= min(self.max_num_seqs, self.max_prefill_seqs):
                 break
             seq = self.waiting.popleft()
+            if not seq.has_stream and self.num_streams >= self.max_num_seqs:
+                # every stream slot is taken: a new request waits, a resuming one (preempted, continuation) may run
+                deferred_waiting.append(seq)
+                if self.num_streams == len(self.running):  # none waits to resume
+                    break
+                continue
             hint = prefix_hint(seq) if prefix_hint is not None else 0
             if (
                 num_batched_tokens + len(seq) - hint > self.max_num_batched_tokens
@@ -138,15 +158,18 @@ class Scheduler:
                 deferred_waiting.append(seq)
                 continue
             self.block_manager.allocate(seq)
+            if not seq.has_stream:
+                seq.has_stream = True
+                self.num_streams += 1
             seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
             if self.callbacks is not None:
                 self.callbacks.on_seq_running(seq)
-            tokens_to_compute = len(seq) - seq.num_cached_tokens
-            if tokens_to_compute > 0:
-                num_seqs += 1
-                scheduled_seqs.append(seq)
-                num_batched_tokens += tokens_to_compute
+            # always >= 1: the block manager and the model-level prefix cache both leave the last token to compute
+            # (it produces the step's patch), so an admitted sequence is always prefilled
+            num_seqs += 1
+            scheduled_seqs.append(seq)
+            num_batched_tokens += len(seq) - seq.num_cached_tokens
         while deferred_waiting:
             self.waiting.appendleft(deferred_waiting.pop())
 
@@ -177,8 +200,11 @@ class Scheduler:
             self.callbacks.on_seq_waiting(seq)
 
     def finish(self, seq: Sequence):
+        if self._id_to_seq.get(seq.seq_id) is not seq:  # cancelled already
+            return
         seq.status = SequenceStatus.FINISHED
         self.block_manager.deallocate(seq)
+        self.num_streams -= seq.has_stream
         self.running.remove(seq)
         self._id_to_seq.pop(seq.seq_id)
         if self.callbacks is not None:

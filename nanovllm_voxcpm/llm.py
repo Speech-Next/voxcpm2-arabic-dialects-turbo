@@ -43,7 +43,8 @@ class VoxCPM:
         if not os.path.isfile(config_file):
             raise FileNotFoundError(f"Config file `{config_file}` not found")
 
-        config = json.load(open(config_file))
+        with open(config_file) as f:
+            config = json.load(f)
 
         arch = config["architecture"]
 

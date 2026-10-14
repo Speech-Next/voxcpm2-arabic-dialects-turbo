@@ -107,6 +107,8 @@ class TurboConfig(BaseModel):
     which only drops work whose result was masked out anyway.
     """
 
+    model_config = ConfigDict(extra="forbid")  # a misspelled key fails at startup instead of being ignored
+
     first_steps: Optional[int] = None  # CFM steps for the first patch (None = inference_timesteps)
     cfg_steps: int = -1  # evaluated decode steps that use CFG (-1 = all, 0 = none)
     first_cfg_steps: int = -1  # same for the first patch

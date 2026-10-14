@@ -33,10 +33,12 @@ def load(name: str, sweep: bool = False):
     )
 
 
+@functools.cache  # a failed build is tried once per process, not by every layer that asks
 def available(name: str) -> bool:
     try:
         load(name)
         return True
     except Exception as e:  # no nvcc / ninja, or a compile error: the Triton path stays
-        print(f"[voxcpm_kernels] CUDA extension {name!r} unavailable: {str(e).splitlines()[-1][:200]}")
+        last = (str(e).strip().splitlines() or [type(e).__name__])[-1]
+        print(f"[voxcpm_kernels] CUDA extension {name!r} unavailable: {last[:200]}")
         return False

@@ -59,7 +59,10 @@ on top of this base engine:
 """
 
 import atexit
+import contextlib
 import sys
+from collections import deque
+
 import torch.multiprocessing as mp
 
 from nanovllm_voxcpm.config import Config
@@ -81,6 +84,11 @@ def get_distributed_port():
 class LLMEngineBase:
     model_runner: BaseModelRunner
     scheduler: Scheduler
+    # cancels that arrive during a step (the runner's overlap hook runs commands while the GPU computes) wait for
+    # its end: the step still decodes, postprocesses and finishes the sequences it scheduled
+    _step_depth = 0
+    _deferred_cancels: deque | None = None
+    _exited = False
 
     def __init__(
         self,
@@ -130,16 +138,35 @@ class LLMEngineBase:
         atexit.register(self.exit)
 
     def exit(self):
+        if self._exited:  # also registered with atexit
+            return
+        self._exited = True
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
             p.join()
 
-    def add_sequence(self, seq: Sequence):
-        self.scheduler.add(seq)
+    def add_sequence(self, seq: Sequence, front: bool = False):
+        self.scheduler.add(seq, front=front)
 
     def cancel_sequence(self, seq_id: str):
+        if self._step_depth:
+            if self._deferred_cancels is None:
+                self._deferred_cancels = deque()
+            self._deferred_cancels.append(seq_id)
+            return
         self.scheduler.cancel(seq_id)
+
+    @contextlib.contextmanager
+    def stepping(self):
+        """Around a step (nestable: a model engine's step wraps this one): cancels wait for the outermost end."""
+        self._step_depth += 1
+        try:
+            yield
+        finally:
+            self._step_depth -= 1
+            while not self._step_depth and self._deferred_cancels:
+                self.scheduler.cancel(self._deferred_cancels.popleft())
 
     def register_lora(
         self, name: str, payload: LoRAModelPayload | list[LoRAModelPayload] | tuple[LoRAModelPayload, ...]
@@ -149,13 +176,13 @@ class LLMEngineBase:
         self.model_runner.call("validate_lora_payload", payload)
         try:
             self.model_runner.call("register_lora", adapter_id, name, payload)
-        except Exception:
+            self.lora_manager.register_lora(name, local_payload, adapter_id=adapter_id)
+        except Exception:  # runner and manager stay in step: neither keeps the adapter
             try:
                 self.model_runner.call("unregister_lora", adapter_id)
             except Exception:
                 pass
             raise
-        self.lora_manager.register_lora(name, local_payload, adapter_id=adapter_id)
         return adapter_id
 
     def unregister_lora(self, name: str) -> None:
@@ -196,23 +223,24 @@ class LLMEngineBase:
         self.model_runner.call("release_sequence_state", seq.seq_id)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        if not seqs:
+        with self.stepping():
+            seqs, is_prefill = self.scheduler.schedule()
+            if not seqs:
+                return seqs
+
+            runner_tasks = [self.preprocess_seq(seq, is_prefill) for seq in seqs]
+            outputs = self.model_runner.call("run", runner_tasks, is_prefill)
+
+            for seq, output in zip(seqs, outputs):
+                self.postprocess_seq(seq, output, is_prefill)
+            if is_prefill:
+                self.after_prefill(seqs)
+
+            for seq in seqs:
+                if seq.stoped:
+                    self.scheduler.finish(seq)
+
             return seqs
-
-        runner_tasks = [self.preprocess_seq(seq, is_prefill) for seq in seqs]
-        outputs = self.model_runner.call("run", runner_tasks, is_prefill)
-
-        for seq, output in zip(seqs, outputs):
-            self.postprocess_seq(seq, output, is_prefill)
-        if is_prefill:
-            self.after_prefill(seqs)
-
-        for seq in seqs:
-            if seq.stoped:
-                self.scheduler.finish(seq)
-
-        return seqs
 
     def after_prefill(self, seqs) -> None:
         """Hook for model engines (e.g. to cache prefix KV); runs before finished sequences are freed."""
