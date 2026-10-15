@@ -112,10 +112,10 @@ def _cfg(m: int, n: int, kind: str) -> int:
     """Tile configuration by row count, measured on the A10 at base_lm's FFN shapes (tests/gpu/bench_sparse24.py):
     gate_up (SwiGLU, N = 12288, K = 2048) and down (residual, N = 2048, K = 6144)."""
     if kind == "swiglu":
-        for rows, cfg in ((8, 4), (16, 3), (32, 7), (64, 2), (128, 1)):
+        for rows, cfg in ((8, 4), (16, 3), (32, 7), (64, 2), (128, 1), (1023, 0)):
             if m <= rows:
                 return cfg
-        return 0
+        return 12  # 64 x 64 warp tiles: 1306 rows 492 -> 462 us
     for rows, cfg in ((16, 4), (64, 3), (128, 2), (200, 5), (256, 1)):
         if m <= rows:
             return cfg
