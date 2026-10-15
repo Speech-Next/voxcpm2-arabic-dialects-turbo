@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
 
+import numpy as np
 import torch
 
 from nanovllm_voxcpm.lora import assert_available as assert_lora_available
@@ -74,21 +75,37 @@ class LoRABatchPlan:
     slot_start_offsets: list[int]
 
 
-def _build_lora_metadata_from_token_to_slot(
-    token_to_slot: list[int],
-) -> tuple[list[int], list[int], list[int], list[int]]:
-    slot_to_indices: dict[int, list[int]] = {}
-    for token_idx, slot_id in enumerate(token_to_slot):
-        if slot_id >= 0:
-            slot_to_indices.setdefault(slot_id, []).append(token_idx)
+_LOOP_MAX_ROWS = 512  # LoRA metadata: the per-token loop up to here, numpy above (measured crossover)
 
-    active_slot_ids = sorted(slot_to_indices)
-    num_tokens_per_slot = [len(slot_to_indices[slot_id]) for slot_id in active_slot_ids]
-    token_indices_sorted_by_slot = [token_idx for slot_id in active_slot_ids for token_idx in slot_to_indices[slot_id]]
-    slot_start_offsets = [0]
-    for count in num_tokens_per_slot:
-        slot_start_offsets.append(slot_start_offsets[-1] + count)
-    return token_indices_sorted_by_slot, active_slot_ids, num_tokens_per_slot, slot_start_offsets
+
+def _build_lora_metadata_from_token_to_slot(
+    token_to_slot,
+) -> tuple[list[int], list[int], list[int], list[int]]:
+    """(token indices grouped by slot, ascending within a slot; active slots ascending; tokens per slot; offsets) of
+    the tokens with a slot (>= 0). numpy, one pass: the per-token Python loop took ~0.7 ms of a 200-request prefill
+    step's preparation (its LM, projection and LocDiT domains: ~1300 + 200 + ~2300 rows). Up to _LOOP_MAX_ROWS rows
+    (every decode step, small prefills) the loop is faster: numpy's fixed cost is ~15 us, the loop's ~1 us per 16
+    rows."""
+    if len(token_to_slot) <= _LOOP_MAX_ROWS:
+        slot_to_indices: dict[int, list[int]] = {}
+        for token_idx, slot_id in enumerate(token_to_slot):
+            if slot_id >= 0:
+                slot_to_indices.setdefault(int(slot_id), []).append(token_idx)
+        active_slot_ids = sorted(slot_to_indices)
+        num_tokens_per_slot = [len(slot_to_indices[slot_id]) for slot_id in active_slot_ids]
+        token_indices_sorted_by_slot = [i for slot_id in active_slot_ids for i in slot_to_indices[slot_id]]
+        slot_start_offsets = [0]
+        for count in num_tokens_per_slot:
+            slot_start_offsets.append(slot_start_offsets[-1] + count)
+        return token_indices_sorted_by_slot, active_slot_ids, num_tokens_per_slot, slot_start_offsets
+    s = np.asarray(token_to_slot, dtype=np.int64).reshape(-1)
+    idx = np.flatnonzero(s >= 0)
+    if idx.size == 0:
+        return [], [], [], [0]
+    slots = s[idx]
+    active, counts = np.unique(slots, return_counts=True)
+    order = idx[np.argsort(slots, kind="stable")]  # stable: token order within each slot
+    return order.tolist(), active.tolist(), counts.tolist(), [0] + np.cumsum(counts).tolist()
 
 
 def build_lora_batch_plan_from_token_to_slot(
@@ -209,6 +226,37 @@ def build_lora_context_from_slot_list(
     )
 
 
+def stage_lora_context(context: LoRAContext, add: Callable[[np.ndarray], int]) -> Callable[[list], LoRAContext]:
+    """materialize_lora_context through a step's HostPack: ``add`` stages an int32 array (returns its index); the
+    returned function builds, from the uploaded tensors, the context materialize_lora_context would have built (the
+    same five device arrays, flags and host lists), without an H2D copy of its own."""
+    if context.token_to_slot is not None or context.host_token_to_slot is None:
+        return lambda views: context
+    host_slots = context.host_token_to_slot
+    indices = context.host_token_indices_sorted_by_slot or []
+    active = context.host_active_slot_ids or []
+    counts = context.host_num_tokens_per_slot or []
+    host = dict(host_token_to_slot=host_slots, host_token_indices_sorted_by_slot=indices,
+                host_active_slot_ids=active, host_num_tokens_per_slot=counts)
+    if not active:
+        i = add(np.asarray(host_slots, dtype=np.int32))
+        return lambda views: LoRAContext(token_to_slot=views[i], no_lora_flag=True, num_active_loras=0, **host)
+    offsets = [0]
+    for c in counts:
+        offsets.append(offsets[-1] + c)
+    ids = [add(np.asarray(values, dtype=np.int32)) for values in (host_slots, indices, active, counts, offsets)]
+    return lambda views: LoRAContext(
+        token_to_slot=views[ids[0]],
+        token_indices_sorted_by_slot=views[ids[1]],
+        active_slot_ids=views[ids[2]],
+        num_tokens_per_slot=views[ids[3]],
+        slot_start_offsets=views[ids[4]],
+        no_lora_flag=False,
+        num_active_loras=len(active),
+        **host,
+    )
+
+
 def materialize_lora_context(context: LoRAContext) -> LoRAContext:
     """Create device metadata for a host-only graph context on eager fallback."""
     if context.token_to_slot is not None or context.host_token_to_slot is None:
@@ -308,7 +356,7 @@ class _LoRAStateBase:
         entry.gpu_running_ref_count += 1
         if entry.state == LoRALifecycleState.REGISTERED:
             entry.state = LoRALifecycleState.ACTIVE
-        self._refresh_slot_states()
+        self._refresh_entry_slot(entry)
 
     def on_sequence_preempted(self, adapter_id: int | None) -> None:
         if adapter_id is None:
@@ -317,7 +365,7 @@ class _LoRAStateBase:
         if entry.gpu_running_ref_count <= 0:
             raise RuntimeError(f"LoRA adapter {adapter_id} GPU ref count underflow")
         entry.gpu_running_ref_count -= 1
-        self._refresh_slot_states()
+        self._refresh_entry_slot(entry)
 
     def on_sequence_finished(self, adapter_id: int | None, *, was_running: bool) -> None:
         if adapter_id is None:
@@ -337,21 +385,27 @@ class _LoRAStateBase:
             entry.state = LoRALifecycleState.REGISTERED
 
     def can_schedule(self, running_adapter_ids: set[int], candidate_adapter_id: int | None) -> bool:
+        """Can every adapter of ``running_adapter_ids`` and the candidate's be resident at once: the required adapters
+        without a slot (missing) fit into free slots plus idle slots of adapters not required (reclaimable). One pass
+        over the slots, no sets built (the scheduler asks once per admitted request)."""
         if not self.enabled or candidate_adapter_id is None:
             return True
-        required = set(running_adapter_ids)
-        required.add(candidate_adapter_id)
-        resident = {slot.adapter_id for slot in self._slots if slot.adapter_id is not None}
-        missing = required - resident
-        reclaimable = sum(1 for slot in self._slots if slot.adapter_id is None)
-        reclaimable += sum(
-            1
-            for slot in self._slots
-            if slot.adapter_id is not None
-            and slot.adapter_id not in required
-            and slot.resident_state == LoRAResidentState.IDLE
-        )
-        return len(missing) <= reclaimable
+        missing = len(running_adapter_ids) + (candidate_adapter_id not in running_adapter_ids)  # |required|
+        reclaimable = 0
+        resident_required = None
+        for slot in self._slots:
+            adapter_id = slot.adapter_id
+            if adapter_id is None:
+                reclaimable += 1
+            elif adapter_id == candidate_adapter_id or adapter_id in running_adapter_ids:
+                if resident_required is None:
+                    resident_required = set()
+                resident_required.add(adapter_id)
+            elif slot.resident_state == LoRAResidentState.IDLE:
+                reclaimable += 1
+        if resident_required is not None:
+            missing -= len(resident_required)
+        return missing <= reclaimable
 
     def _remove_entry(self, adapter_id: int) -> None:
         entry = self._entries[adapter_id]
@@ -363,6 +417,21 @@ class _LoRAStateBase:
         entry.state = LoRALifecycleState.REMOVED
         self._name_to_adapter_id.pop(entry.name, None)
         self._entries.pop(adapter_id, None)
+
+    def _refresh_entry_slot(self, entry: LoRAControlEntry) -> None:
+        """_refresh_slot_states after a change of ``entry``'s GPU ref count, for its slot only: every other slot is up
+        to date already (each count change refreshes its own slot; a removed entry clears its slot in _remove_entry;
+        build_batch_plan refreshes all slots before it reads any state). A slot holds an adapter exactly when the
+        adapter's entry names it (_assign_slot / _evict_slot / _remove_entry set both), and the control plane
+        (LoRAManager) never assigns slots at all: walking every slot twice per admitted request was ~0.3 ms of a
+        200-request prefill step."""
+        if entry.slot_id is None:
+            return
+        slot = self._slots[entry.slot_id]
+        if slot.adapter_id != entry.adapter_id:  # not reachable (see above); the full refresh stays correct
+            self._refresh_slot_states()
+            return
+        slot.resident_state = LoRAResidentState.ACTIVE if entry.gpu_running_ref_count > 0 else LoRAResidentState.IDLE
 
     def _refresh_slot_states(self) -> None:
         for slot in self._slots:

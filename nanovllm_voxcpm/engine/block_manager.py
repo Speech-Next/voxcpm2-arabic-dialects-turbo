@@ -126,13 +126,19 @@ class BlockManager:
                 h.update(it)
         return h.intdigest()
 
+    _CHAIN_SEEDS: dict[int, int] = {}  # adapter id -> its chain seed (a pure function of the id)
+
     @staticmethod
     def chain_seed(seq: Sequence) -> int:
         """The hash chain's start for ``seq``: its LoRA adapter's (-1 = none, the base model)."""
         adapter_id = getattr(seq, "adapter_id", None)
         if adapter_id is None:
             return -1
-        return xxhash.xxh64_intdigest(b"lora-adapter" + int(adapter_id).to_bytes(8, "little", signed=True))
+        seed = BlockManager._CHAIN_SEEDS.get(adapter_id)
+        if seed is None:
+            seed = BlockManager._CHAIN_SEEDS[adapter_id] = xxhash.xxh64_intdigest(
+                b"lora-adapter" + int(adapter_id).to_bytes(8, "little", signed=True))
+        return seed
 
     def _allocate_block(self, block_id: int) -> Block:
         """Take a free block into use; a recycled block's old content (and its hash entry) ends here."""
@@ -160,10 +166,14 @@ class BlockManager:
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
+        num_blocks = seq.num_blocks
+        last = num_blocks - 1
+        if num_blocks == 1 and seq.num_tokens < self.block_size:  # one partial block (a short prompt): never cached,
+            seq.block_table.append(self._allocate_block(self.free_block_ids[0]).block_id)  # hashed or published
+            return
         h = self.chain_seed(seq)
         cache_miss = False
-        last = seq.num_blocks - 1
-        for i in range(seq.num_blocks):
+        for i in range(num_blocks):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
             block_id = self.hash_to_block_id.get(h, -1)

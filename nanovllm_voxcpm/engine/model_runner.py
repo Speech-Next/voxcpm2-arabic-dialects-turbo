@@ -72,10 +72,12 @@ Concrete example: VoxCPM
   them to be streamed.
 """
 
+import math
 import os
 import sys
 import pickle
 import tempfile
+import numpy as np
 import torch
 
 from nanovllm_voxcpm.utils import profile as _profile
@@ -90,6 +92,7 @@ from nanovllm_voxcpm.engine.lora_manager import (
     build_lora_context_from_batch_plan,
     build_lora_context_from_slot_list,
     materialize_lora_context,
+    stage_lora_context,
 )
 from nanovllm_voxcpm.layers.attention import Attention
 from nanovllm_voxcpm.layers.lora import iter_lora_modules
@@ -193,8 +196,77 @@ def expand_dit_lora_slots(
     padded_batch_size = batch_size if padded_batch_size is None else padded_batch_size
     if padded_batch_size < batch_size:
         raise ValueError("padded_batch_size cannot be smaller than the real batch size")
-    padded_slots = sample_to_slot + [-1] * (padded_batch_size - batch_size)
-    return [slot for _ in range(cfg_branches) for slot in padded_slots for _ in range(sequence_length)]
+    if padded_batch_size * sequence_length <= 128:  # a few rows: the comprehension beats numpy's fixed cost
+        padded = list(sample_to_slot) + [-1] * (padded_batch_size - batch_size)
+        return [slot for _ in range(cfg_branches) for slot in padded for _ in range(sequence_length)]
+    padded_slots = np.full(padded_batch_size, -1, dtype=np.int64)
+    padded_slots[:batch_size] = sample_to_slot
+    # each slot sequence_length times, the padded batch once per CFG branch (numpy: ~2300 rows at 200 requests)
+    return np.tile(np.repeat(padded_slots, max(sequence_length, 0)), max(cfg_branches, 0)).tolist()
+
+
+_TORCH_DTYPES = {np.dtype(d): t for d, t in (
+    (np.int64, torch.int64), (np.int32, torch.int32), (np.int16, torch.int16), (np.int8, torch.int8),
+    (np.uint8, torch.uint8), (np.bool_, torch.bool), (np.float64, torch.float64), (np.float32, torch.float32),
+    (np.float16, torch.float16))}
+
+
+class HostPack:
+    """A step's host inputs staged in one page-locked buffer and copied to the GPU in one transfer. Every small H2D
+    copy costs a pinned allocation, a device allocation and a cudaMemcpyAsync: a prefill step made ~17 of them
+    before its first kernel. add() / add_concat() return the index of the tensor upload() hands back: a view into
+    the one device buffer with the array's dtype, shape and values. Parts start at multiples of 256 bytes, as fresh
+    allocations do, so kernels that specialize on pointer alignment see the alignment they saw before."""
+
+    ALIGN = 256
+
+    def __init__(self, device="cuda"):
+        self.device = torch.device(device)
+        self.parts: list[tuple[tuple, np.dtype, object]] = []  # (shape, dtype, array or arrays to concatenate)
+
+    def add(self, array) -> int:
+        a = np.asarray(array)  # (np.ascontiguousarray would make a 0-d array 1-d)
+        self.parts.append((a.shape, a.dtype, a))
+        return len(self.parts) - 1
+
+    def add_concat(self, arrays: list[np.ndarray]) -> int:
+        """np.concatenate(arrays) (the first array's dtype), written straight into the staging buffer."""
+        first = arrays[0]
+        self.parts.append(((sum(a.shape[0] for a in arrays), *first.shape[1:]), first.dtype, arrays))
+        return len(self.parts) - 1
+
+    def upload(self) -> list[torch.Tensor]:
+        counts = [math.prod(shape) for shape, _, _ in self.parts]
+        offsets, total = [], 0
+        for (_, dtype, _), n in zip(self.parts, counts):
+            offsets.append(total)
+            total += -(-n * dtype.itemsize // self.ALIGN) * self.ALIGN
+        total = max(total, self.ALIGN)
+        on_gpu = self.device.type == "cuda"
+        host = torch.empty(total, dtype=torch.uint8, device="cpu", pin_memory=on_gpu)
+        buf = host.numpy()
+        typed_host: dict = {}  # the buffer viewed once per dtype (offsets are multiples of every item size)
+        for (shape, dtype, src), off, n in zip(self.parts, offsets, counts):
+            view = typed_host.get(dtype)
+            if view is None:
+                view = typed_host[dtype] = buf.view(dtype)
+            dst = view[off // dtype.itemsize : off // dtype.itemsize + n]
+            if len(shape) != 1:
+                dst = dst.reshape(shape)
+            if isinstance(src, list):
+                np.concatenate(src, axis=0, out=dst)
+            else:
+                dst[...] = src
+        dev = host.to(self.device, non_blocking=True) if on_gpu else host
+        typed: dict = {}
+        out = []
+        for (shape, dtype, _), off, n in zip(self.parts, offsets, counts):
+            t = typed.get(dtype)
+            if t is None:
+                t = typed[dtype] = dev.view(_TORCH_DTYPES[dtype])
+            v = t[off // dtype.itemsize : off // dtype.itemsize + n]
+            out.append(v if len(shape) == 1 else v.view(shape))
+        return out
 
 
 def _clear_lora_slot_modules(modules, slot_id: int, module_names: list[str] | None = None) -> None:
@@ -439,6 +511,10 @@ class BaseModelRunner:
 
     def lora_on_sequence_started(self, adapter_id: int | None) -> None:
         self.lora_runtime.on_sequence_started(adapter_id)
+
+    def lora_on_sequences_started(self, adapter_ids: list[int | None]) -> None:
+        for adapter_id in adapter_ids:
+            self.lora_runtime.on_sequence_started(adapter_id)
 
     def lora_on_sequence_preempted(self, adapter_id: int | None) -> None:
         self.lora_runtime.on_sequence_preempted(adapter_id)
@@ -740,65 +816,71 @@ class BaseModelRunner:
         return torch.tensor(block_tables_list, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
     def prepare_prefill_context(self, seqs: list[RunnerTask]):
-        positions_list: list[int] = []
-        cu_seqlens_q_list: list[int] = [0]
-        cu_seqlens_k_list: list[int] = [0]
-        max_seqlen_q = 0
-        max_seqlen_k = 0
-        slot_mapping_list: list[int] = []
-        block_tables: torch.Tensor | None = None
-        for seq in seqs:
-            seq_len = seq.seq_length
-            positions_list.extend(list(range(seq.num_cached_tokens, seq_len)))
-            seqlen_q = seq_len - seq.num_cached_tokens
-            seqlen_k = seq_len
-            cu_seqlens_q_list.append(cu_seqlens_q_list[-1] + seqlen_q)
-            cu_seqlens_k_list.append(cu_seqlens_k_list[-1] + seqlen_k)
-            max_seqlen_q = max(seqlen_q, max_seqlen_q)
-            max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:  # warmup
-                continue
-            # token-granular: a cached prefix may end inside a block (ref_prefix_cache)
-            bs = self.block_size
-            pos = seq.num_cached_tokens
-            while pos < seq_len:
-                i, off = divmod(pos, bs)
-                end = min(seq_len, (i + 1) * bs)
-                start = seq.block_table[i] * bs + off
-                slot_mapping_list.extend(range(start, start + end - pos))
-                pos = end
-        # prefix cache, or the paged prefill graphs (which read every sequence's K/V through block tables)
-        if cu_seqlens_k_list[-1] > cu_seqlens_q_list[-1] or getattr(self, "prefill_backbone_graphs", None):
-            block_tables = self.prepare_block_tables(seqs)
+        pack = HostPack(getattr(self, "pack_device", "cuda"))
+        finish = self.stage_prefill_context(seqs, pack)
+        return finish(pack.upload())
 
-        positions = torch.tensor(positions_list, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q_list, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k_list, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(
-            True,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            slot_mapping,
-            None,
-            block_tables,
-        )
-        token_counts = [seq.seq_length - seq.num_cached_tokens for seq in seqs]
+    def stage_prefill_context(self, seqs: list[RunnerTask], pack: HostPack):
+        """The prefill attention context and LoRA contexts, built on the host with numpy (one pass per array instead
+        of a Python loop over every token: ~1.5 -> ~0.4 ms for 200 cloned requests) and staged in ``pack``. Returns
+        ``finish(uploaded)``: sets the contexts from the uploaded tensors and returns the positions. Values, dtypes
+        and shapes are those of the per-token loop it replaces (tests/test_burst_host_path.py compares both)."""
+        n = len(seqs)
+        seqlen_k = np.fromiter((seq.seq_length for seq in seqs), dtype=np.int64, count=n)
+        cached = np.fromiter((seq.num_cached_tokens for seq in seqs), dtype=np.int64, count=n)
+        seqlen_q = seqlen_k - cached
+        cu_seqlens_q = np.zeros(n + 1, dtype=np.int64)
+        cu_seqlens_k = np.zeros(n + 1, dtype=np.int64)
+        np.cumsum(seqlen_q, out=cu_seqlens_q[1:])
+        np.cumsum(seqlen_k, out=cu_seqlens_k[1:])
+        max_seqlen_q = int(seqlen_q.max(initial=0))
+        max_seqlen_k = int(seqlen_k.max(initial=0))
+        total_q = int(cu_seqlens_q[-1])
+        seq_of_token = np.repeat(np.arange(n), seqlen_q)
+        # position of every query token: from its sequence's cached prefix to its length
+        positions = np.arange(total_q, dtype=np.int64) - np.repeat(cu_seqlens_q[:-1] - cached, seqlen_q)
+        lens = [len(seq.block_table) for seq in seqs]
+        max_blocks = max(lens, default=0)
+        flat: list[int] = []
+        for seq, m in zip(seqs, lens):
+            flat.extend(seq.block_table)
+            if m < max_blocks:
+                flat.extend([-1] * (max_blocks - m))
+        tables = np.array(flat, dtype=np.int64).reshape(n, max_blocks)
+        # token-granular slots (a cached prefix may end inside a block: ref_prefix_cache); warmup tasks have no
+        # block table and no slots
+        bs = self.block_size
+        with_table = np.asarray(lens, dtype=np.int64)[seq_of_token] > 0
+        tok_seq, tok_pos = seq_of_token[with_table], positions[with_table]
+        slot_mapping = (tables[tok_seq, tok_pos // bs] * bs + tok_pos % bs) if tok_seq.size else np.zeros(0, np.int64)
+        i_pos = pack.add(positions)
+        i_cu_q = pack.add(cu_seqlens_q.astype(np.int32))
+        i_cu_k = pack.add(cu_seqlens_k.astype(np.int32))
+        i_slot = pack.add(slot_mapping.astype(np.int32))
+        # prefix cache, or the paged prefill graphs (which read every sequence's K/V through block tables)
+        i_bt = None
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1] or getattr(self, "prefill_backbone_graphs", None):
+            i_bt = pack.add(tables.astype(np.int32))
         use_diffusion_graph = (
             not getattr(self, "enforce_eager", True)
             and hasattr(self, "prefill_diffusion_graphs")
             and hasattr(self.model, "forward_backbone")
         )
         materialize_domains = {LM_LORA_DOMAIN, PROJ_LORA_DOMAIN} if use_diffusion_graph else set(LORA_DOMAINS)
-        for domain, lora_context in self._build_lora_contexts(
-            seqs,
-            token_counts,
-            materialize_domains=materialize_domains,
-        ).items():
-            set_lora_context(lora_context, domain=domain)
-        return positions
+        # host-only contexts; the domains that get device metadata stage it in the pack (no copies of their own)
+        lora = [
+            (domain, stage_lora_context(ctx, pack.add) if domain in materialize_domains else (lambda views, c=ctx: c))
+            for domain, ctx in self._build_lora_contexts(seqs, seqlen_q.tolist(), materialize_domains=set()).items()
+        ]
+
+        def finish(views: list[torch.Tensor]) -> torch.Tensor:
+            set_context(True, views[i_cu_q], views[i_cu_k], max_seqlen_q, max_seqlen_k, views[i_slot], None,
+                        views[i_bt] if i_bt is not None else None)
+            for domain, make in lora:
+                set_lora_context(make(views), domain=domain)
+            return views[i_pos]
+
+        return finish
 
     def prepare_decode_context(self, seqs: list[RunnerTask]):
         positions_list: list[int] = []

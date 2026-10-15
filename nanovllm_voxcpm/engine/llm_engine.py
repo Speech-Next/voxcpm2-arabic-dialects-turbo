@@ -70,6 +70,7 @@ from nanovllm_voxcpm.engine.lora_manager import LoRAManager, LoRAModelPayload
 from nanovllm_voxcpm.engine.sequence import Sequence
 from nanovllm_voxcpm.engine.scheduler import Scheduler
 from nanovllm_voxcpm.engine.model_runner import RunnerTask, BaseModelRunner, select_lora_payload_for_rank
+from nanovllm_voxcpm.utils import profile as _profile
 import socket
 import torch
 
@@ -210,25 +211,65 @@ class LLMEngineBase:
         return 0
 
     def on_seq_running(self, seq: Sequence) -> None:
-        self.lora_manager.on_sequence_started(seq.adapter_id)
-        self.model_runner.call("lora_on_sequence_started", seq.adapter_id)
+        """A sequence was admitted (blocks allocated); its LoRA bookkeeping follows in on_seqs_running."""
+
+    def on_seqs_running(self, seqs: list[Sequence]) -> None:
+        """The LoRA bookkeeping of a scheduling pass's admitted sequences, at the end of the pass: one runner call
+        instead of one per sequence (with tensor parallelism, each was a broadcast and an all-reduce). Nothing reads
+        these counts during the pass: the control plane's admission test does not depend on them (it assigns no
+        slots), the runtime's slot states are refreshed and read only when a step's batch plan is built."""
+        ids = [seq.adapter_id for seq in seqs if seq.adapter_id is not None]  # None: a no-op on both sides
+        if not ids:
+            return
+        for adapter_id in ids:
+            self.lora_manager.on_sequence_started(adapter_id)
+        self.model_runner.call("lora_on_sequences_started", ids)
 
     def on_seq_waiting(self, seq: Sequence) -> None:
         self.lora_manager.on_sequence_preempted(seq.adapter_id)
         self.model_runner.call("lora_on_sequence_preempted", seq.adapter_id)
 
     def on_seq_removed(self, seq: Sequence, *, was_running: bool) -> None:
+        if self._prepared:
+            self._prepared.pop(seq, None)  # cancelled after prepare_prefill
         self.lora_manager.on_sequence_finished(seq.adapter_id, was_running=was_running)
         self.model_runner.call("lora_on_sequence_finished", seq.adapter_id, was_running)
         self.model_runner.call("release_sequence_state", seq.seq_id)
 
+    def on_prefill_admitted(self, seqs: list[Sequence]) -> None:
+        """Hook: ``seqs`` were admitted into the next prefill step, before their runner inputs are built."""
+
+    _prepared: dict | None = None  # sequence -> its prefill RunnerTask, built by prepare_prefill ahead of the step
+
+    def prepare_prefill(self) -> int:
+        """Admit waiting sequences into the next prefill step and build their runner inputs now. Only while the engine
+        is idle and the next step is theirs (the server calls it in its admission window, when no request is pending):
+        step() then starts from them instead of scheduling and preparing every request after the last one arrived.
+        Returns how many were admitted."""
+        seqs = self.scheduler.admit()
+        if seqs:
+            self.on_prefill_admitted(seqs)
+            if self._prepared is None:
+                self._prepared = {}
+            for seq in seqs:
+                self._prepared[seq] = self.preprocess_seq(seq, True)
+        return len(seqs)
+
     def step(self):
         with self.stepping():
+            _profile.begin_step()  # NANOVLLM_PROFILE: the step record's t_begin (and GPU reference)
             seqs, is_prefill = self.scheduler.schedule()
             if not seqs:
                 return seqs
 
-            runner_tasks = [self.preprocess_seq(seq, is_prefill) for seq in seqs]
+            prepared = self._prepared
+            if is_prefill:
+                self.on_prefill_admitted([seq for seq in seqs if not prepared or seq not in prepared])
+            if prepared and is_prefill:
+                runner_tasks = [prepared.pop(seq, None) or self.preprocess_seq(seq, True) for seq in seqs]
+                prepared.clear()
+            else:
+                runner_tasks = [self.preprocess_seq(seq, is_prefill) for seq in seqs]
             outputs = self.model_runner.call("run", runner_tasks, is_prefill)
 
             for seq, output in zip(seqs, outputs):
