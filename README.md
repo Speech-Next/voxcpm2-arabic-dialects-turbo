@@ -57,7 +57,7 @@ from nanovllm_voxcpm import DialectTTS
 async def main():
     tts = await DialectTTS.load(
         "VoxCPM-Kernel/VoxCPM2-Arabic-Dialects",                       # VoxCPM2 + dialect LoRAs
-        dit="kadirnar/VoxCPM2-Turbo-distilled-DiT:student_k2_dmd.pt",  # 2 steps; None = 10 steps (quality)
+        dit="VoxCPM-Kernel/VoxCPM2-Turbo-distilled-DiT:student_k2_dmd.pt",  # 2 steps; None = 10 steps (quality)
     )
     await tts.add_voice("ahmed", "ahmed.wav")
     audio = await tts.synthesize("هلا والله، كيف حالك اليوم؟", dialect="najdi", voice="ahmed")  # 48 kHz
@@ -73,7 +73,7 @@ Dialects: ab, egyptian, emirati, hejazi, hindi_english, iraqi, jordanian, najdi,
 python examples/voice_clone.py --voice ahmed.wav --dialect najdi --text "هلا والله" --out out.wav   # one file
 NANOVLLM_BUSY_POLL_S=30 python examples/benchmark.py                                             # the speed table
 python -m nanovllm_voxcpm.entrypoints.openai_server --model VoxCPM-Kernel/VoxCPM2-Arabic-Dialects \
-    --dit kadirnar/VoxCPM2-Turbo-distilled-DiT:student_k2_dmd.pt                                # HTTP server, :8092
+    --dit VoxCPM-Kernel/VoxCPM2-Turbo-distilled-DiT:student_k2_dmd.pt                                # HTTP server, :8092
 ```
 
 License: MIT. VoxCPM2 weights: Apache-2.0.
