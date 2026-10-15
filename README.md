@@ -6,7 +6,7 @@ LoRA per dialect.
 ## Results
 
 One NVIDIA A10, installed with `./setup.sh`. The test clones the 32 voices of
-[`VoxCPM-Kernel/Arabic-Dialects-and-Hindi-Voice-Samples`](https://huggingface.co/datasets/VoxCPM-Kernel/Arabic-Dialects-and-Hindi-Voice-Samples),
+[`VoxCPM-Kernel/Arabic-Hindi-Reference-Voices`](https://huggingface.co/datasets/VoxCPM-Kernel/Arabic-Hindi-Reference-Voices),
 each in its own dialect's LoRA.
 
 | requests at once | first audio, avg | first audio, p95 | whole sentence, avg |

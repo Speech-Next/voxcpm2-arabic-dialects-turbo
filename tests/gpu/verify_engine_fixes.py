@@ -32,7 +32,7 @@ import numpy as np
 __test__ = False  # pytest: nothing to collect here
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VOICES = "VoxCPM-Kernel/Arabic-Dialects-and-Hindi-Voice-Samples"
+VOICES = "VoxCPM-Kernel/Arabic-Hindi-Reference-Voices"
 TEXTS = os.path.join(HERE, "..", "..", "examples", "ar_dialects.txt")
 # (name, dialect, voice clip, line of ar_dialects.txt, seed): plain single requests, run one after another
 REFERENCE = [("najdi_ref", "najdi", "SaudiReem_38.wav", 0, 11), ("base_ref", None, "SaudiReem_38.wav", 1, 12),
