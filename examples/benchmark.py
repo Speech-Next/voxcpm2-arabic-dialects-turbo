@@ -67,8 +67,7 @@ async def burst(tts, reqs):
 
 async def main(args):
     levels = [int(x) for x in args.levels.split(",")]
-    async with await DialectTTS.load(args.model, args.dit, max_concurrency=max(levels),
-                                     gpu_memory_utilization=args.gpu_memory_utilization) as tts:
+    async with await DialectTTS.load(args.model, args.dit, max_concurrency=max(levels), kv_blocks=args.kv_blocks) as tts:
         folder = voice_folder(args.voices)
         voices = sorted(f[:-4] for f in os.listdir(folder) if f.endswith(".wav"))
         for v in voices:
@@ -96,8 +95,8 @@ if __name__ == "__main__":
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--dit", default=DEFAULT_DIT, help="'none' for the model's own LocDiT")
-    ap.add_argument("--gpu-memory-utilization", type=float, default=0.85,
-                    help="0.8 for --dit none at 200 requests (its CUDA graphs are larger)")
+    ap.add_argument("--kv-blocks", type=int, default=600, help="KV cache blocks of 256 tokens; 400 for --dit none at "
+                                                               "200 requests (its CUDA graphs are larger)")
     args = ap.parse_args()
     args.dit = None if args.dit == "none" else args.dit
     asyncio.run(main(args))
