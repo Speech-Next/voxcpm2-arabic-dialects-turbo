@@ -477,6 +477,19 @@ class FusedCpm4Layer:
                 self.q8["qkv"] = rope_weights(self.q8["qkv"], attn.head_dim)
         self.swiglu = self.q8 is not None and _SWIGLU
         self.qkv_rope = self.q8 is not None and _ROPE_EPILOGUE and self.rope is not None and attn.head_dim == 128
+        # a 2:4-pruned FFN (at most 2 non-zeros in every 4 input channels, e.g. a 2:4-sparse base_lm checkpoint): its
+        # int8 GEMMs run on the sparse tensor cores (sparse24.py), bit-identical to the dense kernels on the same
+        # weights and faster at every row count measured, so the dense int8 FFN weights are dropped
+        self.sp24 = None
+        if self.swiglu:
+            from . import sparse24
+
+            gate_up, down = self.q8["gate_up"], self.q8["down"]
+            if sparse24.ENABLED and sparse24.is_24(gate_up.w_q) and sparse24.is_24(down.w_q) and sparse24.available():
+                self.sp24 = {"gate_up": sparse24.Sparse24Linear(gate_up, sparse24.swiglu_rows(gate_up.out_features,
+                                                                                               gate_up.w_q.device)),
+                             "down": sparse24.Sparse24Linear(down)}
+                gate_up.w_q = down.w_q = None
         # LoRA adapters merged into int8 q/k/v/o weights, one per slot ([0] = the base model): a batch mixing
         # adapters runs segmented GEMMs (rows grouped by adapter) and no LoRA kernels. refresh_lora(slot) rebuilds a
         # slot when the runner loads an adapter into it.
@@ -661,6 +674,11 @@ class FusedCpm4Layer:
     def _mlp_q(self, x2: torch.Tensor, dtype) -> torch.Tensor:
         """x2 + down(silu(gate) * up), gate|up = gate_up(rmsnorm(x2)), all int8 GEMMs."""
         xq = rmsnorm_quant(x2, self.ln_post_q, self.eps_post)
+        if self.sp24 is not None:
+            from . import sparse24
+
+            hq = sparse24.swiglu_gemm_quant(*xq, self.sp24["gate_up"], dtype)
+            return sparse24.gemm_res(*hq, self.sp24["down"], dtype, x2)
         if self.swiglu:
             hq = swiglu_gemm_quant(*xq, self.q8["gate_up"], dtype)
         else:
