@@ -34,19 +34,27 @@ __global__ void __launch_bounds__(256) head_kernel(const half* __restrict__ x, c
   const int tid = threadIdx.x, b = blockIdx.y, t0 = blockIdx.x * BN;
   const half* xb = x + (int64_t)b * C * T;
   const half* sb = state + idx[b] * state_slot_stride;
-  if (T % 8 == 0 && t0 >= PH && t0 + BN <= T) {  // interior tile: halo and tile, 8 samples per load
+  if (T % 8 == 0) {  // halo and tile by groups of 8 samples (16-byte loads of x, zeros past T, the state before 0)
     constexpr int Q = (PH + BN) / 8;
     for (int e = tid; e < C * Q; e += 256) {
-      const int c = e / Q, q = e % Q;
-      const int4 raw = *reinterpret_cast<const int4*>(xb + (int64_t)c * T + t0 - PH + q * 8);
-      const half2* h = reinterpret_cast<const half2*>(&raw);
-      const float ac = a[c], iac = ia[c];
+      const int c = e / Q, q = e % Q, ts = t0 - PH + q * 8;
       float v[8];
+      if (ts >= 0 && ts < T) {
+        const int4 raw = *reinterpret_cast<const int4*>(xb + (int64_t)c * T + ts);
+        const half2* h = reinterpret_cast<const half2*>(&raw);
+        const float ac = a[c], iac = ia[c];
 #pragma unroll
-      for (int u = 0; u < 4; u++) {
-        const float2 f = __half22float2(h[u]);
-        v[2 * u] = snake(f.x, ac, iac);
-        v[2 * u + 1] = snake(f.y, ac, iac);
+        for (int u = 0; u < 4; u++) {
+          const float2 f = __half22float2(h[u]);
+          v[2 * u] = snake(f.x, ac, iac);
+          v[2 * u + 1] = snake(f.y, ac, iac);
+        }
+      } else if (ts < 0) {
+#pragma unroll
+        for (int u = 0; u < 8; u++) v[u] = ts + u >= -P ? __half2float(sb[c * P + ts + u + P]) : 0.f;
+      } else {
+#pragma unroll
+        for (int u = 0; u < 8; u++) v[u] = 0.f;
       }
       float4* dst = reinterpret_cast<float4*>(xs + c * LX + q * 8);
       dst[0] = make_float4(v[0], v[1], v[2], v[3]);
