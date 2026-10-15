@@ -42,7 +42,6 @@ Needs Linux, an NVIDIA GPU (Ampere or newer) and the CUDA toolkit (`nvcc`).
 git clone https://github.com/Speech-Next/voxcpm2-arabic-dialects-turbo && cd voxcpm2-arabic-dialects-turbo
 ./setup.sh                      # Python env, torch, flash-attn and this package, in one step
 source .venv/bin/activate
-hf auth login                   # once: the models are private
 ```
 
 Models and voices are downloaded automatically on first use. The first start takes 1-2 minutes, to compile a kernel
