@@ -98,10 +98,10 @@ def test_dialect_tts_tagged_aliases_and_transcripts():
 
 
 def server_args(model, **kw):
-    args = dict(model=str(model), dit=None, dit_cache=None, head_tokens=8, kv_blocks=0, lora_dir=None, lora=[],
-                default_lora=None, max_lora_rank=None, inference_timesteps=10, max_num_seqs=8, max_model_len=2048,
-                max_num_batched_tokens=2048, gpu_memory_utilization=0.5, voice_dir=None, voices=None,
-                served_model_name="voxcpm2", split_max_chars=200, max_tokens=600)
+    args = dict(model=str(model), dit=None, dit_adapters=True, dit_cache=None, head_tokens=8, kv_blocks=0,
+                lora_dir=None, lora=[], default_lora=None, max_lora_rank=None, inference_timesteps=10, max_num_seqs=8,
+                max_model_len=2048, max_num_batched_tokens=2048, gpu_memory_utilization=0.5, voice_dir=None,
+                voices=None, served_model_name="voxcpm2", split_max_chars=200, max_tokens=600)
     return SimpleNamespace(**{**args, **kw})
 
 

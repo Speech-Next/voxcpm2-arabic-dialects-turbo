@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,12 +25,20 @@ class _CollectedModule:
     lora_b_by_target: dict[str | int, torch.Tensor] = field(default_factory=dict)
 
 
-def load_voxcpm2_lora_checkpoint(path: str, *, tp_size: int = 1) -> LoRAModelPayload | list[LoRAModelPayload]:
+def load_voxcpm2_lora_checkpoint(
+    path: str, *, tp_size: int = 1, overrides: Sequence[str] = ()
+) -> LoRAModelPayload | list[LoRAModelPayload]:
+    """The LoRA of checkpoint directory ``path``. overrides: further LoRA directories (the same rank and alpha) whose
+    tensors replace ``path``'s tensors of the same names, e.g. a distilled LocDiT's own LocDiT LoRA for an adapter
+    (dialect_tts.student_adapters); they cannot add a tensor ``path`` does not have."""
     checkpoint_dir = Path(path)
     _validate_checkpoint_dir(checkpoint_dir)
     checkpoint_config = _load_checkpoint_config(checkpoint_dir)
     alpha = _resolve_alpha(checkpoint_config)
-    collected_modules = _load_collected_modules(checkpoint_dir)
+    tensors = _read_tensors(checkpoint_dir)
+    for override in overrides:
+        _apply_override(tensors, checkpoint_dir, checkpoint_config, Path(override))
+    collected_modules = _collect_modules(tensors)
     if not collected_modules:
         raise ValueError("LoRA checkpoint does not contain any supported module weights")
 
@@ -93,31 +102,53 @@ def _resolve_rank(collected_modules: dict[str, _CollectedModule], checkpoint_con
     return rank
 
 
-def _load_collected_modules(checkpoint_dir: Path) -> dict[str, _CollectedModule]:
+def _read_tensors(checkpoint_dir: Path) -> dict[str, torch.Tensor]:
+    """The directory's LoRA tensors (keys ending in .lora_A / .lora_B), fp32, in file order."""
+    out: dict[str, torch.Tensor] = {}
+    with safe_open(checkpoint_dir / _LORA_WEIGHTS_FILE, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            if _parse_weight_key(key) is not None:
+                out[key] = f.get_tensor(key).to(dtype=torch.float32)
+    return out
+
+
+def _apply_override(tensors: dict[str, torch.Tensor], base_dir: Path, base_config: dict, override_dir: Path) -> None:
+    _validate_checkpoint_dir(override_dir)
+    config = _load_checkpoint_config(override_dir)
+    for name, get in (("alpha", _resolve_alpha), ("rank", lambda c: c.get("r", c.get("rank")))):
+        if get(config) != get(base_config):
+            raise ValueError(f"LoRA override {override_dir}: {name} {get(config)} differs from {base_dir}'s "
+                             f"{get(base_config)}")
+    replaced = _read_tensors(override_dir)
+    if not replaced:
+        raise ValueError(f"LoRA override {override_dir} holds no LoRA tensors")
+    for key, tensor in replaced.items():
+        if key not in tensors:
+            raise ValueError(f"LoRA override {override_dir}: tensor {key} is not in {base_dir}")
+        if tensor.shape != tensors[key].shape:
+            raise ValueError(f"LoRA override {override_dir}: {key} has shape {tuple(tensor.shape)}, "
+                             f"{base_dir} {tuple(tensors[key].shape)}")
+        tensors[key] = tensor
+
+
+def _collect_modules(tensors: dict[str, torch.Tensor]) -> dict[str, _CollectedModule]:
     # Adapter weights are typically HtoD-copied on the first request that
     # needs them. We pin the CPU staging tensors up front so `.to("cuda",
     # non_blocking=True)` at slot-load time is a real DMA transfer (pinned
     # memory path is ~2x faster than pageable and does not block the CPU).
     cuda_available = torch.cuda.is_available()
     collected: dict[str, _CollectedModule] = {}
-    with safe_open(checkpoint_dir / _LORA_WEIGHTS_FILE, framework="pt", device="cpu") as f:
-        for key in f.keys():
-            parsed = _parse_weight_key(key)
-            if parsed is None:
-                continue
-            module_name, module_kind, target, tensor_kind = parsed
-            module = collected.setdefault(
-                module_name, _CollectedModule(module_name=module_name, module_kind=module_kind)
-            )
-            if target not in module.targets:
-                module.targets.append(target)
-            tensor = f.get_tensor(key).to(dtype=torch.float32)
-            if cuda_available:
-                tensor = tensor.pin_memory()
-            if tensor_kind == "a":
-                module.lora_a_by_target[target] = tensor
-            else:
-                module.lora_b_by_target[target] = tensor
+    for key, tensor in tensors.items():
+        module_name, module_kind, target, tensor_kind = _parse_weight_key(key)
+        module = collected.setdefault(module_name, _CollectedModule(module_name=module_name, module_kind=module_kind))
+        if target not in module.targets:
+            module.targets.append(target)
+        if cuda_available:
+            tensor = tensor.pin_memory()
+        if tensor_kind == "a":
+            module.lora_a_by_target[target] = tensor
+        else:
+            module.lora_b_by_target[target] = tensor
 
     for module in collected.values():
         missing_a = [target for target in module.targets if target not in module.lora_a_by_target]

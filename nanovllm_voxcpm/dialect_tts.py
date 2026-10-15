@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from typing import AsyncIterator
 
 import numpy as np
@@ -48,6 +49,32 @@ def resolve(spec: str) -> str:
         repo, filename = spec.split(":", 1)
         return hf_hub_download(repo, filename)
     return snapshot_download(spec)
+
+
+def student_adapters(dit: str | None) -> dict[str, str]:
+    """A distilled LocDiT's own LocDiT LoRAs for the model's adapters, adapter name -> directory: the adapter
+    directories under ``<checkpoint stem>.adapters/`` next to the checkpoint (a local file, or in the same Hugging Face
+    repo for ``repo:file``). Each holds LocDiT LoRA tensors tuned for this LocDiT (issue #12); they replace that
+    adapter's own when the adapter is registered (the same shapes, so no cost). None: the adapters run as trained."""
+    if not dit:
+        return {}
+    local = os.path.expanduser(dit)
+    if os.path.exists(local):
+        root = os.path.splitext(local)[0] + ".adapters"
+    elif ":" in dit:
+        from huggingface_hub import snapshot_download
+
+        repo, filename = dit.split(":", 1)
+        stem = os.path.splitext(filename)[0]
+        try:
+            root = os.path.join(snapshot_download(repo, allow_patterns=[f"{stem}.adapters/*"]), f"{stem}.adapters")
+        except Exception as e:  # no answer from the Hub and nothing cached: the adapters as trained, said out loud
+            print(f"[dialect_tts] {repo}: {stem}.adapters/ not available ({type(e).__name__}: {e}); the adapters "
+                  "keep their own LocDiT LoRA", file=sys.stderr, flush=True)
+            return {}
+    else:
+        return {}
+    return find_adapters(root) if os.path.isdir(root) else {}
 
 
 def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | None = None, w8a8: bool = True) -> dict:
@@ -187,16 +214,20 @@ class DialectTTS:
         self.tags = DialectTags(tags) if tags else None
         self.dialects = self.tags.names if tags else dialects
         self.voices: dict[str, bool] = {}  # name -> registered with a transcript
+        self.dit_adapters: list[str] = []  # adapters running with the distilled LocDiT's own LoRA (load)
         # tagged models: latents, transcript and its normalize flag of prompt_ref voices
         self._voice_src: dict[str, tuple[bytes, str, bool]] = {}
 
     @classmethod
     async def load(cls, model: str = DEFAULT_MODEL, dit: str | None = DEFAULT_DIT, *, max_concurrency: int = 256,
                    head_tokens: int = 8, dit_cache: str | dict | None = None, gpu_memory_utilization: float = 0.85,
-                   kv_blocks: int = 600, device: int = 0, w8a8: bool = True) -> "DialectTTS":
+                   kv_blocks: int = 600, device: int = 0, w8a8: bool = True,
+                   dit_adapters: bool = True) -> "DialectTTS":
         """Start the engine on ``model`` (local directory or Hugging Face repo with ``adapters/<dialect>/``).
 
         dit: the distilled 2-step LocDiT (path or ``repo:file``; None = the model's own LocDiT, slower).
+        dit_adapters: when ``dit`` ships LocDiT LoRAs tuned for it (``student_adapters``), the adapters run with
+        those (``tts.dit_adapters`` lists them); False: every adapter with its own.
         head_tokens: the first audio comes from the text's first <= head_tokens tokens (0 = from the whole text).
         dit_cache: with dit=None, "light" or "medium": reuse the LocDiT's middle layers on 2 or 4 of its 9 steps.
         """
@@ -218,8 +249,12 @@ class DialectTTS:
             gpu_memory_utilization=gpu_memory_utilization, lora_config=adapters_lora_config(adapters),
         )
         await server.wait_for_ready()
+        tuned = student_adapters(dit) if dit and dit_adapters else {}
         for name, adapter_path in adapters.items():
-            await server.register_lora(name, adapter_path)
+            if name in tuned:
+                await server.register_lora(name, adapter_path, [tuned[name]])
+            else:
+                await server.register_lora(name, adapter_path)
         sample_rate = int((await server.get_model_info())["sample_rate"])
         # this process's startup objects (torch, transformers, ...) out of the garbage collector's reach: a full
         # collection over them paused a burst's submission for ~165 ms (200 requests: half sent, the rest late)
@@ -227,7 +262,9 @@ class DialectTTS:
 
         gc.collect()
         gc.freeze()
-        return cls(server, sorted(adapters), sample_rate, tags)
+        tts = cls(server, sorted(adapters), sample_rate, tags)
+        tts.dit_adapters = sorted(set(tuned) & set(adapters))
+        return tts
 
     async def add_voice(self, name: str, audio: str | bytes, text: str | None = None, audio_format: str = "wav",
                         normalize: bool = True) -> None:

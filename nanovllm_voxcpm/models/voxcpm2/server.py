@@ -212,8 +212,8 @@ class VoxCPM2ServerImpl:
     def unregister_voice(self, voice_id: str) -> None:
         self.llm.unregister_voice(voice_id)
 
-    def register_lora(self, name: str, path: str) -> RegisterLoRAResponse:
-        self.llm.register_lora(name, path)
+    def register_lora(self, name: str, path: str, overrides: list[str] | None = None) -> RegisterLoRAResponse:
+        self.llm.register_lora(name, path, overrides)
         return RegisterLoRAResponse(name=name)
 
     def unregister_lora(self, name: str) -> UnregisterLoRAResponse:
@@ -941,8 +941,8 @@ class AsyncVoxCPM2Server:
             with contextlib.suppress(Exception):
                 q.join_thread()
 
-    async def register_lora(self, name: str, path: str) -> RegisterLoRAResponse:
-        return await self.submit("register_lora", name, path)
+    async def register_lora(self, name: str, path: str, overrides: list[str] | None = None) -> RegisterLoRAResponse:
+        return await self.submit("register_lora", name, path, overrides)
 
     async def unregister_lora(self, name: str) -> UnregisterLoRAResponse:
         return await self.submit("unregister_lora", name)
@@ -1065,13 +1065,14 @@ class AsyncVoxCPM2ServerPool:
     async def unregister_voice(self, voice_id: str) -> None:
         await asyncio.gather(*[server.unregister_voice(voice_id) for server in self.servers])
 
-    async def register_lora(self, name: str, path: str) -> RegisterLoRAResponse:
+    async def register_lora(self, name: str, path: str, overrides: list[str] | None = None) -> RegisterLoRAResponse:
+        """overrides: LoRA directories whose tensors replace ``path``'s of the same names (lora_loader)."""
         if name in self._registered_loras or name in self._draining_loras:
             raise ValueError(f"LoRA '{name}' is already registered")
         registered_servers: list[AsyncVoxCPM2Server] = []
         try:
             for server in self.servers:
-                await server.register_lora(name, path)
+                await server.register_lora(name, path, overrides)
                 registered_servers.append(server)
         except Exception:
             for server in reversed(registered_servers):
@@ -1196,9 +1197,9 @@ class SyncVoxCPM2ServerPool:
         assert self.loop is not None
         return self.loop.run_until_complete(self.server_pool.get_model_info())
 
-    def register_lora(self, name: str, path: str) -> RegisterLoRAResponse:
+    def register_lora(self, name: str, path: str, overrides: list[str] | None = None) -> RegisterLoRAResponse:
         assert self.loop is not None
-        return self.loop.run_until_complete(self.server_pool.register_lora(name, path))
+        return self.loop.run_until_complete(self.server_pool.register_lora(name, path, overrides))
 
     def unregister_lora(self, name: str) -> UnregisterLoRAResponse:
         assert self.loop is not None

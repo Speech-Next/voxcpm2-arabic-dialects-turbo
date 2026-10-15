@@ -57,7 +57,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, ValidationError
 
 from nanovllm_voxcpm.dialect_tts import (DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters, read_as,
-                                         resolve, turbo_config, use_model_calibration)
+                                         resolve, student_adapters, turbo_config, use_model_calibration)
 
 CLONE_MODES = ("prompt_ref", "ref", "prompt")
 VOICE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # voice names are also file names in --voice-dir
@@ -232,8 +232,12 @@ def build_app(args: argparse.Namespace):
             lora_config=adapters_lora_config(adapters, args.max_lora_rank),
         )
         await pool.wait_for_ready()
+        tuned = student_adapters(args.dit) if args.dit and args.dit_adapters else {}
         for name, path in adapters.items():
-            await pool.register_lora(name, path)
+            if name in tuned:
+                await pool.register_lora(name, path, [tuned[name]])
+            else:
+                await pool.register_lora(name, path)
         state["adapters"] = sorted(adapters)
         state["pool"] = pool
         state["sample_rate"] = int((await pool.get_model_info())["sample_rate"])
@@ -467,6 +471,9 @@ def main():
     ap.add_argument("--dit", help="distilled LocDiT checkpoint (path or repo:file): the low-latency configuration, "
                                   "unless NANOVLLM_VOXCPM2_TURBO is set")
     ap.add_argument("--head-tokens", type=int, default=8, help="with --dit: head start length in tokens (0 = off)")
+    ap.add_argument("--no-dit-adapters", dest="dit_adapters", action="store_false",
+                    help="with --dit: every adapter with its own LocDiT LoRA, not the ones shipped with the --dit "
+                         "checkpoint (<stem>.adapters/)")
     ap.add_argument("--dit-cache", choices=["light", "medium"],
                     help="instead of --dit: the original LocDiT, its middle layers reused on 2 (light) or 4 (medium) "
                          "of its 9 steps")

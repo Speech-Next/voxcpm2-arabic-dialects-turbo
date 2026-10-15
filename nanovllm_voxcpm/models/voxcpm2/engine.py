@@ -117,8 +117,9 @@ class VoxCPM2Engine(LLMEngineBase):
         self.head_tokens, self.head_patches, self.head_min_rest = turbo.head_tokens, turbo.head_patches, turbo.head_min_rest
         super().__init__(VoxCPM2Runner, config, config.tensor_parallel_size)
 
-    def register_lora(self, name: str, path: str) -> int:
-        payload = load_voxcpm2_lora_checkpoint(path, tp_size=self.model_runner.world_size)
+    def register_lora(self, name: str, path: str, overrides: list[str] | None = None) -> int:
+        """overrides: LoRA directories whose tensors replace ``path``'s of the same names (lora_loader)."""
+        payload = load_voxcpm2_lora_checkpoint(path, tp_size=self.model_runner.world_size, overrides=overrides or ())
         return super().register_lora(name, payload)
 
     def _prefix_match(self, seq: Sequence[VoxCPM2SeqPayload]) -> tuple[int, int]:
