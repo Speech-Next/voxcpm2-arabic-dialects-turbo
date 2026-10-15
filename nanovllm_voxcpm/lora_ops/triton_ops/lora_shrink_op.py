@@ -145,7 +145,7 @@ def _lora_shrink_small_m_kernel(
     mask_r = offset_r < N
     load_r = tl.max_contiguous(tl.multiple_of(offset_r % N, BLOCK_R), BLOCK_R)
 
-    accumulator = tl.zeros((1, BLOCK_R), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_R,), dtype=tl.float32)
     split_k_start = pid_sk * BLOCK_K
     step_k = BLOCK_K * SPLIT_K
     a_ptr = input_ptr + pid_m * input_d0_stride + (split_k_start + tl.arange(0, BLOCK_K)) * input_d1_stride
@@ -160,11 +160,11 @@ def _lora_shrink_small_m_kernel(
         mask_k = offset_k < K
         tiled_a = tl.load(a_ptr, mask=mask_k, other=0.0)
         tiled_b = tl.load(b_ptr, mask=mask_k[:, None] & mask_r[None, :], other=0.0)
-        accumulator += tl.dot(tiled_a[None, :], tiled_b, out_dtype=tl.float32)
+        # one row times BLOCK_R (<= 8) columns: a multiply and a sum, since tl.dot needs M, N, K >= 16 (triton >= 3.4)
+        accumulator += tl.sum(tiled_a[:, None].to(tl.float32) * tiled_b.to(tl.float32), axis=0)
         a_ptr += step_k * input_d1_stride
         b_ptr += step_k * lora_d2_stride
 
-    accumulator = tl.reshape(accumulator, (BLOCK_R,))
     accumulator *= scaling
     out_ptr = out_ptr + slice_id * output_d0_stride + pid_m * output_d1_stride + offset_r * output_d2_stride
     if SPLIT_K == 1:

@@ -24,7 +24,7 @@ from nanovllm_voxcpm import DialectTTS
 from nanovllm_voxcpm.dialect_tts import DEFAULT_DIT, DEFAULT_MODEL
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VOICES = "VoxCPM-Kernel/Arabic-Dialects-and-Hindi-Voice-Samples"
+VOICES = "VoxCPM-Kernel/Arabic-Hindi-Reference-Voices"
 
 
 def voice_folder(spec: str) -> str:
