@@ -66,7 +66,9 @@ __global__ void __launch_bounds__(256, MINB) resunit_fused_kernel(
   const half* xb = x + (int64_t)b * C * T;
   const half* sb = state + idx[b] * state_slot_stride;
   const int wm = warp / WN, wn = warp % WN;
-  const bool vec_ok = (T % 8 == 0) && (t0 + BN <= T);
+  // T a multiple of 8 (every chunk of whole latent frames): time groups of 8 are 16-byte aligned and lie wholly
+  // before 0 (state), inside [0, T) or past T, so every tile stages and stores by groups, the first and last too
+  const bool t8 = (T % 8 == 0);
 
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[G::FM][G::FN];
 #pragma unroll
@@ -80,25 +82,34 @@ __global__ void __launch_bounds__(256, MINB) resunit_fused_kernel(
       const int co = e / (KC / 8), q = e % (KC / 8);
       *reinterpret_cast<int4*>(ws + co * G::WS + q * 8) = *reinterpret_cast<const int4*>(w1 + (int64_t)co * C + kc + q * 8);
     }
-    if (vec_ok && t0 >= G::PH) {  // interior tile: halo and main tile, times t0 - PH .. t0 + BN - 1, 8 per thread
+    if (t8) {  // halo and main tile, times t0 - PH .. t0 + BN - 1, 8 per thread: x by 16-byte loads (zeros past T),
+               // the causal state for t < 0 (columns before t0 - P are never read)
       constexpr int Q = (G::PH + BN) / 8;
       for (int e = tid; e < KC * Q; e += 256) {
-        const int c = e / Q, q = e % Q, cg = kc + c;
-        const int4 raw = *reinterpret_cast<const int4*>(xb + (int64_t)cg * T + t0 - G::PH + q * 8);
-        const half2* h = reinterpret_cast<const half2*>(&raw);
-        const float a = a1[cg], ia = i1[cg];
+        const int c = e / Q, q = e % Q, cg = kc + c, ts = t0 - G::PH + q * 8;
         float v[8];
+        if (ts >= 0 && ts < T) {
+          const int4 raw = *reinterpret_cast<const int4*>(xb + (int64_t)cg * T + ts);
+          const half2* h = reinterpret_cast<const half2*>(&raw);
+          const float a = a1[cg], ia = i1[cg];
 #pragma unroll
-        for (int u = 0; u < 4; u++) {
-          const float2 f = __half22float2(h[u]);
-          v[2 * u] = snake(f.x, a, ia);
-          v[2 * u + 1] = snake(f.y, a, ia);
+          for (int u = 0; u < 4; u++) {
+            const float2 f = __half22float2(h[u]);
+            v[2 * u] = snake(f.x, a, ia);
+            v[2 * u + 1] = snake(f.y, a, ia);
+          }
+        } else if (ts < 0) {
+#pragma unroll
+          for (int u = 0; u < 8; u++) v[u] = ts + u >= -G::P ? __half2float(sb[cg * G::P + ts + u + G::P]) : 0.f;
+        } else {
+#pragma unroll
+          for (int u = 0; u < 8; u++) v[u] = 0.f;
         }
         float4* dst = reinterpret_cast<float4*>(xs + c * G::LXS + q * 8);
         dst[0] = make_float4(v[0], v[1], v[2], v[3]);
         dst[1] = make_float4(v[4], v[5], v[6], v[7]);
       }
-    } else {  // first tiles of a stream (halo from the state), the tail, or T not a multiple of 8
+    } else {  // T not a multiple of 8: one time step per thread
       for (int e = tid; e < KC * (G::P + BN); e += 256) {
         const int c = e / (G::P + BN), j = e % (G::P + BN), cg = kc + c, t = t0 - G::P + j;
         float v;
@@ -158,7 +169,8 @@ __global__ void __launch_bounds__(256, MINB) resunit_fused_kernel(
       float y[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
       const float bias = b1[co];
       const int64_t off = (int64_t)co * T + t;
-      if (vec_ok) {
+      const bool vec = t8 && t < T;  // 8 time steps inside [0, T); with t8, a group past T is skipped whole
+      if (vec) {
         const int4 raw = *reinterpret_cast<const int4*>(xb + off);
         const half2* h = reinterpret_cast<const half2*>(&raw);
 #pragma unroll
@@ -176,13 +188,13 @@ __global__ void __launch_bounds__(256, MINB) resunit_fused_kernel(
 #pragma unroll
         for (int u = 0; u < 8; u++) y[u] = snake(fmaf(y[u], sc, sh), a, ia);
       }
-      if (vec_ok) {
+      if (vec) {
         int4 packed;
         half2* o = reinterpret_cast<half2*>(&packed);
 #pragma unroll
         for (int u = 0; u < 4; u++) o[u] = __floats2half2_rn(y[2 * u], y[2 * u + 1]);
         *reinterpret_cast<int4*>(ob + off) = packed;
-      } else {
+      } else if (!t8) {
 #pragma unroll
         for (int u = 0; u < 8; u++)
           if (t + u < T) ob[off + u] = __float2half_rn(y[u]);
