@@ -1,6 +1,8 @@
 import re
 from collections import OrderedDict
 from dataclasses import dataclass
+from itertools import compress, count, islice
+from operator import ne
 
 import numpy as np
 import torch
@@ -44,7 +46,9 @@ class VoxCPM2SeqPayload:
     seed_step: int = 0
     ref_key: int | None = None  # ref_prefix_cache bucket: xxh64 of the reference latents (+ LoRA adapter)
     feat_keys: list[int] | None = None  # per position: xxh64 of the audio patch (LocEnc cache), 0 = uncached
-    prefix_block: int | None = None  # cached block claimed for the current prefill (None: miss)
+    prefix_block: int | None = None  # cached block claimed for the current prefill, its KV copy pending (None: miss)
+    prefix_memo: tuple | None = None  # _prefix_match: (cache entry, compared length, matched tokens)
+    ref_audio: "PreparedAudio | None" = None  # the reference the leading tokens were built from (its ref_hash)
     # head start (TurboConfig.head_tokens): the whole request, continued after this head sequence's patches
     chain: dict | None = None
     chained: bool = False  # the continuation was queued: this sequence's end is not the end of the stream
@@ -107,8 +111,8 @@ class VoxCPM2Engine(LLMEngineBase):
         self.ref_prefix_cache_enabled = turbo.ref_prefix_cache
         self.ref_prefix_cache_size = turbo.ref_prefix_cache_size
         self.locenc_cache_enabled = turbo.locenc_cache_size > 0 and turbo.skip_text_locenc
-        # ref_key -> (pinned KV block, token_ids it holds KV for), LRU order
-        self.ref_prefix_blocks: OrderedDict[int, tuple[int, list]] = OrderedDict()
+        # ref_key -> (pinned KV block, token_ids it holds KV for, PreparedAudio of their reference), LRU order
+        self.ref_prefix_blocks: OrderedDict[int, tuple[int, list, PreparedAudio | None]] = OrderedDict()
         self.voices: dict[str, RegisteredVoice] = {}
         self.head_tokens, self.head_patches, self.head_min_rest = turbo.head_tokens, turbo.head_patches, turbo.head_min_rest
         super().__init__(VoxCPM2Runner, config, config.tensor_parallel_size)
@@ -122,16 +126,29 @@ class VoxCPM2Engine(LLMEngineBase):
 
         Equal ``token_ids`` (text ids and reference / prompt latent bytes) at equal positions mean equal KV, so
         the match is exact; it covers the reference audio and, for prompt+reference cloning, the prompt text too.
+        The scheduler asks twice per admitted request (its budget hint, then on_seq_running): the result is kept
+        for the same cache entry (the same tuple object) and length. A sequence's tokens only ever grow at the end,
+        so its first ``n`` tokens, and the match, are the same for the same ``n``. When both requests took their
+        reference from the same PreparedAudio object (a registered voice), their leading tokens are that object's
+        ref_hash list, element for element: the comparison starts after it (a cloned voice is ~50 positions).
         """
-        entry = self.ref_prefix_blocks.get(seq.custom_payload.ref_key)
+        payload = seq.custom_payload
+        entry = self.ref_prefix_blocks.get(payload.ref_key)
         if entry is None:
             return -1, 0
-        block, tokens = entry
-        ids = seq.token_ids
+        block, tokens, ref = entry
         n = min(len(tokens), len(seq) - 1)  # at least one position must run to produce the first patch
-        k = 0
-        while k < n and ids[k] == tokens[k]:
-            k += 1
+        memo = payload.prefix_memo
+        if memo is not None and memo[0] is entry and memo[1] == n:
+            return block, memo[2]
+        k = min(len(ref.ref_hash), n) if ref is not None and ref is payload.ref_audio else 0
+        ids = seq.token_ids
+        if n - k > 16:  # the first position from k whose tokens differ (or n), compared in C
+            k = next(compress(count(k), map(ne, islice(ids, k, n), islice(tokens, k, None))), n)
+        else:
+            while k < n and ids[k] == tokens[k]:
+                k += 1
+        payload.prefix_memo = (entry, n, k)
         return block, k
 
     def cached_prefix_tokens(self, seq: Sequence[VoxCPM2SeqPayload]) -> int:
@@ -152,6 +169,23 @@ class VoxCPM2Engine(LLMEngineBase):
             payload.prefix_block = block
             seq.num_cached_tokens = k
 
+    def on_prefill_admitted(self, seqs) -> None:
+        """Copy the claimed reference-prefix KV into the newly admitted sequences' first blocks now, in one call, not
+        at the start of their step's run: the copy (~0.9 ms of GPU time for 200 cloned requests) then runs while the
+        host prepares the step instead of in front of its first kernel. A cached prefix ends inside block 0 (the
+        reference is < block_size tokens) and the sequence's own tokens follow it in the same block, so the block
+        cannot be shared (each sequence writes its own tokens there): it is copied. Safe this early: the
+        destination is the sequence's own fresh block (stream order puts the copy after the GPU work of any earlier
+        owner), the source stays pinned until _remember_prefixes evicts it after a step, and the copy is
+        stream-ordered before the step's kernels."""
+        hits = [s for s in seqs if s.custom_payload.prefix_block is not None]
+        if not hits:
+            return
+        self.model_runner.call("copy_kv_blocks", [(s.custom_payload.prefix_block, s.block_table[0]) for s in hits],
+                               [s.num_cached_tokens for s in hits])
+        for s in hits:
+            s.custom_payload.prefix_block = None  # copied: the runner does not copy it again
+
     def after_prefill(self, seqs) -> None:
         if self.ref_prefix_cache_enabled:
             self._remember_prefixes(seqs)
@@ -165,7 +199,7 @@ class VoxCPM2Engine(LLMEngineBase):
             if key is None or key in self.ref_prefix_blocks or not seq.block_table:
                 continue
             if len(self.ref_prefix_blocks) >= self.ref_prefix_cache_size:
-                _, (old, _) = self.ref_prefix_blocks.popitem(last=False)
+                _, (old, *_) = self.ref_prefix_blocks.popitem(last=False)
                 bm.blocks[old].ref_count = 0
                 bm._deallocate_block(old)
             if not bm.free_block_ids:
@@ -173,7 +207,8 @@ class VoxCPM2Engine(LLMEngineBase):
             block_id = bm.free_block_ids[0]
             bm._allocate_block(block_id).ref_count = 1  # pinned until evicted
             n = min(seq.num_prompt_tokens, self.block_size)
-            self.ref_prefix_blocks[key] = (block_id, seq.token_ids[:n])
+            # (pinned block, the tokens it holds KV for, the PreparedAudio its reference tokens came from)
+            self.ref_prefix_blocks[key] = (block_id, seq.token_ids[:n], seq.custom_payload.ref_audio)
             pairs.append((seq.block_table[0], block_id))
             counts.append(n)
         if pairs:
@@ -181,29 +216,26 @@ class VoxCPM2Engine(LLMEngineBase):
 
     def preprocess_seq(self, seq: Sequence[VoxCPM2SeqPayload], is_prefill: bool) -> RunnerTask[VoxCPM2Payload]:
         if is_prefill:
-            prefix_block = seq.custom_payload.prefix_block
+            p, k = seq.custom_payload, seq.num_cached_tokens
+            prefix_block = p.prefix_block  # None also when on_prefill_admitted copied it already
 
             return RunnerTask(
                 seq.block_table,
                 len(seq),
-                seq.num_cached_tokens,
+                k,
                 seq.block_size,
-                VoxCPM2Payload(
-                    text_tokens=np.array(seq.custom_payload.text_tokens[seq.num_cached_tokens :], dtype=np.int64),
-                    feats=_rows_from(seq.custom_payload.feats, seq.num_cached_tokens),
-                    feat_masks=np.array(seq.custom_payload.feat_masks[seq.num_cached_tokens :], dtype=np.bool_),
-                    temperature=seq.custom_payload.temperature,
-                    cfg_value=seq.custom_payload.cfg_value,
-                    padding_decode=seq.custom_payload.decode_pad,
-                    seed=seq.custom_payload.seed,
-                    seed_step=seq.custom_payload.seed_step,
-                    feat_keys=(
-                        np.array(seq.custom_payload.feat_keys[seq.num_cached_tokens :], dtype=np.uint64)
-                        if seq.custom_payload.feat_keys is not None
-                        else None
-                    ),
+                VoxCPM2Payload(  # the tails as lists: the runner converts a whole prefill step's at once
+                    text_tokens=p.text_tokens[k:],
+                    feats=_rows_from(p.feats, k),
+                    feat_masks=p.feat_masks[k:],
+                    temperature=p.temperature,
+                    cfg_value=p.cfg_value,
+                    padding_decode=p.decode_pad,
+                    seed=p.seed,
+                    seed_step=p.seed_step,
+                    feat_keys=p.feat_keys[k:] if p.feat_keys is not None else None,
                     prefix_src_block=prefix_block,
-                    prefix_len=seq.num_cached_tokens if prefix_block is not None else 0,
+                    prefix_len=k if prefix_block is not None else 0,
                 ),
                 adapter_id=seq.adapter_id,
                 seq_id=seq.seq_id,
@@ -322,7 +354,7 @@ class VoxCPM2Engine(LLMEngineBase):
                             max_generate_length,
                         )
                     except ValueError:
-                        self._pretok_map.pop(prompt_text + target_text, None)
+                        self._release_text(prompt_text + target_text)
                         raise
                 # voice_entry: the voice as the head saw it, also if it is unregistered before the continuation
                 chain = dict(target_text=target_text, prompt_text=prompt_text, prompt_latents=prompt_latents,
@@ -333,7 +365,7 @@ class VoxCPM2Engine(LLMEngineBase):
                                         self.head_patches, temperature, cfg_value, lora_name, seed, voice, clone_mode,
                                         head_start=False, text_tokens=head_ids)
                 head.custom_payload.chain = chain
-                self._pretok_map.pop(prompt_text + target_text, None)
+                self._release_text(prompt_text + target_text)
                 return head
         ref = self.prepare_audio(ref_audio_latents) if ref_audio_latents is not None else None
         prompt = self.prepare_audio(prompt_latents) if prompt_latents is not None else None
@@ -415,6 +447,7 @@ class VoxCPM2Engine(LLMEngineBase):
                 seed_step=0,
                 ref_key=ref_key,
                 feat_keys=feat_keys if self.locenc_cache_enabled and (ref is not None or prompt is not None) else None,
+                ref_audio=ref,
             ),
             lora_name=lora_name,
             adapter_id=adapter_id,
@@ -459,19 +492,43 @@ class VoxCPM2Engine(LLMEngineBase):
             self._pretok_cache = {}
         return self._pretok_cache
 
+    @property
+    def _pretok_uses(self) -> dict[str, int]:
+        """pretokenize()'s count of the registrations still to come per text: an entry of the cache stays until the
+        last of them (a text twice in one batch was tokenized again, one by one, for its second request)."""
+        if self._pretok_pending is None:
+            self._pretok_pending = {}
+        return self._pretok_pending
+
+    _pretok_pending: dict | None = None
+
     def pretokenize(self, texts: list[str]) -> None:
         """Tokenize a burst's texts in one batched call (the fast tokenizer, with character offsets for head
         start); add_request then takes them from this cache. Texts with CJK characters keep the per-text path
         (the multi-character Chinese token split)."""
-        cache = self._pretok_map
-        texts = [t for t in texts if t not in cache and not _CJK.search(t)]
+        cache, uses = self._pretok_map, self._pretok_uses
+        for t in texts:
+            uses[t] = uses.get(t, 0) + 1
+        texts = [t for t in dict.fromkeys(texts) if t not in cache and not _CJK.search(t)]
         backend = getattr(getattr(self.tokenizer, "tokenizer", None), "_tokenizer", None)  # tokenizers.Tokenizer
-        if not texts or backend is None:  # no fast tokenizer behind the wrapper
-            return
-        for t, enc in zip(texts, backend.encode_batch(texts, add_special_tokens=False)):
-            cache[t] = (enc.ids, enc.offsets)
-        while len(self._pretok_map) > 4096:  # requests that never came (cancelled before registration)
-            self._pretok_map.pop(next(iter(self._pretok_map)))
+        if texts and backend is not None:  # (else: no fast tokenizer behind the wrapper)
+            for t, enc in zip(texts, backend.encode_batch(texts, add_special_tokens=False)):
+                cache[t] = (enc.ids, enc.offsets)
+        while len(cache) > 4096:  # requests that never came (cancelled before registration)
+            t = next(iter(cache))
+            cache.pop(t)
+            uses.pop(t, None)
+        while len(uses) > 8192:  # (counts of texts that were never cached: CJK, no fast tokenizer)
+            uses.pop(next(iter(uses)))
+
+    def _release_text(self, text: str) -> None:
+        """add_request is done with ``text``: its cached ids go once no registration of it is pending."""
+        uses = self._pretok_uses
+        n = uses.pop(text, 0) - 1
+        if n > 0:
+            uses[text] = n
+        else:
+            self._pretok_map.pop(text, None)
 
     def _tokens(self, text: str) -> tuple[list[int], list[tuple[int, int]] | None]:
         """ids (and character offsets) of ``text``, from pretokenize()'s cache or tokenized now (and cached until
@@ -487,7 +544,7 @@ class VoxCPM2Engine(LLMEngineBase):
 
     def _text_ids(self, prompt_text: str, target_text: str) -> list[int]:
         ids = self._tokens(prompt_text + target_text)[0]
-        self._pretok_map.pop(prompt_text + target_text, None)
+        self._release_text(prompt_text + target_text)
         return ids
 
     def _split_head(self, prompt_text, target_text, voice, clone_mode) -> tuple[list[int], list[int]] | None:

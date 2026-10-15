@@ -250,6 +250,25 @@ def _host_fields(before: tuple[float, int, int], wall_s: float) -> dict:
             "core": after[2], "cpu_abs": after[0], "minflt_abs": after[1]}
 
 
+def _get_by(queue_in, t_end: float):
+    """The next command if one arrives by t_end (perf_counter), else None; a command already there is taken even past
+    t_end. A pipe poll waits whole milliseconds (a shorter timeout is rounded up to 1 ms), so a sub-millisecond wait,
+    such as an admission gap's rest after prepare(), would last a whole millisecond: whole milliseconds are polled,
+    the rest is spun."""
+    ms = int((t_end - time.perf_counter()) * 1000)
+    if ms > 0:
+        try:
+            return queue_in.get(timeout=(ms - 0.5) / 1000)  # poll rounds it up to ms
+        except Empty:
+            pass
+    while True:
+        try:
+            return queue_in.get_nowait()
+        except Empty:
+            if time.perf_counter() >= t_end:
+                return None
+
+
 def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
     import signal
 
@@ -364,8 +383,25 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
     sched = getattr(getattr(srv, "llm", None), "scheduler", None)
     group = min(sched.max_num_seqs, getattr(sched, "max_prefill_seqs", sched.max_num_seqs)) if sched else first_chunk
 
-    def n_waiting() -> int:
-        return len(sched.waiting) if sched is not None else 0
+    def n_waiting() -> int:  # waiting for a prefill step, also when admitted to the next one already (prepare)
+        if sched is None:
+            return 0
+        return sched.num_queued if hasattr(sched, "num_queued") else len(sched.waiting)
+
+    # In the admission window the engine is idle and the next step is a prefill of what registers there. Whenever
+    # no request is pending, it admits what has registered so far into that step and builds their runner inputs
+    # (and starts their reference-prefix KV copies): the step that follows the last request only does that for the
+    # requests after the last idle moment. Requests that trickle in (HTTP) leave idle moments between them; a burst
+    # handed over at once does not, and runs exactly as before.
+    prepare_prefill = getattr(getattr(srv, "llm", None), "prepare_prefill", None)
+
+    def prepare() -> None:
+        if prepare_prefill is None or sched is None or not sched.waiting:
+            return
+        t0 = time.perf_counter()
+        n = prepare_prefill()
+        if _profile.StepProfile.enabled and n:
+            _profile.log(kind="prepare", t=t0, n=n, ms=(time.perf_counter() - t0) * 1000)
 
     window = {"n": 0, "end": False}  # commands of the current admission window, last message ended a client turn
 
@@ -466,9 +502,13 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
                 if remaining <= 0:
                     break
                 try:
-                    cmd = queue_in.get(timeout=remaining if more else min(remaining, gap_ms / 1000.0))
-                except Empty:
-                    break
+                    cmd = queue_in.get_nowait()
+                except Empty:  # idle until the next request: prepare the step for the ones registered so far
+                    gap_end = time.perf_counter() + gap_ms / 1000.0  # the gap counts from here, as before
+                    prepare()
+                    cmd = _get_by(queue_in, hard if more else min(deadline, gap_end))
+                    if cmd is None:
+                        break
                 put(handle(cmd))
 
         if srv.is_finished():
