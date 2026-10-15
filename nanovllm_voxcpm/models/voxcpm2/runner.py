@@ -99,6 +99,21 @@ def _patch_silent(wave) -> bool:
 # NANOVLLM_FIRST_AUDIO_FRAMES=k: a prefill step's patch is decoded and sent as its first k latent frames (40 ms of
 # audio each), then the rest; 0 = in one piece
 _FIRST_AUDIO_FRAMES = int(os.environ.get("NANOVLLM_FIRST_AUDIO_FRAMES", "1"))
+# NANOVLLM_FIRST_AUDIO_MS=m: with a one-frame first piece, that frame leaves in two parts too, its first m ms (a
+# multiple of 5: the first transposed conv's output phases, stride 8 over a 40 ms frame) and then the rest of it;
+# 0 or 40 = the whole frame at once. Needs the fused VAE kernels.
+_FIRST_AUDIO_MS = float(os.environ.get("NANOVLLM_FIRST_AUDIO_MS", "20"))
+
+
+def first_audio_phases(ms: float, frame_ms: float, stride: int) -> int:
+    """Output phases of the decoder's first transposed conv (``stride`` per latent frame of ``frame_ms``) that make up
+    the first ``ms`` of a frame; 0 = no split (``ms`` <= 0 or a whole frame or more)."""
+    if ms <= 0 or ms >= frame_ms:
+        return 0
+    r = ms * stride / frame_ms
+    if abs(r - round(r)) > 1e-6:
+        raise ValueError(f"NANOVLLM_FIRST_AUDIO_MS={ms:g}: a multiple of {frame_ms / stride:g} ms below {frame_ms:g}")
+    return int(round(r))
 
 
 class VoxCPM2Runner(BaseModelRunner):
@@ -184,6 +199,11 @@ class VoxCPM2Runner(BaseModelRunner):
         if model_config.turbo.vae_kernel:
             from voxcpm_kernels import SlotStreamingVAEDecoder
 
+            first_phases = 0
+            if _FIRST_AUDIO_FRAMES == 1 and model_config.turbo.vae_fused:
+                first_phases = first_audio_phases(
+                    _FIRST_AUDIO_MS, 1000.0 * self.vae.decoder_chunk_size / self.vae.out_sample_rate,
+                    self.vae.decoder_rates[0])
             self.vae_streaming_decoder = SlotStreamingVAEDecoder(
                 self.vae.decoder,
                 max_streams=self._config.max_num_seqs,
@@ -193,6 +213,7 @@ class VoxCPM2Runner(BaseModelRunner):
                 # the first audio of a prefill step's patch and the rest of it, graphed too
                 extra_chunk_frames=(_FIRST_AUDIO_FRAMES, self.patch_size - _FIRST_AUDIO_FRAMES)
                 if 0 < _FIRST_AUDIO_FRAMES < self.patch_size else (),
+                first_phases=first_phases,
             )
         else:
             self.vae_streaming_decoder = self.vae.streaming_decoder(self._config.max_num_seqs)
@@ -483,6 +504,27 @@ class VoxCPM2Runner(BaseModelRunner):
         out = _to_host(wav.to(torch.float32 if not self._pcm16 else torch.int16))
         return [out[i] for i in range(out.shape[0])]
 
+    def _wave_rows_async(self, vae_decoded: torch.Tensor):
+        """_wave_rows without the wait: the conversion and the copy into page-locked memory are queued now (ahead of
+        the next decode, which may reuse the graph-owned buffer); the returned function waits for them and returns the
+        rows."""
+        wav = vae_decoded[:, 0, :]
+        if self._pcm16:
+            wav = (wav.float().clamp_(-1.0, 1.0) * 32767.0).round_().to(torch.int16)
+        else:
+            wav = wav.to(torch.float32)
+        host = torch.empty(wav.shape, dtype=wav.dtype, pin_memory=True)
+        host.copy_(wav, non_blocking=True)
+        done = torch.cuda.Event()
+        done.record()
+
+        def rows() -> list:
+            done.synchronize()
+            out = host.numpy()
+            return [out[i] for i in range(out.shape[0])]
+
+        return rows
+
     def _run_with_inputs(self, seqs, inputs, is_prefill, prof):
         if prof.enabled:
             prof.rec["tokens"] = int(inputs["text_tokens"].numel())
@@ -526,12 +568,27 @@ class VoxCPM2Runner(BaseModelRunner):
                 # Time to first audio: a prefill step's patch is decoded in two pieces (the first
                 # NANOVLLM_FIRST_AUDIO_FRAMES frames, then the rest) and the first piece's audio leaves at once
                 # (emit_hook). The VAE is causal and keeps each stream's state, so the pieces are the patch's audio;
-                # one frame (40 ms of audio) costs a quarter of the patch's VAE time before the first audio.
+                # one frame (40 ms of audio) costs a quarter of the patch's VAE time before the first audio; with
+                # NANOVLLM_FIRST_AUDIO_MS (default 20) the first audio is half a frame, decoded on its own.
                 half = _FIRST_AUDIO_FRAMES
-                first = self._wave_rows(dec.decode_chunks(z[..., :half].contiguous(), ids, initial_contexts, **kw))
-                emit(ids, first)
-                prof.mark("vae_first_half")
-                vae_decoded = dec.decode_chunks(z[..., half:].contiguous(), ids)
+                if half == 1 and getattr(dec, "split_phases", 0):
+                    # NANOVLLM_FIRST_AUDIO_MS: the first frame in two parts as well, each sent as soon as it is on the
+                    # host; the GPU decodes the next part meanwhile (each copy is queued before the next decode)
+                    part_a = self._wave_rows_async(
+                        dec.decode_first(z[..., :1].contiguous(), ids, initial_contexts, **kw))
+                    part_b = self._wave_rows_async(dec.decode_first_rest(ids))
+                    first_a = part_a()
+                    emit(ids, first_a)
+                    prof.mark("vae_first_half")
+                    vae_decoded = dec.decode_chunks(z[..., half:].contiguous(), ids)
+                    first_b = part_b()
+                    emit(ids, first_b)
+                    first = [np.concatenate(p) for p in zip(first_a, first_b)]
+                else:
+                    first = self._wave_rows(dec.decode_chunks(z[..., :half].contiguous(), ids, initial_contexts, **kw))
+                    emit(ids, first)
+                    prof.mark("vae_first_half")
+                    vae_decoded = dec.decode_chunks(z[..., half:].contiguous(), ids)
             else:
                 first = None
                 vae_decoded = dec.decode_chunks(z, ids, initial_contexts, **kw)
