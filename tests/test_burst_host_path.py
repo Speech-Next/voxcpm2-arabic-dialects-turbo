@@ -820,6 +820,27 @@ def test_a_burst_handed_over_at_once_runs_without_preparation(monkeypatch):
 # --- 7. the profile helper -----------------------------------------------------------------------------------------
 
 
+def test_get_by_waits_until_its_deadline_not_to_the_next_millisecond():
+    """mp.Queue.get(timeout) polls whole milliseconds: after prepare(), a gap's ~0.7 ms rest waited ~1.07 ms, which
+    put every lone request's step ~0.3 ms later than main's."""
+    import multiprocessing as mp
+    import statistics
+
+    from nanovllm_voxcpm.models.voxcpm2.server import _get_by
+
+    q = mp.Queue()
+    for wait in (0.0003, 0.0025):
+        took = []
+        for _ in range(15):
+            t0 = time.perf_counter()
+            assert _get_by(q, t0 + wait) is None
+            took.append(time.perf_counter() - t0)
+        assert wait <= statistics.median(took) < wait + 0.0005
+    q.put("cmd")
+    time.sleep(0.05)  # the queue's feeder thread has sent it
+    assert _get_by(q, time.perf_counter() - 1.0) == "cmd"  # one already there is taken past the deadline
+
+
 def test_profile_timeline_from_records():
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "examples"))
     import profile_burst

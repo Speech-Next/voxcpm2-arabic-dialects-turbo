@@ -250,6 +250,25 @@ def _host_fields(before: tuple[float, int, int], wall_s: float) -> dict:
             "core": after[2], "cpu_abs": after[0], "minflt_abs": after[1]}
 
 
+def _get_by(queue_in, t_end: float):
+    """The next command if one arrives by t_end (perf_counter), else None; a command already there is taken even past
+    t_end. A pipe poll waits whole milliseconds (a shorter timeout is rounded up to 1 ms), so a sub-millisecond wait,
+    such as an admission gap's rest after prepare(), would last a whole millisecond: whole milliseconds are polled,
+    the rest is spun."""
+    ms = int((t_end - time.perf_counter()) * 1000)
+    if ms > 0:
+        try:
+            return queue_in.get(timeout=(ms - 0.5) / 1000)  # poll rounds it up to ms
+        except Empty:
+            pass
+    while True:
+        try:
+            return queue_in.get_nowait()
+        except Empty:
+            if time.perf_counter() >= t_end:
+                return None
+
+
 def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
     import signal
 
@@ -487,11 +506,8 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
                 except Empty:  # idle until the next request: prepare the step for the ones registered so far
                     gap_end = time.perf_counter() + gap_ms / 1000.0  # the gap counts from here, as before
                     prepare()
-                    now = time.perf_counter()
-                    remaining = (hard if more else deadline) - now
-                    try:  # (a request that came during prepare() is taken even past the deadline)
-                        cmd = queue_in.get(timeout=max(0.0, remaining if more else min(remaining, gap_end - now)))
-                    except Empty:
+                    cmd = _get_by(queue_in, hard if more else min(deadline, gap_end))
+                    if cmd is None:
                         break
                 put(handle(cmd))
 
