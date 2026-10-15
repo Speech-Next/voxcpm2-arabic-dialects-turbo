@@ -20,19 +20,14 @@ each in its own dialect's LoRA.
 
 | mode | LocDiT steps | first audio p95, 200 requests | CER | WER | UTMOS |
 |---|---|---:|---:|---:|---:|
-| fast (default) | 2 | 99 ms | 4.6 % | 13.5 % | 2.41 |
-| quality (`dit=None`) | 10, with CFG | 277 ms | 4.2 % | 12.5 % | 2.77 |
+| fast (default) | 2, distilled for these adapters | 99 ms | 5.3 % | 16.1 % | 2.14 |
+| quality (`dit=None`) | 10, with CFG | 277 ms | 5.3 % | 15.5 % | 2.40 |
 
-| dialect (fast mode) | voices | CER | WER | UTMOS |
-|---|---:|---:|---:|---:|
-| jordanian | 17 | 5.8 % | 15.8 % | 2.34 |
-| palestinian | 5 | 3.4 % | 10.4 % | 2.25 |
-| qatari | 3 | 1.8 % | 7.8 % | 2.80 |
-| saudi | 3 | 2.6 % | 11.4 % | 2.65 |
-| hindi_english | 4 | 8.9 % | 13.5 % | 2.02 |
-
-- CER / WER: the better of Whisper large-v3 and Cohere Transcribe Arabic (Whisper only for Hindi).
-- 6 sentences per voice. The mode table covers the Arabic voices only.
+- Quality: the held-out evaluation set, 17 dialects × 40 sentences × 2 seeds (1,320 clips), each voice cloned from
+  another clip of its speaker, default settings (int8). Per dialect: the
+  [distilled LocDiT's card](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT).
+- CER / WER: the better of Whisper large-v3 and Cohere Transcribe Arabic; lower is better. UTMOS: predicted
+  naturalness, 1-5.
 
 ## Install
 
@@ -57,7 +52,7 @@ from nanovllm_voxcpm import DialectTTS
 async def main():
     tts = await DialectTTS.load(
         "VoxCPM-Kernel/VoxCPM2-Arabic-Dialects",                       # VoxCPM2 + dialect LoRAs
-        dit="VoxCPM-Kernel/VoxCPM2-Turbo-distilled-DiT:student_k2_dmd.pt",  # 2 steps; None = 10 steps (quality)
+        dit="VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k2_dmd.pt",  # 2 steps; None = 10 (quality)
     )
     await tts.add_voice("ahmed", "ahmed.wav")
     audio = await tts.synthesize("هلا والله، كيف حالك اليوم؟", dialect="najdi", voice="ahmed")  # 48 kHz
@@ -73,7 +68,7 @@ Dialects: ab, egyptian, emirati, hejazi, hindi_english, iraqi, jordanian, najdi,
 python examples/voice_clone.py --voice ahmed.wav --dialect najdi --text "هلا والله" --out out.wav   # one file
 NANOVLLM_BUSY_POLL_S=30 python examples/benchmark.py                                             # the speed table
 python -m nanovllm_voxcpm.entrypoints.openai_server --model VoxCPM-Kernel/VoxCPM2-Arabic-Dialects \
-    --dit VoxCPM-Kernel/VoxCPM2-Turbo-distilled-DiT:student_k2_dmd.pt                                # HTTP server, :8092
+    --dit VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k2_dmd.pt                      # HTTP server, :8092
 ```
 
 License: MIT. VoxCPM2 weights: Apache-2.0.
