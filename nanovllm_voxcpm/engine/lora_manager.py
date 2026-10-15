@@ -75,12 +75,29 @@ class LoRABatchPlan:
     slot_start_offsets: list[int]
 
 
+_LOOP_MAX_ROWS = 512  # LoRA metadata: the per-token loop up to here, numpy above (measured crossover)
+
+
 def _build_lora_metadata_from_token_to_slot(
     token_to_slot,
 ) -> tuple[list[int], list[int], list[int], list[int]]:
     """(token indices grouped by slot, ascending within a slot; active slots ascending; tokens per slot; offsets) of
     the tokens with a slot (>= 0). numpy, one pass: the per-token Python loop took ~0.7 ms of a 200-request prefill
-    step's preparation (its LM, projection and LocDiT domains: ~1300 + 200 + ~2300 rows)."""
+    step's preparation (its LM, projection and LocDiT domains: ~1300 + 200 + ~2300 rows). Up to _LOOP_MAX_ROWS rows
+    (every decode step, small prefills) the loop is faster: numpy's fixed cost is ~15 us, the loop's ~1 us per 16
+    rows."""
+    if len(token_to_slot) <= _LOOP_MAX_ROWS:
+        slot_to_indices: dict[int, list[int]] = {}
+        for token_idx, slot_id in enumerate(token_to_slot):
+            if slot_id >= 0:
+                slot_to_indices.setdefault(int(slot_id), []).append(token_idx)
+        active_slot_ids = sorted(slot_to_indices)
+        num_tokens_per_slot = [len(slot_to_indices[slot_id]) for slot_id in active_slot_ids]
+        token_indices_sorted_by_slot = [i for slot_id in active_slot_ids for i in slot_to_indices[slot_id]]
+        slot_start_offsets = [0]
+        for count in num_tokens_per_slot:
+            slot_start_offsets.append(slot_start_offsets[-1] + count)
+        return token_indices_sorted_by_slot, active_slot_ids, num_tokens_per_slot, slot_start_offsets
     s = np.asarray(token_to_slot, dtype=np.int64).reshape(-1)
     idx = np.flatnonzero(s >= 0)
     if idx.size == 0:

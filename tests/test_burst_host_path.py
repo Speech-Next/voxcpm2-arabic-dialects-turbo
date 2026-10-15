@@ -174,14 +174,16 @@ def test_host_pack_views_have_the_arrays_dtypes_shapes_and_values():
 @pytest.mark.parametrize("seed", range(5))
 def test_lora_metadata_matches_the_per_token_loop(seed):
     rng = np.random.default_rng(seed)
-    for n in (0, 1, 7, 300):
+    for n in (0, 1, 7, 300, lm._LOOP_MAX_ROWS + 1, 1300):  # both the loop (small) and numpy (large) paths
         slots = rng.integers(-1, 6, n).tolist()
         assert lm._build_lora_metadata_from_token_to_slot(slots) == _old_metadata(slots)
     assert lm._build_lora_metadata_from_token_to_slot([-1, -1]) == _old_metadata([-1, -1])
 
 
 def test_expand_dit_lora_slots_matches_the_comprehension():
-    for slots, seq_len, cfg, padded in [([0, 2, -1], 11, 2, 8), ([1], 11, 1, None), ([], 3, 2, 4), ([3, 3], 0, 2, 2)]:
+    big = [i % 4 - 1 for i in range(40)]  # 48 x 11 rows: the numpy path; the others take the comprehension
+    for slots, seq_len, cfg, padded in [([0, 2, -1], 11, 2, 8), ([1], 11, 1, None), ([], 3, 2, 4), ([3, 3], 0, 2, 2),
+                                        (big, 11, 2, 48), (big, 11, 1, None)]:
         assert expand_dit_lora_slots(slots, seq_len, cfg, padded) == _old_expand(slots, seq_len, cfg, padded)
 
 
@@ -394,6 +396,20 @@ def test_prefill_inputs_and_noise_seeds_match_the_per_tensor_path(seed, monkeypa
         assert torch.equal(got[k], torch.from_numpy(want[k]).to(r.dtype)), k
     np.testing.assert_array_equal(seen["seed_t"].numpy(), want["seed_t"])
     assert r._enc_rows == ref._enc_rows  # the LocEnc cache's rows and LRU order
+
+
+@pytest.mark.parametrize("n", [1, 16, 17, 60])
+def test_noise_seeds_match_the_per_row_derivation(n):
+    """Per row up to 16 rows, numpy above: the same seeds, and unseeded rows draw random bits in row order."""
+    rng = np.random.default_rng(n)
+    tasks = _payload_tasks(rng, n)
+    r = _runner()
+    random.seed(n)
+    got = r._noise_seeds(tasks)
+    random.seed(n)
+    want = np.array([s & 0x7FFFFFFFFFFFFFFF for s in _old_noise_seeds(tasks)], dtype=np.int64)
+    assert got.dtype == np.int64
+    np.testing.assert_array_equal(got, want)
 
 
 def test_vectorized_step_seeds_match_splitmix():

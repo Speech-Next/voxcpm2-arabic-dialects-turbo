@@ -343,6 +343,9 @@ class VoxCPM2Runner(BaseModelRunner):
         from voxcpm_kernels.noise import SEED_MASK
 
         payloads = [seq.custom_payload for seq in seqs]
+        if len(payloads) <= 16:  # a few rows: per row is faster than numpy's fixed cost (~2 vs ~11 us at one row)
+            return np.array([(derive_step_seed(int(p.seed), p.seed_step) if p.seed is not None and p.seed >= 0
+                              else random.getrandbits(63)) & SEED_MASK for p in payloads], dtype=np.int64)
         seeded = [i for i, p in enumerate(payloads) if p.seed is not None and p.seed >= 0]
         out = np.zeros(len(payloads), dtype=np.uint64)
         if seeded:

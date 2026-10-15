@@ -196,6 +196,9 @@ def expand_dit_lora_slots(
     padded_batch_size = batch_size if padded_batch_size is None else padded_batch_size
     if padded_batch_size < batch_size:
         raise ValueError("padded_batch_size cannot be smaller than the real batch size")
+    if padded_batch_size * sequence_length <= 128:  # a few rows: the comprehension beats numpy's fixed cost
+        padded = list(sample_to_slot) + [-1] * (padded_batch_size - batch_size)
+        return [slot for _ in range(cfg_branches) for slot in padded for _ in range(sequence_length)]
     padded_slots = np.full(padded_batch_size, -1, dtype=np.int64)
     padded_slots[:batch_size] = sample_to_slot
     # each slot sequence_length times, the padded batch once per CFG branch (numpy: ~2300 rows at 200 requests)
