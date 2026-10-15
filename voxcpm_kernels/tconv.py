@@ -177,13 +177,50 @@ class FusedSnakeTransposeConv:
         self.allph = ALLPH_TILES.get(self.C_in)  # (BM, BN, BK, warps, stages) or None
         self.flat = FLAT_TILES.get(self.C_in)  # (BM, BN, BK, warps, stages) of _tconv_gemm_flat, or None
         self.w_flat = self.w.permute(1, 0, 2).reshape(self.C_out * s, 2 * self.C_in).contiguous()  # row = co * S + r
+        self._w_phases: dict[tuple[int, int], torch.Tensor] = {}  # packed weights of phase ranges (see phases)
+
+    def phases(self, y: torch.Tensor, idx: torch.Tensor, r0: int, r1: int) -> torch.Tensor:
+        """Output phases [r0, r1) of a one-frame chunk, from its snaked input y [B, C_in, 1] and the current state,
+        which is not advanced: out[:, :, r - r0] = W_r^T y + W_{r+S}^T state + b, i.e. output samples r0 .. r1 - 1 of
+        that frame. When the whole frame runs the all-phase or flattened kernel (the wide first blocks), this is the
+        same kernel and tiles over the phase range's packed weights, with the same K order per output: the samples
+        are bit-identical to the frame's."""
+        if y.size(2) != 1 or not 0 <= r0 < r1 <= self.S:
+            raise ValueError("phases: a one-frame chunk and 0 <= r0 < r1 <= S")
+        y = y.contiguous()
+        B, C_in, _ = y.shape
+        n = r1 - r0
+        w = self._w_phases.get((r0, r1))
+        out = torch.empty(B, self.C_out, n, device=y.device, dtype=y.dtype)
+        if self.flat is not None:
+            if w is None:  # rows co * n + (r - r0)
+                w = self.w[r0:r1].permute(1, 0, 2).reshape(self.C_out * n, 2 * C_in).contiguous()
+                self._w_phases[(r0, r1)] = w
+            bm, bn, bk, warps, stages = self.flat
+            _tconv_gemm_flat[(triton.cdiv(self.C_out * n, bm), triton.cdiv(B, bn))](
+                y, self.state, idx, w, self.b, out, C_in, self.C_out, 1, B, self.state.stride(0),
+                S=n, BM=bm, BN=bn, BK=bk, num_warps=warps, num_stages=stages,
+            )
+            return out
+        if w is None:
+            w = self._w_phases[(r0, r1)] = self.w[r0:r1].contiguous()
+        bm, bn, bk, warps, stages = self.allph or (*self.tiles, self.stages)
+        _tconv_gemm_allph[(triton.cdiv(self.C_out, bm), triton.cdiv(B, bn))](
+            y, self.state, idx, w, self.b, out, C_in, self.C_out, 1, B, self.state.stride(0),
+            S=n, SP=triton.next_power_of_2(n), BM=bm, BN=bn, BK=bk, num_warps=warps, num_stages=stages,
+        )
+        return out
+
+    def snaked(self, x: torch.Tensor) -> torch.Tensor:
+        """The GEMM's input: x after this op's snake (or x itself when the op before applied it)."""
+        return x if self.pre_snaked else self.snake(x)
 
     def __call__(self, x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         x = x.contiguous()
         B, C_in, T = x.shape
         # the snake runs once over the input (the GEMM then needs no sin), or already ran in the epilogue of the op
         # that produced x (pre_snaked, see vae_stream._fuse_post_snakes)
-        y = x if self.pre_snaked else self.snake(x)
+        y = self.snaked(x)
         out = torch.empty(B, self.C_out, T * self.S, device=x.device, dtype=x.dtype)
         bm, bn, bk, warps = self.tiles
         if self.flat is not None:
