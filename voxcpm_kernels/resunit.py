@@ -390,7 +390,10 @@ def _dw_snake12_h3(
     a1_ptr, i1_ptr, w7_ptr, b7_ptr, a2_ptr, i2_ptr,
     C, T, P, state_slot_stride,
     DIL: tl.constexpr, KSIZE: tl.constexpr, BC: tl.constexpr, BT: tl.constexpr, FAST_SIN: tl.constexpr,
+    UPDATE_STATE: tl.constexpr = False, BP: tl.constexpr = 1,
 ):
+    """UPDATE_STATE (a chunk no longer than BT: one program owns its channels' whole chunk) also advances the causal
+    state as _snake_state does, after every read of the old one."""
     b = tl.program_id(0)
     t = tl.program_id(1) * BT + tl.arange(0, BT)
     c = tl.program_id(2) * BC + tl.arange(0, BC)
@@ -420,6 +423,18 @@ def _dw_snake12_h3(
     h3 = h2 + s2 * s2 * tl.load(i2_ptr + c, mask=cm, other=1.0)[:, None]
     tl.store(h3_ptr + b.to(tl.int64) * C * T + c[:, None] * T + t[None, :], h3.to(h3_ptr.dtype.element_ty),
              mask=cm[:, None] & tm[None, :])
+    if UPDATE_STATE:  # state[slot, c, j] <- [state | snake1(x)][T + j], the same values as _snake_state
+        j = tl.arange(0, BP)
+        jm = j < PC
+        src = T + j - PC
+        in_x = src >= 0
+        xv = tl.load(xrow + src[None, :], mask=cm[:, None] & (in_x & jm)[None, :], other=0.0).to(tl.float32)
+        sx = _sin(a1 * xv, FAST_SIN)
+        hx = xv + sx * sx * i1
+        sv = tl.load(srow + (T + j)[None, :], mask=cm[:, None] & ((~in_x) & jm)[None, :], other=0.0).to(tl.float32)
+        new = tl.where(in_x[None, :], hx, sv)
+        tl.debug_barrier()  # every thread has read the old state (taps above, shifted values here) before any store
+        tl.store(srow + j[None, :], new.to(state_ptr.dtype.element_ty), mask=cm[:, None] & jm[None, :])
 
 
 @triton.jit
@@ -484,6 +499,9 @@ COLS_MAX_T = int(os.environ.get("VOXCPM_KERNELS_COLS_MAX_T", "16"))
 COLS_TILES = {1024: (128, 32, 8, 3), 512: (128, 32, 4, 3)}  # tuned at B=208, T=4 and 8 on an A10
 # Depthwise pass of short chunks: at least this many elements per program (tiles are BC channels x next_pow2(T))
 DW_MIN_TILE = 512
+# A chunk within one depthwise time tile: that pass also advances the causal state (no separate _snake_state); at
+# B=208, T=4: 0.16 -> 0.12 ms per 1024-channel unit of dilation 1 or 3, bit-identical
+DW_STATE = os.environ.get("VOXCPM_KERNELS_DW_STATE", "1") == "1"
 
 
 # (BM, BN, BK, num_warps, num_stages) of the 1x1 conv per channel count, tuned at
@@ -513,15 +531,20 @@ class TwoPassResidualUnit(FusedResidualUnit):
             bc = min(triton.next_power_of_2(C), max(bc, DW_MIN_TILE // bt))
         else:
             bt = min(bt, max(16, triton.next_power_of_2(T)))
+        # one time tile and a short state: the depthwise pass advances the state itself (a long one, dilation 9,
+        # is faster in _snake_state)
+        fused_state = DW_STATE and T <= bt and self.P <= 32
         _dw_snake12_h3[(B, triton.cdiv(T, bt), triton.cdiv(C, bc))](
             x, self.state, idx, h3, self.a1, self.i1, self.w7, self.b7, self.a2, self.i2,
             C, T, self.P, self.state.stride(0), DIL=self.dil, KSIZE=self.ksize, BC=bc, BT=bt,
-            FAST_SIN=DIRECT_FAST_SIN, num_warps=dw_warps,
+            FAST_SIN=DIRECT_FAST_SIN, UPDATE_STATE=fused_state, BP=triton.next_power_of_2(self.P),
+            num_warps=dw_warps,
         )
-        _snake_state[(B, triton.cdiv(C, 32))](
-            x, self.state, idx, self.a1, self.i1, C, T, self.P, self.state.stride(0),
-            BC=32, BP=triton.next_power_of_2(self.P), FAST_SIN=DIRECT_FAST_SIN,
-        )
+        if not fused_state:
+            _snake_state[(B, triton.cdiv(C, 32))](
+                x, self.state, idx, self.a1, self.i1, C, T, self.P, self.state.stride(0),
+                BC=32, BP=triton.next_power_of_2(self.P), FAST_SIN=DIRECT_FAST_SIN,
+            )
         out = torch.empty_like(x)
         bm, bn, bk, warps, stages = self.twopass_tiles
         post = self.post_snake or (self.a1, self.i1, self.a1, self.i1)

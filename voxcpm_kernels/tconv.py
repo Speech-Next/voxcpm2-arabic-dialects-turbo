@@ -151,6 +151,11 @@ ALLPH_TILES = {2048: (32, 128, 32, 8, 2), 1024: (32, 64, 32, 4, 2), 512: (32, 64
 # Tuned at B=256 on an A10 at the power cap: stride 5 3.97 -> 3.54 ms, stride 6
 # 2.79 -> 2.70 ms; slower for stride 8 (no padding to remove) and stride 2 (strided stores, see _tconv_gemm_s2)
 FLAT_TILES = {1024: (256, 128, 32, 8, 2), 512: (256, 64, 32, 4, 2)}
+# One-frame chunks (the first audio: a whole first frame and the two parts of a split one) take these tiles instead,
+# per input channels up to a frame's input length (SHORT_MAX_T). Same kernel and BK as above, so bit-identical
+# outputs; tuned at B=208 on an A10: stride 8 0.26 -> 0.23 ms, stride 6 0.49 -> 0.41 ms, stride 5 0.68 -> 0.57 ms.
+SHORT_TILES = {2048: (16, 256, 32, 8, 3), 1024: (128, 64, 32, 4, 3), 512: (256, 32, 32, 4, 2)}
+SHORT_MAX_T = {2048: 1, 1024: 8, 512: 48}
 
 
 class FusedSnakeTransposeConv:
@@ -177,6 +182,10 @@ class FusedSnakeTransposeConv:
         self.allph = ALLPH_TILES.get(self.C_in)  # (BM, BN, BK, warps, stages) or None
         self.flat = FLAT_TILES.get(self.C_in)  # (BM, BN, BK, warps, stages) of _tconv_gemm_flat, or None
         self.w_flat = self.w.permute(1, 0, 2).reshape(self.C_out * s, 2 * self.C_in).contiguous()  # row = co * S + r
+        self.short = SHORT_TILES.get(self.C_in)  # (BM, BN, BK, warps, stages) for chunks up to short_max_t input steps
+        self.short_max_t = SHORT_MAX_T.get(self.C_in, 0)
+        if self.short is not None and self.short[2] != (self.flat or self.allph or self.tiles)[2]:
+            raise ValueError("short-chunk tiles must keep the kernel's BK (bit-identical outputs)")
         self._w_phases: dict[tuple[int, int], torch.Tensor] = {}  # packed weights of phase ranges (see phases)
 
     def phases(self, y: torch.Tensor, idx: torch.Tensor, r0: int, r1: int) -> torch.Tensor:
@@ -196,7 +205,7 @@ class FusedSnakeTransposeConv:
             if w is None:  # rows co * n + (r - r0)
                 w = self.w[r0:r1].permute(1, 0, 2).reshape(self.C_out * n, 2 * C_in).contiguous()
                 self._w_phases[(r0, r1)] = w
-            bm, bn, bk, warps, stages = self.flat
+            bm, bn, bk, warps, stages = self.short or self.flat
             _tconv_gemm_flat[(triton.cdiv(self.C_out * n, bm), triton.cdiv(B, bn))](
                 y, self.state, idx, w, self.b, out, C_in, self.C_out, 1, B, self.state.stride(0),
                 S=n, BM=bm, BN=bn, BK=bk, num_warps=warps, num_stages=stages,
@@ -204,7 +213,7 @@ class FusedSnakeTransposeConv:
             return out
         if w is None:
             w = self._w_phases[(r0, r1)] = self.w[r0:r1].contiguous()
-        bm, bn, bk, warps, stages = self.allph or (*self.tiles, self.stages)
+        bm, bn, bk, warps, stages = self.short if self.allph and self.short else (self.allph or (*self.tiles, self.stages))
         _tconv_gemm_allph[(triton.cdiv(self.C_out, bm), triton.cdiv(B, bn))](
             y, self.state, idx, w, self.b, out, C_in, self.C_out, 1, B, self.state.stride(0),
             S=n, SP=triton.next_power_of_2(n), BM=bm, BN=bn, BK=bk, num_warps=warps, num_stages=stages,
@@ -223,8 +232,9 @@ class FusedSnakeTransposeConv:
         y = self.snaked(x)
         out = torch.empty(B, self.C_out, T * self.S, device=x.device, dtype=x.dtype)
         bm, bn, bk, warps = self.tiles
+        short = self.short is not None and T <= self.short_max_t
         if self.flat is not None:
-            bm, bn, bk, warps, stages = self.flat
+            bm, bn, bk, warps, stages = self.short if short else self.flat
             _tconv_gemm_flat[(triton.cdiv(self.C_out * self.S, bm), triton.cdiv(B * T, bn))](
                 y, self.state, idx, self.w_flat, self.b, out,
                 C_in, self.C_out, T, B, self.state.stride(0),
@@ -237,7 +247,7 @@ class FusedSnakeTransposeConv:
                 BM=bm, BN=bn, BK=bk, num_warps=warps, num_stages=self.stages,
             )
         elif self.allph is not None:
-            bm, bn, bk, warps, stages = self.allph
+            bm, bn, bk, warps, stages = self.short if short else self.allph
             _tconv_gemm_allph[(triton.cdiv(self.C_out, bm), triton.cdiv(B * T, bn))](
                 y, self.state, idx, self.w, self.b, out,
                 C_in, self.C_out, T, B, self.state.stride(0),

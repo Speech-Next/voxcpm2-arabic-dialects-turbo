@@ -55,3 +55,29 @@ def test_flatten_states_leaves_mixed_states_alone():
     assert flatten_states(holders) is None
     assert all(h.state is s for h, s in zip(holders, states))
     assert flatten_states([]) is None
+
+
+def _tiny_decoder():
+    from nanovllm_voxcpm.layers.audio_vae_v2 import AudioVAEConfigV2, AudioVAEV2
+
+    cfg = AudioVAEConfigV2(encoder_dim=8, encoder_rates=[2, 2], latent_dim=8, decoder_dim=32, decoder_rates=[2, 2],
+                           sr_bin_boundaries=None)
+    return AudioVAEV2(config=cfg).decoder
+
+
+def test_released_slots_are_zero_for_the_next_stream():
+    from voxcpm_kernels import SlotStreamingVAEDecoder
+
+    dec = SlotStreamingVAEDecoder(_tiny_decoder(), max_streams=2, latent_dim=8, chunk_frames=2, use_cuda_graph=False)
+    assert dec._flat is not None and len(dec.states) > 1
+    a, b = dec._slots_for(["a", "b"])
+    for s in dec.states:  # both streams have decoded something
+        s[a].fill_(1.0)
+        s[b].fill_(2.0)
+    dec.release("a")
+    assert all(not s[a].any() for s in dec.states)  # zeroed when freed
+    assert all(bool((s[b] == 2.0).all()) for s in dec.states)  # the live stream is untouched
+    (c,) = dec._slots_for(["c"])
+    assert c == a and all(not s[c].any() for s in dec.states)  # a new stream starts from zero state
+    dec.clear()
+    assert not dec._flat.any() and dec._slots_for(["d", "e"])
