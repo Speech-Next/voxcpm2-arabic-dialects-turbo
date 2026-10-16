@@ -31,6 +31,12 @@ An alias follows the tagged model's dialects.json (qatari, emirati and khaliji a
 levantine palestinian), so "qatari" is Gulf Arabic on teacher-v3, and the qatari adapter speaks "bahraini" (the #2
 Bahraini group was measured with it). A route keyed by a name wins over one keyed by its dialect:
 ``routes={**DEFAULT_ROUTES, "qatari": "qatari"}`` sends "qatari" alone to the qatari adapter.
+
+MEMORY. Two engines hold two copies of everything (weights, CUDA graphs, caches). Alone, at DialectTTS's settings
+(int8, 256 requests, 300 KV blocks), the adapters model takes 19.7 GB (5.3 GB of it its 11 adapters merged into int8
+q/k/v/o weights) and teacher-v3 14.1 GB. On one 24 GB GPU (A10) they fit together only with bf16 layers and fewer
+requests per engine (the defaults, A10_FIT); int8 does not fit even at 64 requests per engine. With two GPUs
+(device=(0, 1)) or one of 40 GB or more, pass w8a8=True, max_concurrency=256, kv_blocks=(300, 300).
 """
 
 from __future__ import annotations
@@ -51,6 +57,10 @@ DEFAULT_TAGGED_DIT = DEFAULT_DIT
 # dialect (or name) -> adapter: where the adapters model beats teacher-v3 on #2
 DEFAULT_ROUTES = {"bahraini": "qatari", "egyptian": "egyptian", "saudi": "saudi"}
 ADAPTERS, TAGGED = "adapters", "tagged"
+# the largest per-engine configuration that fits both engines on one A10 (22.5 GB), bf16; measured peaks 22.4 and
+# 22.3 GB under mixed bursts of 256 and 128 requests (int8 does not fit: see MEMORY)
+A10_FIT = {"fast": {"max_concurrency": 128, "kv_blocks": (192, 192)},
+           "quality": {"max_concurrency": 64, "kv_blocks": (128, 128)}}
 AUTO = "auto"
 # read by an engine's process when it starts (DialectTTS.load sets them): restored after each start, so that the
 # next engine does not inherit the previous one's (a model's SmoothQuant statistics, its KV blocks)
@@ -122,19 +132,26 @@ class RoutedDialectTTS:
     @classmethod
     async def load(cls, model: str = DEFAULT_MODEL, tagged_model: str = DEFAULT_TAGGED_MODEL,
                    dit: str | None = DEFAULT_DIT, tagged_dit: str | None = AUTO, *,
-                   routes: dict[str, str] | None = None, max_concurrency: int = 256, head_tokens: int = 8,
-                   dit_cache: str | dict | None = None, gpu_memory_utilization: float = 0.85,
-                   kv_blocks: int | tuple[int, int] = 600, device: int = 0, w8a8: bool = True) -> "RoutedDialectTTS":
-        """Start both engines, one after the other, on ``device``.
+                   routes: dict[str, str] | None = None, max_concurrency: int | None = None,
+                   head_tokens: int = 8, dit_cache: str | dict | None = None, gpu_memory_utilization: float = 0.85,
+                   kv_blocks: int | tuple[int, int] | None = None, device: int | tuple[int, int] = 0,
+                   w8a8: bool = False) -> "RoutedDialectTTS":
+        """Start both engines, one after the other.
 
         dit: the adapters model's distilled LocDiT (None = its own, 10 steps: quality mode).
         tagged_dit: the tagged model's; "auto": None with dit=None, else DEFAULT_TAGGED_DIT.
-        kv_blocks: the KV cache, a total split evenly or (adapters, tagged); a block is 256 tokens (~9 MB).
-        max_concurrency: per engine (a burst may go to one). Other arguments as DialectTTS.load, for both.
+        max_concurrency: requests per engine at once (more wait; a burst may go to one engine).
+        kv_blocks: the KV cache, a total split evenly or (adapters, tagged); a block is 256 tokens (9 MiB).
+        device: one GPU for both, or (adapters, tagged).
+        The defaults fit both engines on one 24 GB GPU (A10, see MEMORY): bf16 layers (w8a8=False), 128 requests
+        and 192 blocks per engine in fast mode, 64 and 128 in quality mode. Other arguments as DialectTTS.load.
         """
         if tagged_dit == AUTO:
             tagged_dit = None if dit is None else DEFAULT_TAGGED_DIT
-        kv_a, kv_t = split_kv_blocks(kv_blocks)
+        fit = A10_FIT["fast" if dit and tagged_dit else "quality"]  # the original LocDiT's CUDA graphs are larger
+        max_concurrency = fit["max_concurrency"] if max_concurrency is None else max_concurrency
+        kv_a, kv_t = split_kv_blocks(fit["kv_blocks"] if kv_blocks is None else kv_blocks)
+        dev_a, dev_t = (device, device) if isinstance(device, int) else device
         path_a, path_t = resolve(model), resolve(tagged_model)
         tags = DialectTags.of_model(path_t)
         if tags is None or DialectTags.of_model(path_a) is not None:
@@ -143,13 +160,13 @@ class RoutedDialectTTS:
                                  else None)
         route_table(sorted(adapters), tags, DEFAULT_ROUTES if routes is None else routes)  # fails before starting
         common = dict(max_concurrency=max_concurrency, head_tokens=head_tokens,
-                      gpu_memory_utilization=gpu_memory_utilization, device=device, w8a8=w8a8)
+                      gpu_memory_utilization=gpu_memory_utilization, w8a8=w8a8)
         started = []
         try:
-            for path, d, kv in ((path_a, dit, kv_a), (path_t, tagged_dit, kv_t)):
+            for path, d, kv, dev in ((path_a, dit, kv_a, dev_a), (path_t, tagged_dit, kv_t, dev_t)):
                 with _engine_env():
                     started.append(await DialectTTS.load(path, d, dit_cache=None if d else dit_cache, kv_blocks=kv,
-                                                         **common))
+                                                         device=dev, **common))
             return cls(*started, routes=routes)
         except BaseException:
             await asyncio.gather(*(t.close() for t in started), return_exceptions=True)

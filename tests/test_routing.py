@@ -202,8 +202,10 @@ def models(tmp_path, monkeypatch):
 
 def test_load_starts_each_engine_with_its_own_configuration(models):
     tts = run(RoutedDialectTTS.load(str(models / "adapters-model"), str(models / "tagged-model"),
-                                    str(models / "adapters-dit.pt"), kv_blocks=(250, 350), max_concurrency=64))
+                                    str(models / "adapters-dit.pt"), kv_blocks=(250, 350), max_concurrency=64,
+                                    device=(0, 1), w8a8=True))
     a, t = FakeEngine.started
+    assert (a.kw["devices"], t.kw["devices"]) == ([0], [1])
     assert tts.engines[ADAPTERS].server is a and tts.engines[TAGGED].server is t
     turbo_a, turbo_t = json.loads(a.env["NANOVLLM_VOXCPM2_TURBO"]), json.loads(t.env["NANOVLLM_VOXCPM2_TURBO"])
     assert turbo_a["dit_checkpoint"].endswith("adapters-dit.pt")
@@ -224,8 +226,17 @@ def test_load_quality_mode_and_failures(models):
                                     dit_cache="light"))
     for engine in FakeEngine.started:  # "auto" with dit=None: both on their own LocDiT
         turbo = json.loads(engine.env["NANOVLLM_VOXCPM2_TURBO"])
-        assert "dit_checkpoint" not in turbo and turbo["dit_cache"]
-        assert engine.env["NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"] == "300"
+        assert "dit_checkpoint" not in turbo and turbo["dit_cache"] and "w8a8" not in turbo  # bf16 by default
+        # quality mode's A10 fit by default
+        assert engine.env["NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"] == "128" and engine.kw["max_num_seqs"] == 64
+        assert engine.kw["devices"] == [0]
+    run(tts.close())
+    FakeEngine.started = []
+    tts = run(RoutedDialectTTS.load(str(models / "adapters-model"), str(models / "tagged-model"),
+                                    str(models / "adapters-dit.pt"), w8a8=True))
+    for engine in FakeEngine.started:  # fast mode's A10 fit; int8 when asked
+        assert engine.env["NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"] == "192" and engine.kw["max_num_seqs"] == 128
+        assert json.loads(engine.env["NANOVLLM_VOXCPM2_TURBO"])["w8a8"]
     run(tts.close())
     with pytest.raises(ValueError, match="dialects.json"):  # the models swapped
         run(RoutedDialectTTS.load(str(models / "tagged-model"), str(models / "adapters-model"), None))
