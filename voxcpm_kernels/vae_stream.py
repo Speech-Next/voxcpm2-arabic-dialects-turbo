@@ -215,7 +215,7 @@ def _state_tensors(ops) -> list[torch.Tensor]:
 
 def flatten_states(holders: list) -> torch.Tensor | None:
     """Moves every holder's ``.state`` [slots, ...] into one buffer [slots, total]: each state becomes a view of its
-    columns, with the buffer's row stride as its slot stride (the kernels read ``state.stride(0)``). A fresh slot is
+    columns, with the buffer's row stride as its slot stride (the kernels read ``state.stride(0)``). A released slot is
     then zeroed, and a cached context copied, by one kernel instead of one per layer. Values and shapes are unchanged.
     None (states left as they are) when they differ in device, dtype or slot count."""
     states = [h.state for h in holders]
@@ -373,7 +373,8 @@ class SlotStreamingVAEDecoder:
 
     # -- slot management ------------------------------------------------------
     def _slots_for(self, stream_ids: Sequence[Hashable]) -> list[int]:
-        slots, fresh = [], []
+        """Each stream's slot; a new stream takes a free one, whose state is already zero (see release)."""
+        slots = []
         for sid in stream_ids:
             slot = self._slot_of.get(sid)
             if slot is None:
@@ -381,12 +382,7 @@ class SlotStreamingVAEDecoder:
                     raise RuntimeError(f"more than {self.max_streams} concurrent VAE streams")
                 slot = self._free.pop()
                 self._slot_of[sid] = slot
-                fresh.append(slot)
             slots.append(slot)
-        if fresh:
-            new = self._index(fresh)  # pinned + non_blocking: a pageable copy would wait for the queued GPU work
-            for s in self._state_bufs:
-                s.index_fill_(0, new, 0)
         return slots
 
     def has_stream(self, stream_id: Hashable) -> bool:
@@ -394,13 +390,22 @@ class SlotStreamingVAEDecoder:
         return stream_id in self._slot_of
 
     def release(self, stream_id: Hashable) -> None:
+        """Frees the stream's slot and zeroes its state now, queued after the stream's last decode: a free slot is
+        always zero, so a new stream's first decode (the first audio of a burst) need not clear 324 KB per stream."""
         slot = self._slot_of.pop(stream_id, None)
         if slot is not None:
+            if self._flat is not None:
+                self._flat[slot].zero_()
+            else:
+                for s in self.states:
+                    s[slot].zero_()
             self._free.append(slot)
 
     def clear(self) -> None:
         self._slot_of.clear()
         self._free = list(range(self.max_streams - 1, -1, -1))
+        for s in self._state_bufs:  # every slot is free again: zero, as release leaves them
+            s.zero_()
 
     def _prime(self, slots, initial_contexts, new_streams, context_keys=None) -> None:
         """Run new streams' context latents [1, D, T] through the decoder to set their causal state.
