@@ -1,5 +1,5 @@
-"""DialectTTS and VoxCPM load on first use (PEP 562): ``import nanovllm_voxcpm.arabic_text`` needs no torch or
-flash-attn (the training repo and the tests import the text normalizer alone)."""
+"""DialectTTS, RoutedDialectTTS and VoxCPM load on first use (PEP 562): ``import nanovllm_voxcpm.arabic_text`` needs
+no torch or flash-attn (the training repo and the tests import the text normalizer alone)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import importlib
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from nanovllm_voxcpm.dialect_routing import RoutedDialectTTS
     from nanovllm_voxcpm.dialect_tts import DialectTTS
     from nanovllm_voxcpm.llm import VoxCPM
 
@@ -20,10 +21,12 @@ except Exception:
     except Exception:
         __version__ = "0.0.0"
 
-_LAZY = {"DialectTTS": "nanovllm_voxcpm.dialect_tts", "VoxCPM": "nanovllm_voxcpm.llm"}
+_LAZY = {"DialectTTS": "nanovllm_voxcpm.dialect_tts", "RoutedDialectTTS": "nanovllm_voxcpm.dialect_routing",
+         "VoxCPM": "nanovllm_voxcpm.llm"}
 
 __all__ = [
     "DialectTTS",
+    "RoutedDialectTTS",
     "VoxCPM",
     "__version__",
 ]
