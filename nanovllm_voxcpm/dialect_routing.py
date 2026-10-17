@@ -1,5 +1,5 @@
-"""Per-dialect routing (opt-in): one engine serves the adapters model's adapters and a tagged model, each request
-spoken by the one that serves its dialect better.
+"""Per-dialect routing (the default engine; DialectTTS is the unrouted one): one engine serves the adapters model's
+adapters and a tagged model, each request spoken by the one that serves its dialect better.
 
 The tagged model (VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3) is base VoxCPM2 plus a LoRA (base_lm attention and
 MLP) and trained embeddings for its dialect tag tokens; its unmerged training state (``lora/``) is served as one more
@@ -14,16 +14,18 @@ tagged adapter with its tag, a name only the adapters model knows (hindi_english
     await tts.close()
 
 Default routes, from #2 (the held-out set, 17 groups): teacher-v3 is better pooled but worse than the adapters on
-Bahraini, Egyptian and Saudi. Names resolve as below; ``tts.table`` holds the result.
+Bahraini, Egyptian and Saudi, and less natural on Hejazi (UTMOS) in int8. Names resolve as below; ``tts.table`` holds
+the result.
 
 | name | served by | adapter / tag |
 |---|---|---|
 | bahraini | adapter | qatari |
 | egyptian | adapter | egyptian |
 | saudi | adapter | saudi |
+| hejazi | adapter | hejazi |
 | hindi_english | adapter | hindi_english |
 | None (no dialect) | base model | none, as DialectTTS |
-| msa, lebanese, syrian, iraqi, najdi, hejazi | teacher-v3 | its own tag |
+| msa, lebanese, syrian, iraqi, najdi | teacher-v3 | its own tag |
 | yemeni, sudanese, libyan, tunisian, algerian, moroccan | teacher-v3 | its own tag |
 | gulf, emirati, qatari, khaliji | teacher-v3 | gulf |
 | palestinian, jordanian, ab, levantine | teacher-v3 | palestinian |
@@ -34,11 +36,11 @@ Bahraini group was measured with it). A route keyed by a name wins over one keye
 ``routes={**DEFAULT_ROUTES, "qatari": "qatari"}`` sends "qatari" alone to the qatari adapter. Only the adapters the
 table uses are loaded.
 
-Cost (one A10, int8, 600 KV blocks, the 2-step LocDiT): the speed of the default engine (first audio p95 at 200
-requests 94-95 vs 93-96 ms) and less memory than it (20.6 vs 21.9 GiB peak: 4 adapters instead of 11, plus
-teacher-v3's merged MLP weights, 1 GB). In int8 the tagged requests run the merged int8 weights at every batch size,
-as the adapters do; SmoothQuant statistics are the base model's (teacher-v3's own, max-combined with them, changed
-nothing on #2). A 2:4 sparse FFN (sparse24) cannot take the tagged adapter's MLP LoRA: the engine refuses to start.
+Cost (one A10, int8, 600 KV blocks): the speed of the unrouted engine and less memory than it (5 adapters instead
+of 11, plus teacher-v3's merged MLP weights, 1 GB; README). In int8 the tagged requests run the merged int8 weights
+at every batch size, as the adapters do; SmoothQuant statistics are the base model's (teacher-v3's own, max-combined
+with them, changed nothing on #2). A 2:4 sparse FFN (sparse24) cannot take the tagged adapter's MLP LoRA: the engine
+refuses to start.
 """
 
 from __future__ import annotations
@@ -54,7 +56,8 @@ from nanovllm_voxcpm.dialect_tts import (DEFAULT_DIT, DEFAULT_MODEL, DialectTags
                                          start_engine)
 
 DEFAULT_TAGGED_MODEL = "VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3"
-DEFAULT_ROUTES = {"bahraini": "qatari", "egyptian": "egyptian", "saudi": "saudi"}  # dialect (or name) -> adapter
+# dialect (or name) -> adapter
+DEFAULT_ROUTES = {"bahraini": "qatari", "egyptian": "egyptian", "saudi": "saudi", "hejazi": "hejazi"}
 ADAPTERS, TAGGED = "adapters", "tagged"
 TAGGED_ADAPTER = "@tagged"  # the tagged model's name in the engine (no adapter directory is named so)
 # the files of a tagged model a routed engine reads (not its merged weights)

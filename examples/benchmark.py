@@ -12,9 +12,9 @@ warm-up pairs each request with another voice: the engine caches a voice's first
 repeating it would measure the cache. Prints, per level, TTFB average / p50 / p95 and the average time until the last
 audio chunk.
 
---route: per-dialect routing (RoutedDialectTTS: the adapters the routes use and --tagged-model's LoRA in one engine);
-the voices' dialects then follow its routing table (e.g. Saudi and Hindi voices on the adapters, Jordanian,
-Palestinian and Qatari ones on teacher-v3).
+The engine is the default, routed one (RoutedDialectTTS: the adapters the routes use and --tagged-model's LoRA in one
+engine; the voices' dialects follow its routing table, e.g. Saudi and Hindi voices on the adapters, Jordanian,
+Palestinian and Qatari ones on teacher-v3); --no-route: the unrouted engine (DialectTTS, every adapter).
 """
 
 import argparse
@@ -74,7 +74,7 @@ async def main(args):
     levels = [int(x) for x in args.levels.split(",")]
     kw = dict(max_concurrency=args.max_concurrency or max(levels), kv_blocks=args.kv_blocks,
               w8a8=args.precision == "int8")
-    if args.route:
+    if not args.no_route:
         tts = await RoutedDialectTTS.load(args.model, args.tagged_model, args.dit, **kw)
     else:
         tts = await DialectTTS.load(args.model, args.dit, **kw)
@@ -83,7 +83,7 @@ async def main(args):
         voices = sorted(f[:-4] for f in os.listdir(folder) if f.endswith(".wav"))
         for v in voices:
             await tts.add_voice(v, os.path.join(folder, f"{v}.wav"))
-        if args.route:
+        if not args.no_route:
             routes = [tts.route(d) for _, d, _ in requests(len(voices), voices, tts.dialects)]
             n_adapters = sum(r.model == "adapters" for r in routes)
             print(f"routing: {n_adapters} of {len(voices)} voices on the adapters model, the others on the tagged one")
@@ -114,7 +114,8 @@ if __name__ == "__main__":
                                                                "200 requests (its CUDA graphs are larger)")
     ap.add_argument("--max-concurrency", type=int, help="requests the engine runs at once (default: the largest level)")
     ap.add_argument("--precision", choices=["int8", "bf16"], default="int8", help="the layers")
-    ap.add_argument("--route", action="store_true", help="per-dialect routing: the adapters and --tagged-model's LoRA")
+    ap.add_argument("--no-route", action="store_true", help="the unrouted engine (DialectTTS: every adapter, no "
+                                                             "teacher-v3)")
     ap.add_argument("--tagged-model", default=DEFAULT_TAGGED_MODEL)
     args = ap.parse_args()
     args.dit = None if args.dit == "none" else args.dit
