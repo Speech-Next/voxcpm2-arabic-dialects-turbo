@@ -259,3 +259,42 @@ def test_extra_embedding_rows():
     assert torch.equal(out[0], torch.arange(8.0, 12.0)) and out[1:3].eq(1).all() and not out[3].any()
     with pytest.raises(ValueError, match="extra embedding rows"):
         emb.set_rows(9, torch.ones(1, 4))  # the vocabulary's own rows stay the checkpoint's
+
+
+def test_engine_maps_a_tagged_adapters_tags_to_its_rows(tmp_path, monkeypatch):
+    """VoxCPM2Engine._tagged_adapter / add_request on a fake tokenizer: the tags become the extra rows (after the
+    vocabulary) in the tagged adapter's requests only; the engine reads tags with the adapter's tokenizer."""
+    pytest.importorskip("torch")
+    from types import SimpleNamespace
+
+    from nanovllm_voxcpm.models.voxcpm2 import engine as E
+
+    vocab = {"<reserved_100>": 189, "<reserved_101>": 190, "a": 5, "b": 6}
+
+    class Tok:
+        def __init__(self, special):
+            self.special = special
+            self.tokenizer = SimpleNamespace(get_vocab=lambda: dict(vocab))
+
+        def __call__(self, text):
+            out = []
+            for tag, i in (("<reserved_100>", 189), ("<reserved_101>", 190)):
+                if self.special and text.startswith(tag):
+                    out.append(i)
+                    text = text[len(tag):]
+            return out + [vocab.get(c, 1) for c in text]
+
+    (tmp_path / "lora").mkdir()
+    (tmp_path / "lora" / "train_state.json").write_text(json.dumps({"lora": {}, "dialects": ["msa", "egyptian"]}))
+    (tmp_path / "dialects.json").write_text(json.dumps({"tags": {"msa": "<reserved_100>",
+                                                                 "egyptian": "<reserved_101>"}}))
+    monkeypatch.setattr(E.LlamaTokenizerFast, "from_pretrained", staticmethod(lambda p: "tagged"))
+    monkeypatch.setattr(E, "mask_multichar_chinese_tokens", lambda t: Tok(special=True))
+    eng = E.VoxCPM2Engine.__new__(E.VoxCPM2Engine)
+    eng.tokenizer, eng.vocab_size, eng.tag_rows = Tok(special=False), 100, 17
+    payload = SimpleNamespace(tag_embed=np.zeros((2, 4)), tag_row_start=-1)
+    remap, tok = eng._tagged_adapter(str(tmp_path), payload)
+    assert remap == {189: 100, 190: 101} and payload.tag_row_start == 100 and tok.special  # the engine's misread tags
+    eng._tag_rows_used = 16
+    with pytest.raises(ValueError, match="tag_rows=17"):
+        eng._tagged_adapter(str(tmp_path), payload)

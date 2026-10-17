@@ -157,7 +157,8 @@ class VoxCPM2Engine(LLMEngineBase):
                              f"{self._tag_rows_used} in use")
         dialects = tagged_adapter_state(path)["dialects"]  # the order of tag_embed's rows
         with open(os.path.join(path, "dialects.json"), encoding="utf-8") as f:
-            tags = [json.load(f)["tags"][d] for d in dialects]
+            spec = json.load(f)["tags"]
+        tags = [spec[d] for d in dialects]
         if len(tags) != n:
             raise ValueError(f"{n} tag embeddings for {len(tags)} dialects")
         tok = mask_multichar_chinese_tokens(LlamaTokenizerFast.from_pretrained(path))

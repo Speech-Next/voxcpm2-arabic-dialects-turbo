@@ -74,4 +74,27 @@ python -m nanovllm_voxcpm.entrypoints.openai_server --model VoxCPM-Kernel/VoxCPM
     --dit VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k3.pt                          # HTTP server, :8092
 ```
 
+## Dialect routing (opt-in)
+
+[teacher-v3](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3) (one model, a tag per dialect) is better
+than the adapters on 14 of the 17 dialects of the held-out set and worse on Bahraini, Egyptian and Saudi.
+`RoutedDialectTTS` serves its LoRA as one more adapter of the same engine and sends each dialect to the better one:
+bahraini (the qatari adapter), egyptian, saudi and hindi_english to the adapters, the other dialects to teacher-v3.
+
+```python
+from nanovllm_voxcpm import RoutedDialectTTS
+
+tts = await RoutedDialectTTS.load()   # same arguments and methods as DialectTTS; dialects: tts.dialects
+```
+
+| mode | engine | CER | WER | UTMOS | dialect ID | first audio p95, 200 requests | GPU memory |
+|---|---|---:|---:|---:|---:|---:|---:|
+| fast | default | 5.4 % | 16.0 % | 2.14 | 67 % | 93-96 ms | 21.9 GiB |
+| fast | routed | 4.9 % | 14.7 % | 2.10 | 64 % | 94-95 ms | 20.6 GiB |
+| quality | default | 5.3 % | 15.5 % | 2.40 | 67 % | 271 ms | 20.8 GiB |
+| quality | routed | 4.6 % | 14.1 % | 2.37 | 63 % | 271 ms | 19.5 GiB |
+
+Same held-out set and settings as above (int8), the default re-measured next to the routed engine. Routing lowers CER
+and WER (WER significantly in both modes, CER in quality mode) and costs 0.03-0.04 UTMOS and 3-4 points of dialect ID.
+
 License: MIT. VoxCPM2 weights: Apache-2.0.
