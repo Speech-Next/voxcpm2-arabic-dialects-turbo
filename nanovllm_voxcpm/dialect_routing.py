@@ -33,10 +33,11 @@ Bahraini group was measured with it). A route keyed by a name wins over one keye
 ``routes={**DEFAULT_ROUTES, "qatari": "qatari"}`` sends "qatari" alone to the qatari adapter.
 
 MEMORY. Two engines hold two copies of everything (weights, CUDA graphs, caches). Alone, at DialectTTS's settings
-(int8, 256 requests, 300 KV blocks), the adapters model takes 19.7 GB (5.3 GB of it its 11 adapters merged into int8
-q/k/v/o weights) and teacher-v3 14.1 GB. On one 24 GB GPU (A10) they fit together only with bf16 layers and fewer
-requests per engine (the defaults, A10_FIT); int8 does not fit even at 64 requests per engine. With two GPUs
-(device=(0, 1)) or one of 40 GB or more, pass w8a8=True, max_concurrency=256, kv_blocks=(300, 300).
+(int8, 256 requests, 300 KV blocks), the adapters model takes 19.2 GiB (5.2 GiB of it its 11 adapters merged into int8
+q/k/v/o weights) and teacher-v3 13.8 GiB. On one A10 (22.5 GiB) they fit together only with bf16 layers and fewer
+requests per engine (the defaults, A10_FIT), at about 2.5x the first-audio latency of the single int8 engine; int8
+does not fit even at 64 requests per engine. With two GPUs (device=(0, 1)) or one of 40 GB or more, pass w8a8=True,
+max_concurrency=256, kv_blocks=(300, 300).
 """
 
 from __future__ import annotations
@@ -52,13 +53,15 @@ import numpy as np
 from nanovllm_voxcpm.dialect_tts import DEFAULT_DIT, DEFAULT_MODEL, DialectTags, DialectTTS, find_adapters, resolve
 
 DEFAULT_TAGGED_MODEL = "VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3"
-# fast mode on the tagged model until it has a distilled LocDiT of its own (#7), chosen on #2
+# fast mode on the tagged model until it has a distilled LocDiT of its own (#7): the adapters' Arabic student. On #2's
+# 14 groups routed to teacher-v3 the English student (VoxCPM-Kernel/VoxCPM2-Turbo-distilled-DiT) has WER +0.70
+# [+0.07, +1.37] and CER +0.29 [-0.03, +0.63] against it, Khaliji CER +3.0, for UTMOS +0.04 and DNSMOS +0.07
 DEFAULT_TAGGED_DIT = DEFAULT_DIT
 # dialect (or name) -> adapter: where the adapters model beats teacher-v3 on #2
 DEFAULT_ROUTES = {"bahraini": "qatari", "egyptian": "egyptian", "saudi": "saudi"}
 ADAPTERS, TAGGED = "adapters", "tagged"
-# the largest per-engine configuration that fits both engines on one A10 (22.5 GB), bf16; measured peaks 22.4 and
-# 22.3 GB under mixed bursts of 256 and 128 requests (int8 does not fit: see MEMORY)
+# the largest per-engine configuration that fits both engines on one A10 (22.5 GiB), bf16: whole-GPU peaks of 22.1
+# GiB (fast) and 21.8 GiB (quality) in the speed benchmark, mixed bursts up to 256 requests (int8 does not fit: MEMORY)
 A10_FIT = {"fast": {"max_concurrency": 128, "kv_blocks": (192, 192)},
            "quality": {"max_concurrency": 64, "kv_blocks": (128, 128)}}
 AUTO = "auto"
@@ -143,7 +146,7 @@ class RoutedDialectTTS:
         max_concurrency: requests per engine at once (more wait; a burst may go to one engine).
         kv_blocks: the KV cache, a total split evenly or (adapters, tagged); a block is 256 tokens (9 MiB).
         device: one GPU for both, or (adapters, tagged).
-        The defaults fit both engines on one 24 GB GPU (A10, see MEMORY): bf16 layers (w8a8=False), 128 requests
+        The defaults fit both engines on one A10 (22.5 GiB, see MEMORY): bf16 layers (w8a8=False), 128 requests
         and 192 blocks per engine in fast mode, 64 and 128 in quality mode. Other arguments as DialectTTS.load.
         """
         if tagged_dit == AUTO:
