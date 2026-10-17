@@ -1,4 +1,5 @@
-"""Voice cloning with a model's dialect adapters, in the low-latency configuration.
+"""Voice cloning with a model's dialect adapters, in the low-latency configuration: the unrouted engine (the default
+one is RoutedDialectTTS, dialect_routing.py: these adapters and teacher-v3, each dialect on the better one).
 
 One engine holds every adapter of the model's ``adapters/`` directory; a voice is registered once from a reference
 clip and then cloned by name, mixed with any dialect in the same batch. A model with a ``dialects.json`` instead

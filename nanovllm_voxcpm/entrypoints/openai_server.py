@@ -36,6 +36,11 @@ its own request's adapter. The voices' reference-prefix KV cache is kept per ada
 A model with a ``dialects.json`` (one model for all dialects, see DialectTags) has no adapters: ``"dialect"`` names a
 dialect (``/v1/models`` lists them), whose tag token is put in front of the text.
 
+Dialect routing (the default for a model with ``adapters/``, ``--no-route`` turns it off; see dialect_routing): the
+engine serves the adapters the routes use and ``--tagged-model``'s LoRA (teacher-v3) as one more adapter; a request's
+``"dialect"`` (or ``"lora"``, or a dialect named as ``"model"``) picks its adapter, or teacher-v3 with the dialect's
+tag. ``/v1/models`` lists the dialects.
+
 Arabic input and ref_text are read as the model was trained on them (dialect_tts.read_as: digits, dates, times, amounts
 as words; formal when the request's dialect or adapter, aliases resolved, is msa); hindi_english and text without
 Arabic script stay as they are. ``"normalize": false`` sends the text as written.
@@ -56,6 +61,8 @@ import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, ValidationError
 
+from nanovllm_voxcpm.dialect_routing import (DEFAULT_ROUTES, DEFAULT_TAGGED_MODEL, TAGGED, TAGGED_ADAPTER,
+                                             resolve_tagged, route_table, routed_lora_config, used_adapters)
 from nanovllm_voxcpm.dialect_tts import (DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters, read_as,
                                          resolve, turbo_config, use_model_calibration)
 
@@ -164,7 +171,7 @@ def wav_bytes(pcm: bytes, sample_rate: int) -> bytes:
 
 
 def build_app(args: argparse.Namespace):
-    state: dict = {"voices": {}, "tags": None}
+    state: dict = {"voices": {}, "tags": None, "route": None}
 
     async def warm_up(names: list[str]) -> None:
         """One short generation per voice and clone mode: fills the voice's caches (prefix KV, LocEnc embeddings,
@@ -219,8 +226,22 @@ def build_app(args: argparse.Namespace):
         if lora_dir is None and state["tags"] is None and os.path.isdir(os.path.join(model_path, "adapters")):
             lora_dir = os.path.join(model_path, "adapters")
         adapters = find_adapters(lora_dir, args.lora)
-        if args.default_lora and args.default_lora not in adapters:
+        lora_config = None
+        if not args.no_route and state["tags"] is None and args.lora_dir is None and not args.lora and adapters:
+            # dialect routing: the adapters the routes use and the tagged model's LoRA in this one engine
+            tagged_path = resolve_tagged(args.tagged_model)
+            with open(os.path.join(tagged_path, "dialects.json"), encoding="utf-8") as f:
+                state["tags"] = DialectTags(json.load(f))
+            state["route"] = route_table(sorted(adapters), state["tags"], DEFAULT_ROUTES)
+            adapters = {a: adapters[a] for a in used_adapters(state["route"])}
+            lora_config = routed_lora_config(adapters, tagged_path, args.max_lora_rank)
+            adapters[TAGGED_ADAPTER] = tagged_path
+            if args.default_lora and args.default_lora not in state["route"]:
+                raise SystemExit(f"--default-lora {args.default_lora!r} is not a dialect: {sorted(state['route'])}")
+        elif args.default_lora and args.default_lora not in adapters:
             raise SystemExit(f"--default-lora {args.default_lora!r} is not among the adapters {sorted(adapters)}")
+        if lora_config is None:
+            lora_config = adapters_lora_config(adapters, args.max_lora_rank)
         pool = VoxCPM.from_pretrained(
             model=model_path,
             devices=[0],
@@ -229,7 +250,7 @@ def build_app(args: argparse.Namespace):
             max_model_len=args.max_model_len,
             max_num_batched_tokens=args.max_num_batched_tokens,
             gpu_memory_utilization=args.gpu_memory_utilization,
-            lora_config=adapters_lora_config(adapters, args.max_lora_rank),
+            lora_config=lora_config,
         )
         await pool.wait_for_ready()
         for name, path in adapters.items():
@@ -249,7 +270,8 @@ def build_app(args: argparse.Namespace):
                     with open(v["wav"], "rb") as f:
                         await register(v["id"], f.read(), os.path.splitext(v["wav"])[1].lstrip(".") or "wav",
                                        v.get("text"))
-        dialects = f"{len(state['tags'].names)} dialects (tagged model), " if state["tags"] else ""
+        dialects = (f"{len(state['route'])} dialects (routed), " if state["route"] is not None else
+                    f"{len(state['tags'].names)} dialects (tagged model), " if state["tags"] else "")
         print(f"[server] ready: {len(state['voices'])} voices, {dialects}{len(state['adapters'])} LoRA adapters, "
               f"sample rate {state['sample_rate']}", flush=True)
         import gc
@@ -279,10 +301,13 @@ def build_app(args: argparse.Namespace):
     @app.get("/v1/models")
     async def models():
         base = [{"id": args.served_model_name, "object": "model", "owned_by": "local"}]
-        if state["tags"] is not None:
+        if state["route"] is not None:
+            base[0]["dialects"] = sorted(state["route"])
+        elif state["tags"] is not None:
             base[0]["dialects"] = state["tags"].names
+        names = sorted(state["route"]) if state["route"] is not None else state.get("adapters", [])
         loras = [{"id": name, "object": "model", "owned_by": "local", "parent": args.served_model_name}
-                 for name in state.get("adapters", [])]
+                 for name in names]
         return {"object": "list", "data": base + loras}
 
     @app.post("/v1/audio/voices")
@@ -329,6 +354,21 @@ def build_app(args: argparse.Namespace):
         if mode != "ref" and not v["text"]:
             raise HTTPException(400, f"clone_mode '{mode}' needs a voice registered with ref_text")
         return {"voice": req.voice, "clone_mode": mode}
+
+    def routed_kwargs(req: SpeechRequest) -> tuple[dict, str | None, str | None]:
+        """Dialect routing: (LoRA kwargs, the tag token in front of the text or None, the dialect the text is read
+        in) of the request's dialect (``dialect``, ``lora``, a dialect named as ``model``, or --default-lora)."""
+        if req.lora and req.dialect and req.lora != req.dialect:
+            raise HTTPException(400, "lora and dialect name different dialects")
+        name = req.dialect or req.lora or (req.model if req.model in state["route"] else None) or args.default_lora
+        if name is None:
+            return {}, None, None  # the base model
+        r = state["route"].get(name)
+        if r is None:
+            raise HTTPException(404, f"unknown dialect {name!r}; dialects: {', '.join(sorted(state['route']))}")
+        if r.model == TAGGED:
+            return {"lora_name": TAGGED_ADAPTER}, state["tags"].tags[r.dialect], r.dialect
+        return {"lora_name": r.dialect}, None, r.dialect
 
     def dialect_tag(req: SpeechRequest) -> str | None:
         """A tagged model: the token of the request's dialect (None: no dialect)."""
@@ -411,8 +451,12 @@ def build_app(args: argparse.Namespace):
             req = SpeechRequest.model_validate_json(body)
             if req.response_format not in ("pcm", "wav"):
                 raise HTTPException(400, "response_format must be 'pcm' or 'wav'")
-            vk, lk, tag = voice_kwargs(req), lora_kwargs(req), dialect_tag(req)
-            dialect = request_dialect(req, lk)
+            vk = voice_kwargs(req)
+            if state["route"] is not None:
+                lk, tag, dialect = routed_kwargs(req)
+            else:
+                lk, tag = lora_kwargs(req), dialect_tag(req)
+                dialect = request_dialect(req, lk)
             text = read_as(req.input, dialect) if req.normalize else req.input
             if not text.strip():  # after normalization: tatweel or marks alone read as nothing
                 raise HTTPException(400, "input is empty")
@@ -486,7 +530,12 @@ def main():
     ap.add_argument("--lora-dir", help="register every subdirectory with a lora_weights.safetensors as an adapter "
                                        "(default: the model's adapters/)")
     ap.add_argument("--lora", action="append", default=[], metavar="NAME=PATH", help="register one more adapter")
-    ap.add_argument("--default-lora", help="adapter for requests that name none (default: the base model)")
+    ap.add_argument("--default-lora", help="adapter for requests that name none (default: the base model); with "
+                                           "routing, a dialect")
+    ap.add_argument("--no-route", action="store_true", help="no dialect routing: every adapter of the model, no "
+                                                             "tagged model (the engine before routing)")
+    ap.add_argument("--tagged-model", default=DEFAULT_TAGGED_MODEL, help="routing: the tagged model whose LoRA "
+                                                                          "serves the routed-away dialects")
     ap.add_argument("--max-lora-rank", type=int, help="LoRA slot rank (default: the largest adapter rank)")
     args = ap.parse_args()
     os.environ.setdefault("NANOVLLM_SUBMIT_FLUSH_EVERY", "4")  # requests reach the engine as a steady stream

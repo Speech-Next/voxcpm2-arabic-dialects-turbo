@@ -1,34 +1,37 @@
 # VoxCPM2 Arabic Dialects (Turbo)
 
-Fast Arabic dialect text-to-speech with voice cloning, on [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) with one
-LoRA per dialect.
+Fast Arabic dialect text-to-speech with voice cloning, on [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2): one LoRA
+per dialect, and [teacher-v3](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3) (one model, a tag per
+dialect) served as one more adapter of the same engine. Each dialect is spoken by the one that is better at it.
 
 ## Results
 
 One NVIDIA A10, installed with `./setup.sh`. The test clones the 32 voices of
 [`VoxCPM-Kernel/Arabic-Hindi-Reference-Voices`](https://huggingface.co/datasets/VoxCPM-Kernel/Arabic-Hindi-Reference-Voices),
-each in its own dialect's LoRA.
+each in its own dialect.
 
-| requests at once | first audio, avg | first audio, p95 | whole sentence, avg |
-|---:|---:|---:|---:|
-| 1 | 25 ms | 25 ms | 0.41 s |
-| 16 | 28 ms | 29 ms | 0.55 s |
-| 64 | 40 ms | 40 ms | 0.95 s |
-| 128 | 67 ms | 68 ms | 1.56 s |
-| 200 | 103 ms | 103 ms | 2.17 s |
-| 256 | 131 ms | 133 ms | 2.67 s |
+| engine | CER | WER | UTMOS | dialect ID | first audio p95, 200 requests | GPU memory |
+|---|---:|---:|---:|---:|---:|---:|
+| routed (the default, `RoutedDialectTTS`) | 4.6 % | 13.9 % | 2.22 | 64 % | 107 ms | 21.2 GiB |
+| adapters only (`DialectTTS`) | 5.3 % | 16.0 % | 2.23 | 67 % | 105 ms | 22.0 GiB |
 
-| mode | LocDiT steps | first audio p95, 200 requests | CER | WER | UTMOS |
-|---|---|---:|---:|---:|---:|
-| fast (default) | 3, distilled for these adapters | 103 ms | 5.3 % | 15.9 % | 2.23 |
-| faster (`dit=...:student_k2_dmd.pt`) | 2, distilled for these adapters | 92 ms | 5.4 % | 15.9 % | 2.14 |
-| quality (`dit=None`) | 10, with CFG | 270 ms | 5.3 % | 15.5 % | 2.40 |
+| requests at once | first audio p95, routed | adapters only | whole sentence, routed | adapters only |
+|---:|---:|---:|---:|---:|
+| 1 | 25 ms | 27 ms | 0.42 s | 0.41 s |
+| 64 | 43 ms | 42 ms | 0.96 s | 0.96 s |
+| 128 | 71 ms | 68 ms | 1.50 s | 1.56 s |
+| 200 | 107 ms | 105 ms | 2.14 s | 2.17 s |
+| 256 | 135 ms | 132 ms | 2.65 s | 2.67 s |
 
 - Quality: the held-out evaluation set, 17 dialects × 40 sentences × 2 seeds (1,320 clips), each voice cloned from
-  another clip of its speaker, default settings (int8). Per dialect: the
-  [distilled LocDiT's card](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT).
+  another clip of its speaker, default settings (int8, the 3-step distilled LocDiT). Routed vs adapters only, paired:
+  CER −0.7 and WER −2.0 points (significant), UTMOS and DNSMOS unchanged, dialect ID −3.6 points.
 - CER / WER: the better of Whisper large-v3 and Cohere Transcribe Arabic; lower is better. UTMOS: predicted
-  naturalness, 1-5.
+  naturalness, 1-5. Speed: two alternated runs of each engine, averaged.
+- Routing: bahraini (the qatari adapter), egyptian, saudi, hejazi and hindi_english on their adapters, the other 13
+  dialects of teacher-v3 (and their aliases, e.g. gulf / qatari / emirati, palestinian / jordanian) on teacher-v3.
+- Other LocDiTs: `dit="VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k2_dmd.pt"` (2 steps, ~10 ms faster
+  at 200 requests, less natural), `dit=None` (10 steps with CFG, quality mode, ~270 ms).
 
 ## Install
 
@@ -48,14 +51,10 @@ and capture CUDA graphs.
 
 ```python
 import asyncio
-from nanovllm_voxcpm import DialectTTS
+from nanovllm_voxcpm import RoutedDialectTTS
 
 async def main():
-    tts = await DialectTTS.load(
-        "VoxCPM-Kernel/VoxCPM2-Arabic-Dialects",                       # VoxCPM2 + dialect LoRAs
-        dit="VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k3.pt",  # 3 steps (the default)
-        # dit="VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k2_dmd.pt": 2 steps, faster; None: 10 (quality)
-    )
+    tts = await RoutedDialectTTS.load()   # VoxCPM2-Arabic-Dialects + teacher-v3, the 3-step LocDiT (dit=None: quality)
     await tts.add_voice("ahmed", "ahmed.wav")
     audio = await tts.synthesize("هلا والله، كيف حالك اليوم؟", dialect="najdi", voice="ahmed")  # 48 kHz
     await tts.close()
@@ -64,7 +63,9 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-Dialects: ab, egyptian, emirati, hejazi, hindi_english, iraqi, jordanian, najdi, palestinian, qatari, saudi.
+Dialects (`tts.dialects`): msa, egyptian, palestinian, lebanese, syrian, iraqi, saudi, najdi, hejazi, gulf, bahraini,
+yemeni, sudanese, libyan, tunisian, algerian, moroccan, hindi_english, and the aliases ab, emirati, jordanian,
+khaliji, levantine, qatari. `DialectTTS.load()` (same methods) is the engine with the adapters only.
 
 ```bash
 python examples/voice_clone.py --voice ahmed.wav --dialect najdi --text "هلا والله" --out out.wav   # one file
@@ -74,32 +75,6 @@ python -m nanovllm_voxcpm.entrypoints.openai_server --model VoxCPM-Kernel/VoxCPM
     --dit VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k3.pt                          # HTTP server, :8092
 ```
 
-## Dialect routing (opt-in)
-
-[teacher-v3](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3) (one model, a tag per dialect) is better
-than the adapters on 14 of the 17 dialects of the held-out set and worse on Bahraini, Egyptian and Saudi.
-`RoutedDialectTTS` serves its LoRA as one more adapter of the same engine and sends each dialect to the better one:
-bahraini (the qatari adapter), egyptian, saudi and hindi_english to the adapters, the other dialects to teacher-v3.
-
-```python
-from nanovllm_voxcpm import RoutedDialectTTS
-
-tts = await RoutedDialectTTS.load()   # same arguments and methods as DialectTTS; dialects: tts.dialects
-```
-
-| mode | engine | CER | WER | UTMOS | dialect ID |
-|---|---|---:|---:|---:|---:|
-| fast, 3 steps (default) | default | 5.3 % | 16.0 % | 2.23 | 67 % |
-| fast, 3 steps (default) | routed | 4.7 % | 14.1 % | 2.20 | 64 % |
-| fast, 2 steps | default | 5.4 % | 16.0 % | 2.14 | 67 % |
-| fast, 2 steps | routed | 4.9 % | 14.7 % | 2.10 | 64 % |
-| quality | default | 5.3 % | 15.5 % | 2.40 | 67 % |
-| quality | routed | 4.6 % | 14.1 % | 2.37 | 63 % |
-
-Same held-out set and settings as above (int8), the default re-measured next to the routed engine. Routing lowers CER
-and WER (significantly, except CER with 2 steps) and costs 0.03-0.04 UTMOS and 3-4 points of dialect ID against the
-default with the same LocDiT. Speed and memory, measured with 2 steps and in quality mode (int8, 600 KV blocks): first
-audio p95 at 200 requests 94-95 ms routed vs 93-96 ms default (quality mode 270 vs 271 ms), peak GPU memory 20.6 vs
-21.9 GiB (19.5 vs 20.8 GiB).
+Every command routes by default; `--no-route` runs the adapters only.
 
 License: MIT. VoxCPM2 weights: Apache-2.0.

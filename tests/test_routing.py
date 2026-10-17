@@ -88,16 +88,17 @@ def test_default_route_table():
     assert table["bahraini"] == Route(ADAPTERS, "qatari")
     assert table["egyptian"] == Route(ADAPTERS, "egyptian")
     assert table["saudi"] == Route(ADAPTERS, "saudi")
+    assert table["hejazi"] == Route(ADAPTERS, "hejazi")  # a name of both models: the route wins over the tag
     assert table["hindi_english"] == Route(ADAPTERS, "hindi_english")  # only the adapters model has it
     for name in ("gulf", "emirati", "qatari", "khaliji"):  # aliases follow the tagged model's dialects.json
         assert table[name] == Route(TAGGED, "gulf"), name
     for name in ("palestinian", "jordanian", "ab", "levantine"):
         assert table[name] == Route(TAGGED, "palestinian"), name
-    for name in ("msa", "lebanese", "syrian", "iraqi", "najdi", "hejazi", "yemeni", "sudanese", "libyan", "tunisian",
-                 "algerian", "moroccan"):
+    for name in ("msa", "lebanese", "syrian", "iraqi", "najdi", "yemeni", "sudanese", "libyan", "tunisian", "algerian",
+                 "moroccan"):
         assert table[name] == Route(TAGGED, name), name
     assert sorted(table) == sorted(set(ADAPTER_NAMES) | set(V3["tags"]) | set(V3["aliases"]))
-    assert used_adapters(table) == ["egyptian", "hindi_english", "qatari", "saudi"]  # the engine loads only these
+    assert used_adapters(table) == ["egyptian", "hejazi", "hindi_english", "qatari", "saudi"]  # the engine loads these
 
 
 def test_route_overrides_and_errors():
@@ -193,10 +194,10 @@ def test_load_one_engine_with_the_used_adapters(models):
                                     smooth_stats=str(models / "stats.pt")))
     (e,) = FakeEngine.started
     assert tts.server is e
-    assert sorted(e.loras) == ["@tagged", "egyptian", "hindi_english", "qatari", "saudi"]
+    assert sorted(e.loras) == ["@tagged", "egyptian", "hejazi", "hindi_english", "qatari", "saudi"]
     assert e.loras["@tagged"] == str(models / "tagged-model")
     cfg = e.kw["lora_config"]
-    assert cfg.max_loras == 5 and cfg.max_mlp_loras == 1 and cfg.tag_rows == 17
+    assert cfg.max_loras == 6 and cfg.max_mlp_loras == 1 and cfg.tag_rows == 17
     turbo = json.loads(e.env["NANOVLLM_VOXCPM2_TURBO"])
     assert e.kw["max_num_seqs"] == 64 and turbo["dit_checkpoint"].endswith("dit.pt") and turbo["w8a8"]
     assert e.env["VOXCPM_KERNELS_SMOOTH"].endswith("stats.pt")
@@ -206,7 +207,8 @@ def test_load_one_engine_with_the_used_adapters(models):
     FakeEngine.started = []
     run(RoutedDialectTTS.load(str(models / "adapters-model"), str(models / "tagged-model"), None,
                               routes={**DEFAULT_ROUTES, "najdi": "najdi"}))
-    assert sorted(FakeEngine.started[0].loras) == ["@tagged", "egyptian", "hindi_english", "najdi", "qatari", "saudi"]
+    assert sorted(FakeEngine.started[0].loras) == ["@tagged", "egyptian", "hejazi", "hindi_english", "najdi", "qatari",
+                                                   "saudi"]
     with pytest.raises(ValueError, match="not a tagged model"):
         run(RoutedDialectTTS.load(str(models / "adapters-model"), str(models / "adapters-model"), None))
     with pytest.raises(ValueError, match="lacks"):
@@ -298,3 +300,40 @@ def test_engine_maps_a_tagged_adapters_tags_to_its_rows(tmp_path, monkeypatch):
     eng._tag_rows_used = 16
     with pytest.raises(ValueError, match="tag_rows=17"):
         eng._tagged_adapter(str(tmp_path), payload)
+
+
+def test_server_routes_by_default(models, monkeypatch):
+    """openai_server: a model with adapters/ is served routed unless --no-route; a request's dialect picks its adapter,
+    or teacher-v3 with its tag (a voice copy for prompt_ref); /v1/models lists the dialects."""
+    pytest.importorskip("fastapi")
+    pytest.importorskip("uvicorn")
+    from test_wiring import serve, server_args
+
+    from nanovllm_voxcpm.entrypoints import openai_server
+
+    voices = models / "voices.json"
+    (models / "v.wav").write_bytes(b"wav")
+    voices.write_text(json.dumps([{"id": "v", "wav": str(models / "v.wav"), "text": "عمري 25 سنة"}]))
+    asgi = openai_server.build_app(server_args(models / "adapters-model", no_route=False,
+                                               tagged_model=str(models / "tagged-model"), voices=str(voices)))
+    out = run(serve(asgi, [
+        {"input": "هلا", "dialect": "najdi"},                      # teacher-v3, its tag
+        {"input": "هلا", "dialect": "bahraini"},                   # the qatari adapter
+        {"input": "هلا", "model": "hejazi"},                       # a dialect named as the model: its adapter
+        {"input": "الساعة 9:05", "dialect": "msa", "voice": "v"},  # prompt_ref on teacher-v3: the voice's msa copy
+        {"input": "هلا", "dialect": "kuwaiti"},
+    ]))
+    assert [status for status, _ in out] == [200, 200, 200, 200, 404]
+    (e,) = FakeEngine.started
+    assert sorted(e.loras) == ["@tagged", "egyptian", "hejazi", "hindi_english", "qatari", "saudi"]
+    assert e.kw["lora_config"].max_mlp_loras == 1 and e.kw["lora_config"].tag_rows == 17
+    reqs = [r for r in e.requests if r["text"] != "Warm up."]
+    assert reqs[0]["text"] == V3["tags"]["najdi"] + "هلا" and reqs[0]["lora_name"] == TAGGED_ADAPTER
+    assert reqs[1]["text"] == "هلا" and reqs[1]["lora_name"] == "qatari"
+    assert reqs[2]["lora_name"] == "hejazi"
+    tag = V3["tags"]["msa"]
+    assert reqs[3]["voice"] == "v@" + tag and reqs[3]["text"] == "الساعة تسعة وخمس دقائق"
+    assert e.voices["v@" + tag] == tag + "عمري خمسة وعشرين سنة"
+    FakeEngine.started = []
+    run(serve(openai_server.build_app(server_args(models / "adapters-model", no_route=True)), []))
+    assert sorted(FakeEngine.started[0].loras) == sorted(ADAPTER_NAMES)  # --no-route: every adapter, no teacher-v3
