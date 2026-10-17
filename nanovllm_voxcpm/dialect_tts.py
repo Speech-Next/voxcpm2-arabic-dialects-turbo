@@ -127,6 +127,40 @@ def adapters_lora_config(adapters: dict[str, str], max_rank: int | None = None):
     return LoRAConfig(max_loras=len(adapters), max_lora_rank=max_rank or max(ranks) or 32, **fields)
 
 
+async def start_engine(path: str, dit: str | None, adapters: dict[str, str], lora_config, *, max_concurrency: int,
+                       head_tokens: int, dit_cache, gpu_memory_utilization: float, kv_blocks: int, device: int,
+                       w8a8: bool, smooth_stats: str | None = None):
+    """(server, sample rate): the engine on the model directory ``path`` in the low-latency configuration
+    (turbo_config), with ``adapters`` (name -> directory) registered. smooth_stats: SmoothQuant statistics for its
+    int8 layers (default: the model's own, use_model_calibration)."""
+    # the engine process reads its configuration from the environment when it starts
+    os.environ["NANOVLLM_VOXCPM2_TURBO"] = json.dumps(turbo_config(dit, head_tokens, dit_cache, w8a8))
+    if kv_blocks:
+        os.environ["NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"] = str(kv_blocks)
+    from nanovllm_voxcpm import VoxCPM
+
+    if w8a8:
+        if smooth_stats:
+            os.environ["VOXCPM_KERNELS_SMOOTH"] = smooth_stats
+        else:
+            use_model_calibration(path)
+    server = VoxCPM.from_pretrained(
+        model=path, devices=[device], max_num_seqs=max_concurrency, max_model_len=1024, max_num_batched_tokens=4096,
+        gpu_memory_utilization=gpu_memory_utilization, lora_config=lora_config,
+    )
+    await server.wait_for_ready()
+    for name, adapter_path in adapters.items():
+        await server.register_lora(name, adapter_path)
+    sample_rate = int((await server.get_model_info())["sample_rate"])
+    # this process's startup objects (torch, transformers, ...) out of the garbage collector's reach: a full
+    # collection over them paused a burst's submission for ~165 ms (200 requests: half sent, the rest late)
+    import gc
+
+    gc.collect()
+    gc.freeze()
+    return server, sample_rate
+
+
 class DialectTags:
     """A tagged model's dialects (its ``dialects.json``: {"tags": {dialect: token}, "aliases": {name: dialect}}).
 
@@ -202,33 +236,15 @@ class DialectTTS:
         head_tokens: the first audio comes from the text's first <= head_tokens tokens (0 = from the whole text).
         dit_cache: with dit=None, "light" or "medium": reuse the LocDiT's middle layers on 2 or 4 of its 9 steps.
         """
-        # the engine process reads its configuration from the environment when it starts
-        os.environ["NANOVLLM_VOXCPM2_TURBO"] = json.dumps(turbo_config(dit, head_tokens, dit_cache, w8a8))
-        if kv_blocks:
-            os.environ["NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"] = str(kv_blocks)
-        from nanovllm_voxcpm import VoxCPM
-
         path = resolve(model)
-        if w8a8:
-            use_model_calibration(path)
         tags_path = os.path.join(path, "dialects.json")
         tags = json.load(open(tags_path, encoding="utf-8")) if os.path.exists(tags_path) else None
         adapters = {} if tags else find_adapters(
             os.path.join(path, "adapters") if os.path.isdir(os.path.join(path, "adapters")) else None)
-        server = VoxCPM.from_pretrained(
-            model=path, devices=[device], max_num_seqs=max_concurrency, max_model_len=1024, max_num_batched_tokens=4096,
-            gpu_memory_utilization=gpu_memory_utilization, lora_config=adapters_lora_config(adapters),
-        )
-        await server.wait_for_ready()
-        for name, adapter_path in adapters.items():
-            await server.register_lora(name, adapter_path)
-        sample_rate = int((await server.get_model_info())["sample_rate"])
-        # this process's startup objects (torch, transformers, ...) out of the garbage collector's reach: a full
-        # collection over them paused a burst's submission for ~165 ms (200 requests: half sent, the rest late)
-        import gc
-
-        gc.collect()
-        gc.freeze()
+        server, sample_rate = await start_engine(
+            path, dit, adapters, adapters_lora_config(adapters), max_concurrency=max_concurrency,
+            head_tokens=head_tokens, dit_cache=dit_cache, gpu_memory_utilization=gpu_memory_utilization,
+            kv_blocks=kv_blocks, device=device, w8a8=w8a8)
         return cls(server, sorted(adapters), sample_rate, tags)
 
     async def add_voice(self, name: str, audio: str | bytes, text: str | None = None, audio_format: str = "wav",

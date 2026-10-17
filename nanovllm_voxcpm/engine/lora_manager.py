@@ -36,6 +36,12 @@ class LoRAModelPayload:
     modules: dict[str, LoRAModulePayload]
     rank: int
     alpha: float
+    # a tagged model served as an adapter (models/voxcpm2/lora_loader.py): its dialect tags' embedding rows [n, dim],
+    # written at ids tag_row_start.. (extra rows after the vocabulary), and exact_merge: the fused int8 layers merge it
+    # as the merged model was exported (fp32 W + B A, rounded to the weight dtype) from these fp32 tensors
+    tag_embed: torch.Tensor | None = None
+    tag_row_start: int = -1
+    exact_merge: bool = False
 
 
 @dataclass

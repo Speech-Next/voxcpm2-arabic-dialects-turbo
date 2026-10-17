@@ -434,8 +434,8 @@ class FusedCpm4Layer:
             assert torch.equal(cos[:, :half], cos[:, half:]) and torch.equal(sin[:, :half], sin[:, half:])
             self.cos, self.sin = cos.contiguous(), sin.contiguous()
         mlp = layer.mlp
-        if any(getattr(m, "supports_lora", False) for m in (mlp.gate_up_proj, mlp.down_proj)):
-            raise NotImplementedError("LoRA on the MLP projections is not supported by the fused layers")
+        self.mlp = mlp
+        mlp_lora = any(getattr(m, "supports_lora", False) for m in (mlp.gate_up_proj, mlp.down_proj))
         self.name = name
         self.calib = None
         if _CALIBRATE:
@@ -449,6 +449,7 @@ class FusedCpm4Layer:
         self.q8 = None
         self.ln_in_q = layer.input_layernorm.weight
         self.ln_post_q = layer.post_attention_layernorm.weight
+        self._smooth = {}
         if quantize:
             smooth = {}
             global _SMOOTH_STATS
@@ -459,6 +460,7 @@ class FusedCpm4Layer:
                            "gate_up": mlp.gate_up_proj.weight, "down": mlp.down_proj.weight}
                 smooth = {k: _smooth_factor(_SMOOTH_STATS[f"{name}.{k}"], w) for k, w in weights.items()
                           if f"{name}.{k}" in _SMOOTH_STATS}
+            self._smooth = smooth
             self.q8 = {
                 "qkv": W8A8Linear(attn.qkv_proj.weight, attn.qkv_proj.bias, smooth.get("qkv")),
                 "o": W8A8Linear(attn.o_proj.weight, attn.o_proj.bias, smooth.get("o")),
@@ -497,7 +499,6 @@ class FusedCpm4Layer:
         if self.q8 is not None and _LORA_MERGE and getattr(attn.qkv_proj, "supports_lora", False) \
                 and getattr(attn.o_proj, "supports_lora", False):
             n = attn.qkv_proj.max_loras + 1
-            self._smooth = smooth
             self.stacks = {}
             for key in ("qkv", "o"):
                 lin = self.q8[key]
@@ -506,35 +507,134 @@ class FusedCpm4Layer:
                 w[:] = lin.w_q
                 sc[:] = lin.w_scale
                 self.stacks[key] = (w, sc)
-            for slot in range(n - 1):  # adapters loaded before fusing
-                if attn.qkv_proj._effective_lora_rank_values[slot] or attn.o_proj._effective_lora_rank_values[slot]:
+        # LoRA on the MLP (e.g. a tagged model served as an adapter): merged int8 gate_up / down weights for at most
+        # max_mlp_loras adapters, entry 0 = the base (q8's own weights become views of it: no second copy). The
+        # segmented GEMMs take the attention's tile table; mlp_index maps its weight index (slot + 1) to an entry,
+        # 0 for the base and for adapters without MLP LoRA.
+        self.mlp_stacks = None
+        self._mlp_entry: dict[int, int] = {}
+        if self.q8 is not None and mlp_lora:
+            if self.sp24 is not None:  # merging an adapter into a 2:4-pruned weight would make it dense
+                raise NotImplementedError(
+                    f"{name}: LoRA on the MLP projections (a tagged model served as an adapter, e.g. dialect routing) "
+                    "is not supported on a 2:4 sparse FFN; use the dense model, or VOXCPM_KERNELS_SPARSE24=0")
+            if self.stacks is None:
+                raise NotImplementedError("LoRA on the MLP projections in int8 layers needs the merged q/k/v/o "
+                                          "weights too (attention LoRA, VOXCPM_KERNELS_LORA_MERGE=1)")
+            n_mlp = 1 + max(0, int(getattr(mlp, "max_mlp_loras", attn.qkv_proj.max_loras)))
+            self.mlp_stacks = {}
+            for key in ("gate_up", "down"):
+                lin = self.q8[key]
+                w = torch.empty((n_mlp,) + tuple(lin.w_q.shape), dtype=torch.int8, device=lin.w_q.device)
+                sc = torch.empty(n_mlp, lin.out_features, dtype=torch.float32, device=lin.w_q.device)
+                w[0] = lin.w_q
+                sc[0] = lin.w_scale
+                lin.w_q, lin.w_scale = w[0], sc[0]
+                self.mlp_stacks[key] = (w, sc)
+            self.mlp_index = torch.zeros(attn.qkv_proj.max_loras + 1, dtype=torch.int32, device=w.device)
+        if self.stacks is not None:
+            for slot in range(attn.qkv_proj.max_loras):  # adapters loaded before fusing
+                if attn.qkv_proj._effective_lora_rank_values[slot] or attn.o_proj._effective_lora_rank_values[slot] \
+                        or self._mlp_rank(slot):
                     self.refresh_lora(slot)
 
+    def _mlp_rank(self, slot: int) -> int:
+        """The LoRA rank of slot ``slot`` on this layer's MLP (0: none)."""
+        return max((m._effective_lora_rank_values[slot] for m in (self.mlp.gate_up_proj, self.mlp.down_proj)
+                    if getattr(m, "supports_lora", False)), default=0)
+
+    def _exact_delta(self, payload, module: str, targets=None):
+        """The merged model's weight delta of ``module`` (``{name}.self_attn.qkv_proj``, ...) from an exact_merge
+        payload's fp32 tensors: s * (B @ A), per target stacked along the output rows; None = not in the payload."""
+        mp = payload.modules.get(f"{self.name}.{module}")
+        if mp is None:
+            return None
+        dev = self.attn.qkv_proj.weight.device
+        if isinstance(mp.lora_b, list):
+            return torch.cat([mp.scaling * (b.to(dev, torch.float32) @ mp.lora_a[i].to(dev, torch.float32))
+                              for i, b in enumerate(mp.lora_b)])
+        return mp.scaling * (mp.lora_b.to(dev, torch.float32) @ mp.lora_a.to(dev, torch.float32))
+
+    @staticmethod
+    def _merged(weight: torch.Tensor, delta, exact: bool) -> torch.Tensor:
+        """W + delta in fp32; ``exact``: rounded to the weight's dtype, as the merged model was exported."""
+        if delta is not None and delta.shape != weight.shape:
+            raise ValueError(f"LoRA delta {tuple(delta.shape)} does not match the weight {tuple(weight.shape)} "
+                             "(an exact_merge adapter needs every packed target: q, k, v / gate, up)")
+        w = weight.float() if delta is None else weight.float() + delta
+        return w.to(weight.dtype).float() if exact else w
+
     @torch.no_grad()
-    def refresh_lora(self, slot: int) -> None:
-        """Rebuild slot ``slot``'s merged weights from the LoRA modules' current A / B (B holds the scaling)."""
+    def refresh_lora(self, slot: int, payload=None) -> None:
+        """Rebuild slot ``slot``'s merged weights from the LoRA modules' current A / B (B holds the scaling); with an
+        exact_merge payload (a tagged model's LoRA) from its fp32 tensors, rounded like the merged model."""
         if self.stacks is None:
             return
         attn = self.attn
         qkv, o = attn.qkv_proj, attn.o_proj
-        rows = []
-        for t, size in (("q", qkv.q_size), ("k", qkv.kv_size), ("v", qkv.kv_size)):
-            if t in qkv.target_to_index:
-                a = qkv.lora_A[qkv.target_to_index[t], slot].float()
-                rows.append(getattr(qkv, f"lora_B_{t}")[slot].float() @ a)
-            else:
-                rows.append(torch.zeros(size, qkv.weight.shape[1], device=qkv.weight.device))
-        lin = W8A8Linear(qkv.weight.float() + torch.cat(rows), qkv.bias, self._smooth.get("qkv"))
+        exact = bool(getattr(payload, "exact_merge", False))
+        if exact:
+            w_qkv = self._merged(qkv.weight, self._exact_delta(payload, "self_attn.qkv_proj"), True)
+            w_o = self._merged(o.weight, self._exact_delta(payload, "self_attn.o_proj"), True)
+        else:
+            rows = []
+            for t, size in (("q", qkv.q_size), ("k", qkv.kv_size), ("v", qkv.kv_size)):
+                if t in qkv.target_to_index:
+                    a = qkv.lora_A[qkv.target_to_index[t], slot].float()
+                    rows.append(getattr(qkv, f"lora_B_{t}")[slot].float() @ a)
+                else:
+                    rows.append(torch.zeros(size, qkv.weight.shape[1], device=qkv.weight.device))
+            w_qkv = qkv.weight.float() + torch.cat(rows)
+            w_o = o.weight.float() + o.lora_B[slot].float() @ o.lora_A[slot].float()
+        lin = W8A8Linear(w_qkv, qkv.bias, self._smooth.get("qkv"))
         if self.qkv_rope:
             lin = rope_weights(lin, attn.head_dim)
         w, sc = self.stacks["qkv"]
         w[slot + 1].copy_(lin.w_q)
         sc[slot + 1].copy_(lin.w_scale)
-        lin = W8A8Linear(o.weight.float() + o.lora_B[slot].float() @ o.lora_A[slot].float(), o.bias,
-                         self._smooth.get("o"))
+        lin = W8A8Linear(w_o, o.bias, self._smooth.get("o"))
         w, sc = self.stacks["o"]
         w[slot + 1].copy_(lin.w_q)
         sc[slot + 1].copy_(lin.w_scale)
+        if self.mlp_stacks is not None:
+            self._refresh_mlp(slot, payload if exact else None)
+
+    def _refresh_mlp(self, slot: int, payload=None) -> None:
+        """Slot ``slot``'s merged MLP weights into an entry of mlp_stacks (none: the slot's rows use the base)."""
+        if not self._mlp_rank(slot):
+            self._mlp_entry.pop(slot, None)
+            self.mlp_index[slot + 1] = 0
+            return
+        entry = self._mlp_entry.get(slot)
+        if entry is None:
+            free = sorted(set(range(1, self.mlp_stacks["down"][0].shape[0])) - set(self._mlp_entry.values()))
+            if not free:
+                raise RuntimeError(f"more adapters with MLP LoRA than max_mlp_loras "
+                                   f"({self.mlp_stacks['down'][0].shape[0] - 1}) at once")
+            entry = self._mlp_entry[slot] = free[0]
+        gu, dn = self.mlp.gate_up_proj, self.mlp.down_proj
+        if payload is not None:
+            w_gu = self._merged(gu.weight, self._exact_delta(payload, "mlp.gate_up_proj"), True)
+            w_dn = self._merged(dn.weight, self._exact_delta(payload, "mlp.down_proj"), True)
+        else:
+            w_gu = gu.weight.float()
+            if getattr(gu, "supports_lora", False):
+                half = gu.weight.shape[0] // 2
+                for t in gu.lora_targets:  # 0: gate rows, 1: up rows
+                    w_gu[t * half:(t + 1) * half] += getattr(gu, f"lora_B_{t}")[slot].float() \
+                        @ gu.lora_A[gu.target_to_index[t], slot].float()
+            w_dn = dn.weight.float()
+            if getattr(dn, "supports_lora", False):
+                w_dn = w_dn + dn.lora_B[slot].float() @ dn.lora_A[slot].float()
+        lin_gu = W8A8Linear(w_gu, None, self._smooth.get("gate_up"))
+        lin_dn = W8A8Linear(w_dn, None, self._smooth.get("down"))
+        if self.swiglu:
+            lin_gu = swiglu_weights(lin_gu, lin_dn)
+        for key, lin in (("gate_up", lin_gu), ("down", lin_dn)):
+            w, sc = self.mlp_stacks[key]
+            w[entry].copy_(lin.w_q)
+            sc[entry].copy_(lin.w_scale)
+        self.mlp_index[slot + 1] = entry
 
     def _seg(self, rows: int):
         """Segmented-GEMM tiles for this call when the batch has LoRA slots and merged weights exist, else None."""
@@ -671,9 +771,20 @@ class FusedCpm4Layer:
                                       ctx.max_seqlen_q, inner.scale, quant=quant,
                                       inv_smooth=self.q8["o"].inv_smooth if quant else None)
 
-    def _mlp_q(self, x2: torch.Tensor, dtype) -> torch.Tensor:
-        """x2 + down(silu(gate) * up), gate|up = gate_up(rmsnorm(x2)), all int8 GEMMs."""
+    def _mlp_q(self, x2: torch.Tensor, dtype, seg=None) -> torch.Tensor:
+        """x2 + down(silu(gate) * up), gate|up = gate_up(rmsnorm(x2)), all int8 GEMMs. seg: the attention's
+        segmented-GEMM tiles; with MLP LoRA, each row segment takes its adapter's merged MLP weights."""
         xq = rmsnorm_quant(x2, self.ln_post_q, self.eps_post)
+        if seg is not None and self.mlp_stacks is not None:
+            from .seg_gemm import seg_gemm, seg_swiglu_gemm_quant
+
+            (w_gu, sc_gu), (w_dn, sc_dn) = self.mlp_stacks["gate_up"], self.mlp_stacks["down"]
+            if self.swiglu:
+                hq = seg_swiglu_gemm_quant(*xq, w_gu, sc_gu, dtype, *seg, remap=self.mlp_index)
+            else:
+                hq = silu_mul_quant(seg_gemm(*xq, w_gu, sc_gu, None, dtype, *seg, remap=self.mlp_index),
+                                    self.q8["down"].inv_smooth)
+            return seg_gemm(*hq, w_dn, sc_dn, None, dtype, *seg, residual=x2, remap=self.mlp_index)
         if self.sp24 is not None:
             from . import sparse24
 
@@ -736,7 +847,7 @@ class FusedCpm4Layer:
                 x2 = _gemm(*oq, self.q8["o"], dtype, residual=x)
             if lora_o:
                 attn.o_proj.lora_delta_(o, x2)
-            out = self._mlp_q(x2, dtype)
+            out = self._mlp_q(x2, dtype, seg)
         elif calib is not None:
             torch.maximum(calib["o"], o.abs().amax(0).float(), out=calib["o"])
             x2 = x + attn.o_proj(o)
@@ -763,7 +874,7 @@ class FusedCpm4Layer:
         n = rows.numel()
         # n >= rows: e.g. a small prefill graph bucket, padded to more sequences than it has tokens; LoRA slots in
         # the batch cover every row, so o_proj runs on every row too
-        if n >= x.shape[0] or self._lora_context_on(attn.o_proj):
+        if n >= x.shape[0] or self._lora_context_on(attn.o_proj) or self._lora_context_on(self.mlp.down_proj):
             return self(positions, hidden)[0].reshape(x.shape)[rows]
         dtype = hidden.dtype
         qkv = self._qkv(x, positions if self.rope is not None else None,

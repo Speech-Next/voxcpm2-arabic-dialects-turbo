@@ -12,8 +12,9 @@ warm-up pairs each request with another voice: the engine caches a voice's first
 repeating it would measure the cache. Prints, per level, TTFB average / p50 / p95 and the average time until the last
 audio chunk.
 
---route: per-dialect routing (RoutedDialectTTS), the same requests on the adapters model and --tagged-model in one
-process; the voices' dialects then follow its routing table (e.g. Saudi and Hindi voices on the adapters model).
+--route: per-dialect routing (RoutedDialectTTS: the adapters the routes use and --tagged-model's LoRA in one engine);
+the voices' dialects then follow its routing table (e.g. Saudi and Hindi voices on the adapters, Jordanian,
+Palestinian and Qatari ones on teacher-v3).
 """
 
 import argparse
@@ -24,7 +25,7 @@ import time
 import numpy as np
 
 from nanovllm_voxcpm import DialectTTS, RoutedDialectTTS
-from nanovllm_voxcpm.dialect_routing import AUTO, DEFAULT_TAGGED_MODEL
+from nanovllm_voxcpm.dialect_routing import DEFAULT_TAGGED_MODEL
 from nanovllm_voxcpm.dialect_tts import DEFAULT_DIT, DEFAULT_MODEL
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -71,15 +72,12 @@ async def burst(tts, reqs):
 
 async def main(args):
     levels = [int(x) for x in args.levels.split(",")]
-    kv = tuple(int(x) for x in args.kv_blocks.split(",")) if args.kv_blocks else None
-    kw = {} if args.precision is None else {"w8a8": args.precision == "int8"}
-    if args.route:  # unset: the configuration that fits both engines on one A10 (dialect_routing.A10_FIT)
-        tts = await RoutedDialectTTS.load(args.model, args.tagged_model, args.dit, args.tagged_dit,
-                                          max_concurrency=args.max_concurrency,
-                                          kv_blocks=kv if kv is None or len(kv) == 2 else kv[0], **kw)
+    kw = dict(max_concurrency=args.max_concurrency or max(levels), kv_blocks=args.kv_blocks,
+              w8a8=args.precision == "int8")
+    if args.route:
+        tts = await RoutedDialectTTS.load(args.model, args.tagged_model, args.dit, **kw)
     else:
-        tts = await DialectTTS.load(args.model, args.dit, max_concurrency=args.max_concurrency or max(levels),
-                                    kv_blocks=kv[0] if kv else 600, **kw)
+        tts = await DialectTTS.load(args.model, args.dit, **kw)
     async with tts:
         folder = voice_folder(args.voices)
         voices = sorted(f[:-4] for f in os.listdir(folder) if f.endswith(".wav"))
@@ -112,17 +110,12 @@ if __name__ == "__main__":
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--dit", default=DEFAULT_DIT, help="'none' for the model's own LocDiT")
-    ap.add_argument("--kv-blocks", help="KV cache blocks of 256 tokens (default 600); 400 for --dit none at 200 "
-                                         "requests (its CUDA graphs are larger). --route: the total, split evenly, or "
-                                         "ADAPTERS,TAGGED")
-    ap.add_argument("--max-concurrency", type=int, help="requests an engine runs at once (default: the largest "
-                                                         "level); more wait")
-    ap.add_argument("--precision", choices=["int8", "bf16"], help="the layers (default: int8; --route: bf16)")
-    ap.add_argument("--route", action="store_true", help="per-dialect routing: the adapters model and --tagged-model")
+    ap.add_argument("--kv-blocks", type=int, default=600, help="KV cache blocks of 256 tokens; 400 for --dit none at "
+                                                               "200 requests (its CUDA graphs are larger)")
+    ap.add_argument("--max-concurrency", type=int, help="requests the engine runs at once (default: the largest level)")
+    ap.add_argument("--precision", choices=["int8", "bf16"], default="int8", help="the layers")
+    ap.add_argument("--route", action="store_true", help="per-dialect routing: the adapters and --tagged-model's LoRA")
     ap.add_argument("--tagged-model", default=DEFAULT_TAGGED_MODEL)
-    ap.add_argument("--tagged-dit", default=AUTO, help="the tagged model's LocDiT: 'auto' (none with --dit none, else "
-                                                       "the interim default), 'none' or a checkpoint")
     args = ap.parse_args()
     args.dit = None if args.dit == "none" else args.dit
-    args.tagged_dit = None if args.tagged_dit == "none" else args.tagged_dit
     asyncio.run(main(args))

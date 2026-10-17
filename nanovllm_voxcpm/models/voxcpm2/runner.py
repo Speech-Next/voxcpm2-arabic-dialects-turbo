@@ -141,6 +141,11 @@ class VoxCPM2Runner(BaseModelRunner):
                 "its token slots are laid out for one DiT batch size"
             )
 
+    def register_lora(self, adapter_id: int, name: str, payload) -> None:
+        super().register_lora(adapter_id, name, payload)
+        if getattr(payload, "tag_embed", None) is not None:  # a tagged adapter: its tags' rows after the vocabulary
+            self.model.base_lm.embed_tokens.set_rows(payload.tag_row_start, payload.tag_embed.to("cuda"))
+
     def init_model(self, model_config: VoxCPM2Config, model_path: str):
         self.model = VoxCPM2Model(model_config, self.inference_timesteps, lora_config=self.lora_config)
         load_model(self.model, model_path)

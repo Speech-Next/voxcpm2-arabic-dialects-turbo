@@ -1,5 +1,5 @@
-"""Per-dialect routing on fake engines (no GPU): the name -> (model, adapter or tag) table of the two default models,
-dispatch of requests and voices to the right engine, and the loader's per-engine configuration."""
+"""Per-dialect routing on a fake engine (no GPU): the name -> (adapter or tag) table of the two default models,
+dispatch of requests and voices, the one engine's LoRA configuration and adapters, the tagged-adapter loader."""
 
 import asyncio
 import json
@@ -8,10 +8,9 @@ import os
 import numpy as np
 import pytest
 
-from nanovllm_voxcpm import dialect_routing, dialect_tts
-from nanovllm_voxcpm.dialect_routing import (ADAPTERS, DEFAULT_ROUTES, TAGGED, Route, RoutedDialectTTS, route_table,
-                                             split_kv_blocks)
-from nanovllm_voxcpm.dialect_tts import DialectTags, DialectTTS
+from nanovllm_voxcpm.dialect_routing import (ADAPTERS, DEFAULT_ROUTES, TAGGED, TAGGED_ADAPTER, Route,
+                                             RoutedDialectTTS, route_table, routed_lora_config, used_adapters)
+from nanovllm_voxcpm.dialect_tts import DialectTags
 
 # the default models' names: adapters.json of VoxCPM-Kernel/VoxCPM2-Arabic-Dialects, dialects.json of
 # VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3
@@ -22,19 +21,26 @@ V3_DIALECTS = ["msa", "egyptian", "palestinian", "lebanese", "syrian", "iraqi", 
 V3 = {"tags": {d: f"<reserved_{100 + i}>" for i, d in enumerate(V3_DIALECTS)},
       "aliases": {"emirati": "gulf", "qatari": "gulf", "khaliji": "gulf", "jordanian": "palestinian",
                   "ab": "palestinian", "levantine": "palestinian"}}
+ADAPTER_LORA = {"enable_lm": True, "enable_dit": True, "enable_proj": False, "r": 64, "alpha": 128,
+                "target_modules_lm": ["q_proj", "v_proj", "k_proj", "o_proj"],
+                "target_modules_dit": ["q_proj", "v_proj", "k_proj", "o_proj"]}
+ALL7 = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+V3_STATE = {"lora": {"enable_lm": True, "enable_dit": False, "enable_proj": False, "r": 64, "alpha": 64,
+                     "target_modules_lm": ALL7, "target_modules_dit": ALL7, "train_modules": ["base_lm"]},
+            "dialects": V3_DIALECTS}
 
 
 class FakeEngine:
-    """The engine's async API, recording what it is sent and the engine environment it was started with."""
+    """The engine's async API, recording what it is sent."""
 
     started: list = []
 
     def __init__(self, **kw):
         self.kw = kw
-        self.env = {k: os.environ.get(k) for k in dialect_routing._ENGINE_ENV}
+        self.env = {k: os.environ.get(k) for k in ("NANOVLLM_VOXCPM2_TURBO", "VOXCPM_KERNELS_SMOOTH")}
         self.requests: list[dict] = []
         self.voices: dict[str, str | None] = {}
-        self.fail_register = False
+        self.loras: dict[str, str] = {}
         self.stopped = False
 
     @classmethod
@@ -47,7 +53,7 @@ class FakeEngine:
         pass
 
     async def register_lora(self, name, path):
-        pass
+        self.loras[name] = path
 
     async def get_model_info(self):
         return {"sample_rate": 48000}
@@ -56,8 +62,6 @@ class FakeEngine:
         return b"latents"
 
     async def register_voice(self, name, latents, text):
-        if self.fail_register:
-            raise RuntimeError("engine refused the voice")
         self.voices[name] = text
 
     async def unregister_voice(self, name):
@@ -76,9 +80,7 @@ def run(coro):
 
 
 def routed(routes=None) -> RoutedDialectTTS:
-    adapters = DialectTTS(FakeEngine(), ADAPTER_NAMES, 48000)
-    tagged = DialectTTS(FakeEngine(), [], 48000, V3)
-    return RoutedDialectTTS(adapters, tagged, routes)
+    return RoutedDialectTTS(FakeEngine(), ADAPTER_NAMES, V3, 48000, routes)
 
 
 def test_default_route_table():
@@ -95,7 +97,7 @@ def test_default_route_table():
                  "algerian", "moroccan"):
         assert table[name] == Route(TAGGED, name), name
     assert sorted(table) == sorted(set(ADAPTER_NAMES) | set(V3["tags"]) | set(V3["aliases"]))
-    assert sum(r.model == ADAPTERS for r in table.values()) == 4
+    assert used_adapters(table) == ["egyptian", "hindi_english", "qatari", "saudi"]  # the engine loads only these
 
 
 def test_route_overrides_and_errors():
@@ -110,138 +112,150 @@ def test_route_overrides_and_errors():
         route_table(ADAPTER_NAMES, tags, {"bahraini": "bahraini"})  # no such adapter
 
 
-def test_split_kv_blocks():
-    assert split_kv_blocks(600) == (300, 300)
-    assert split_kv_blocks(601) == (301, 300)
-    assert split_kv_blocks((200, 400)) == (200, 400)
-    with pytest.raises(ValueError, match="automatic"):
-        split_kv_blocks(0)
-
-
-def test_dispatch_to_the_routed_engine():
+def test_dispatch_adapters_tags_and_base():
     tts = routed()
-    a, t = tts.engines[ADAPTERS].server, tts.engines[TAGGED].server
+    e = tts.server
     run(tts.synthesize("هلا", "bahraini"))
-    assert a.requests[-1]["lora_name"] == "qatari" and a.requests[-1]["text"] == "هلا"
-    run(tts.synthesize("هلا", "najdi"))
-    assert t.requests[-1]["text"] == V3["tags"]["najdi"] + "هلا" and t.requests[-1]["lora_name"] is None
+    assert e.requests[-1]["lora_name"] == "qatari" and e.requests[-1]["text"] == "هلا"
+    run(tts.synthesize("هلا", "najdi"))  # teacher-v3: its adapter, the tag in front of the text
+    assert e.requests[-1]["lora_name"] == TAGGED_ADAPTER and e.requests[-1]["text"] == V3["tags"]["najdi"] + "هلا"
     run(tts.synthesize("هلا", "qatari"))  # Gulf on teacher-v3
-    assert t.requests[-1]["text"] == V3["tags"]["gulf"] + "هلا"
+    assert e.requests[-1]["text"] == V3["tags"]["gulf"] + "هلا"
     run(tts.synthesize("मीटिंग 9 बजे", "hindi_english"))
-    assert (a.requests[-1]["text"], a.requests[-1]["lora_name"]) == ("मीटिंग 9 बजे", "hindi_english")
+    assert (e.requests[-1]["text"], e.requests[-1]["lora_name"]) == ("मीटिंग 9 बजे", "hindi_english")
     run(tts.synthesize("hello", None))  # no dialect: the base model, as DialectTTS
-    assert a.requests[-1]["lora_name"] is None and a.requests[-1]["text"] == "hello"
-    assert (len(a.requests), len(t.requests)) == (3, 2)
+    assert e.requests[-1]["lora_name"] is None and e.requests[-1]["text"] == "hello"
     run(tts.synthesize("الساعة 9:05", "msa", seed=7, cfg_value=1.5, max_patches=50))  # formal, arguments passed on
-    assert t.requests[-1] | {"text": None} == {"text": None, "lora_name": None, "seed": 7, "cfg_value": 1.5,
-                                               "max_generate_length": 50}
-    assert t.requests[-1]["text"] == V3["tags"]["msa"] + "الساعة تسعة وخمس دقائق"
+    assert e.requests[-1] == {"text": V3["tags"]["msa"] + "الساعة تسعة وخمس دقائق", "lora_name": TAGGED_ADAPTER,
+                              "seed": 7, "cfg_value": 1.5, "max_generate_length": 50}
+    run(tts.synthesize("الساعة 9:05", "egyptian"))  # an adapter: colloquial, no tag
+    assert e.requests[-1]["text"] == "الساعة تسعة وخمس دقايق"
     with pytest.raises(ValueError, match="unknown dialect 'kuwaiti'"):
         run(tts.synthesize("هلا", "kuwaiti"))
+    with pytest.raises(ValueError, match="empty"):
+        run(tts.synthesize("ـــ", "najdi"))
     assert "bahraini" in tts.dialects and "hindi_english" in tts.dialects and tts.sample_rate == 48000
 
 
-def test_voices_on_both_engines():
+def test_voices_and_tagged_copies():
     tts = routed()
-    a, t = tts.engines[ADAPTERS].server, tts.engines[TAGGED].server
+    e = tts.server
     run(tts.add_voice("v", b"wav", text="الساعة 9:30"))
-    assert a.voices["v"] == t.voices["v"] == "الساعة تسعة ونص" and tts.voices == {"v": True}
-    run(tts.synthesize("هلا", "saudi", voice="v"))
-    assert a.requests[-1]["voice"] == "v" and a.requests[-1]["clone_mode"] == "prompt_ref"
-    run(tts.synthesize("هلا", "msa", voice="v"))  # prompt_ref on the tagged model: the dialect's copy of the voice
-    assert t.requests[-1]["voice"] == "v@" + V3["tags"]["msa"]
-    assert t.voices["v@" + V3["tags"]["msa"]] == V3["tags"]["msa"] + "الساعة تسعة والنصف"
-    run(tts.synthesize("هلا", "najdi", voice="v", clone_mode="ref"))
-    assert t.requests[-1]["voice"] == "v" and t.requests[-1]["text"] == V3["tags"]["najdi"] + "هلا"
+    assert e.voices == {"v": "الساعة تسعة ونص"} and tts.voices == {"v": True}
+    run(tts.synthesize("هلا", "saudi", voice="v"))  # an adapter: the voice itself, prompt_ref
+    assert (e.requests[-1]["voice"], e.requests[-1]["clone_mode"]) == ("v", "prompt_ref")
+    run(tts.synthesize("هلا", "msa", voice="v"))  # teacher-v3 prompt_ref: the tag leads the transcript of a copy
+    tag = V3["tags"]["msa"]
+    assert e.requests[-1]["voice"] == "v@" + tag and e.voices["v@" + tag] == tag + "الساعة تسعة والنصف"
+    assert e.requests[-1]["lora_name"] == TAGGED_ADAPTER and e.requests[-1]["text"] == "هلا"
+    run(tts.synthesize("هلا", "najdi", voice="v", clone_mode="ref"))  # ref: the tag leads the text
+    assert e.requests[-1]["voice"] == "v" and e.requests[-1]["text"] == V3["tags"]["najdi"] + "هلا"
     run(tts.remove_voice("v"))
-    assert a.voices == {} and t.voices == {} and tts.voices == {}
+    assert e.voices == {} and tts.voices == {}
     with pytest.raises(ValueError, match="not registered"):
         run(tts.synthesize("هلا", "najdi", voice="v"))
 
 
-def test_voice_registration_is_all_or_nothing():
-    tts = routed()
-    a, t = tts.engines[ADAPTERS].server, tts.engines[TAGGED].server
-    t.fail_register = True
-    with pytest.raises(RuntimeError, match="refused"):
-        run(tts.add_voice("v", b"wav"))
-    assert a.voices == {} and "v" not in tts.engines[ADAPTERS].voices and tts.voices == {}
-
-
-def test_rejects_models_of_the_wrong_kind():
-    adapters = DialectTTS(FakeEngine(), ADAPTER_NAMES, 48000)
-    tagged = DialectTTS(FakeEngine(), [], 48000, V3)
-    with pytest.raises(ValueError, match="adapters model first"):
-        RoutedDialectTTS(tagged, adapters)
-    with pytest.raises(ValueError, match="sample rates"):
-        RoutedDialectTTS(adapters, DialectTTS(FakeEngine(), [], 24000, V3))
-
-
 @pytest.fixture
 def models(tmp_path, monkeypatch):
-    """An adapters model with SmoothQuant statistics and a tagged model on disk, the fake engine as VoxCPM."""
+    """An adapters model and a tagged model's training state on disk, the fake engine as VoxCPM."""
     import nanovllm_voxcpm
 
     a, t = tmp_path / "adapters-model", tmp_path / "tagged-model"
     for name in ADAPTER_NAMES:
         (a / "adapters" / name).mkdir(parents=True)
         (a / "adapters" / name / "lora_weights.safetensors").write_bytes(b"")
-    (a / "smooth_stats.pt").write_bytes(b"")
-    t.mkdir()
+        (a / "adapters" / name / "lora_config.json").write_text(json.dumps({"lora_config": ADAPTER_LORA}))
+    (t / "lora").mkdir(parents=True)
+    (t / "lora" / "trainable.safetensors").write_bytes(b"")
+    (t / "lora" / "train_state.json").write_text(json.dumps(V3_STATE))
     (t / "dialects.json").write_text(json.dumps(V3), encoding="utf-8")
-    for dit in ("adapters-dit.pt", "tagged-dit.pt"):
-        (tmp_path / dit).write_bytes(b"")
+    (tmp_path / "dit.pt").write_bytes(b"")
     monkeypatch.setattr(nanovllm_voxcpm, "VoxCPM", FakeEngine, raising=False)
-    monkeypatch.setattr(dialect_tts, "adapters_lora_config", lambda adapters: None)
-    monkeypatch.setattr(dialect_routing, "DEFAULT_TAGGED_DIT", str(tmp_path / "tagged-dit.pt"))
-    for k in dialect_routing._ENGINE_ENV:
+    for k in ("NANOVLLM_VOXCPM2_TURBO", "NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS", "VOXCPM_KERNELS_SMOOTH"):
         monkeypatch.delenv(k, raising=False)
     FakeEngine.started = []
     return tmp_path
 
 
-def test_load_starts_each_engine_with_its_own_configuration(models):
+def test_routed_lora_config(models):
+    adapters = {n: str(models / "adapters-model" / "adapters" / n) for n in ("egyptian", "qatari", "saudi")}
+    cfg = routed_lora_config(adapters, str(models / "tagged-model"))
+    assert cfg.max_loras == 4 and cfg.max_lora_rank == 64 and cfg.tag_rows == 17 and cfg.max_mlp_loras == 1
+    assert cfg.target_modules_lm == ALL7
+    assert cfg.target_modules_residual_lm == ["q_proj", "k_proj", "v_proj", "o_proj"]  # the tagged LoRA: base_lm
+    assert cfg.enable_dit and cfg.target_modules_dit == ["q_proj", "k_proj", "v_proj", "o_proj"]  # adapters' only
+
+
+def test_load_one_engine_with_the_used_adapters(models):
     tts = run(RoutedDialectTTS.load(str(models / "adapters-model"), str(models / "tagged-model"),
-                                    str(models / "adapters-dit.pt"), kv_blocks=(250, 350), max_concurrency=64,
-                                    device=(0, 1), w8a8=True))
-    a, t = FakeEngine.started
-    assert (a.kw["devices"], t.kw["devices"]) == ([0], [1])
-    assert tts.engines[ADAPTERS].server is a and tts.engines[TAGGED].server is t
-    turbo_a, turbo_t = json.loads(a.env["NANOVLLM_VOXCPM2_TURBO"]), json.loads(t.env["NANOVLLM_VOXCPM2_TURBO"])
-    assert turbo_a["dit_checkpoint"].endswith("adapters-dit.pt")
-    assert turbo_t["dit_checkpoint"].endswith("tagged-dit.pt")  # "auto" in fast mode: DEFAULT_TAGGED_DIT
-    assert (a.env["NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"], t.env["NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"]) == \
-        ("250", "350")
-    assert a.env["VOXCPM_KERNELS_SMOOTH"].endswith("smooth_stats.pt")
-    assert t.env["VOXCPM_KERNELS_SMOOTH"] is None  # not the adapters model's statistics
-    assert a.kw["max_num_seqs"] == t.kw["max_num_seqs"] == 64
-    assert all(os.environ.get(k) is None for k in dialect_routing._ENGINE_ENV)  # restored after both starts
-    assert tts.table == route_table(ADAPTER_NAMES, DialectTags(V3), DEFAULT_ROUTES)
+                                    str(models / "dit.pt"), max_concurrency=64, kv_blocks=300,
+                                    smooth_stats=str(models / "stats.pt")))
+    (e,) = FakeEngine.started
+    assert tts.server is e
+    assert sorted(e.loras) == ["@tagged", "egyptian", "hindi_english", "qatari", "saudi"]
+    assert e.loras["@tagged"] == str(models / "tagged-model")
+    cfg = e.kw["lora_config"]
+    assert cfg.max_loras == 5 and cfg.max_mlp_loras == 1 and cfg.tag_rows == 17
+    turbo = json.loads(e.env["NANOVLLM_VOXCPM2_TURBO"])
+    assert e.kw["max_num_seqs"] == 64 and turbo["dit_checkpoint"].endswith("dit.pt") and turbo["w8a8"]
+    assert e.env["VOXCPM_KERNELS_SMOOTH"].endswith("stats.pt")
+    assert tts.route("najdi") == Route(TAGGED, "najdi") and tts.route("bahraini") == Route(ADAPTERS, "qatari")
     run(tts.close())
-    assert a.stopped and t.stopped
-
-
-def test_load_quality_mode_and_failures(models):
-    tts = run(RoutedDialectTTS.load(str(models / "adapters-model"), str(models / "tagged-model"), None,
-                                    dit_cache="light"))
-    for engine in FakeEngine.started:  # "auto" with dit=None: both on their own LocDiT
-        turbo = json.loads(engine.env["NANOVLLM_VOXCPM2_TURBO"])
-        assert "dit_checkpoint" not in turbo and turbo["dit_cache"] and "w8a8" not in turbo  # bf16 by default
-        # quality mode's A10 fit by default
-        assert engine.env["NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"] == "128" and engine.kw["max_num_seqs"] == 64
-        assert engine.kw["devices"] == [0]
-    run(tts.close())
+    assert e.stopped
     FakeEngine.started = []
-    tts = run(RoutedDialectTTS.load(str(models / "adapters-model"), str(models / "tagged-model"),
-                                    str(models / "adapters-dit.pt"), w8a8=True))
-    for engine in FakeEngine.started:  # fast mode's A10 fit; int8 when asked
-        assert engine.env["NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"] == "192" and engine.kw["max_num_seqs"] == 128
-        assert json.loads(engine.env["NANOVLLM_VOXCPM2_TURBO"])["w8a8"]
-    run(tts.close())
-    with pytest.raises(ValueError, match="dialects.json"):  # the models swapped
-        run(RoutedDialectTTS.load(str(models / "tagged-model"), str(models / "adapters-model"), None))
-    with pytest.raises(ValueError, match="lacks"):  # a bad route fails before any engine starts
-        FakeEngine.started = []
+    run(RoutedDialectTTS.load(str(models / "adapters-model"), str(models / "tagged-model"), None,
+                              routes={**DEFAULT_ROUTES, "najdi": "najdi"}))
+    assert sorted(FakeEngine.started[0].loras) == ["@tagged", "egyptian", "hindi_english", "najdi", "qatari", "saudi"]
+    with pytest.raises(ValueError, match="not a tagged model"):
+        run(RoutedDialectTTS.load(str(models / "adapters-model"), str(models / "adapters-model"), None))
+    with pytest.raises(ValueError, match="lacks"):
         run(RoutedDialectTTS.load(str(models / "adapters-model"), str(models / "tagged-model"), None,
                                   routes={"bahraini": "kuwaiti"}))
-    assert FakeEngine.started == []
+
+
+def test_tagged_adapter_loader(tmp_path):
+    """A tagged model's lora/: the LoRA (attention and MLP, packed like the adapters'), the tag rows, exact_merge."""
+    torch = pytest.importorskip("torch")
+    from safetensors.torch import save_file
+
+    from nanovllm_voxcpm.models.voxcpm2.lora_loader import is_tagged_adapter, load_voxcpm2_lora_checkpoint
+
+    (tmp_path / "lora").mkdir()
+    g = torch.Generator().manual_seed(0)
+    t = {"base_lm.embed_tokens.tag_embed": torch.randn(17, 8, generator=g)}
+    for leaf, out_dim, in_dim in (("self_attn.q_proj", 8, 8), ("self_attn.k_proj", 4, 8), ("self_attn.v_proj", 4, 8),
+                                  ("self_attn.o_proj", 8, 8), ("mlp.gate_proj", 16, 8), ("mlp.up_proj", 16, 8),
+                                  ("mlp.down_proj", 8, 16)):
+        t[f"base_lm.layers.0.{leaf}.lora_A"] = torch.randn(2, in_dim, generator=g)
+        t[f"base_lm.layers.0.{leaf}.lora_B"] = torch.randn(out_dim, 2, generator=g)
+    save_file(t, str(tmp_path / "lora" / "trainable.safetensors"))
+    state = {**V3_STATE, "lora": {**V3_STATE["lora"], "r": 2, "alpha": 4}}
+    (tmp_path / "lora" / "train_state.json").write_text(json.dumps(state))
+    assert not is_tagged_adapter(str(tmp_path))  # no dialects.json yet
+    (tmp_path / "dialects.json").write_text(json.dumps(V3))
+    assert is_tagged_adapter(str(tmp_path))
+    p = load_voxcpm2_lora_checkpoint(str(tmp_path))
+    assert p.exact_merge and p.rank == 2 and torch.equal(p.tag_embed, t["base_lm.embed_tokens.tag_embed"])
+    assert sorted(p.modules) == ["base_lm.layers.0.mlp.down_proj", "base_lm.layers.0.mlp.gate_up_proj",
+                                 "base_lm.layers.0.self_attn.o_proj", "base_lm.layers.0.self_attn.qkv_proj"]
+    gu = p.modules["base_lm.layers.0.mlp.gate_up_proj"]
+    assert gu.scaling == 2.0 and torch.equal(gu.lora_a[1], t["base_lm.layers.0.mlp.up_proj.lora_A"])
+    assert torch.equal(gu.lora_b[0], t["base_lm.layers.0.mlp.gate_proj.lora_B"])
+    qkv = p.modules["base_lm.layers.0.self_attn.qkv_proj"]
+    assert [b.shape[0] for b in qkv.lora_b] == [8, 4, 4]
+
+
+def test_extra_embedding_rows():
+    torch = pytest.importorskip("torch")
+    from nanovllm_voxcpm.layers.embed_head import VocabParallelEmbedding
+
+    emb = VocabParallelEmbedding(10, 4, extra_rows=3)
+    emb.weight_loader(emb.weight, torch.arange(40, dtype=torch.float32).view(10, 4))
+    assert emb.weight.shape == (13, 4) and torch.equal(emb.weight[:10].flatten(), torch.arange(40.0))
+    assert not emb.weight[10:].any()
+    emb.set_rows(11, torch.ones(2, 4))
+    out = emb(torch.tensor([2, 11, 12, 10]))
+    assert torch.equal(out[0], torch.arange(8.0, 12.0)) and out[1:3].eq(1).all() and not out[3].any()
+    with pytest.raises(ValueError, match="extra embedding rows"):
+        emb.set_rows(9, torch.ones(1, 4))  # the vocabulary's own rows stay the checkpoint's

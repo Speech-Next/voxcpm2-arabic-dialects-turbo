@@ -82,6 +82,11 @@ class LoRAConfig(BaseModel):
         target_modules_lm: Target modules in LM layers (e.g., ["q_proj", "k_proj", "v_proj", "o_proj"])
         target_modules_dit: Target modules in DiT layers
         target_proj_modules: Projection layer names to apply LoRA
+        target_modules_residual_lm: Target modules in residual_lm layers (None: target_modules_lm)
+        max_mlp_loras: Adapters with LoRA on the MLP (gate/up/down) whose merged int8 weights the fused layers hold at
+            once (None: max_loras); each costs one int8 copy of the MLP weights (base_lm: 1 GB)
+        tag_rows: Extra base_lm embedding rows for tagged adapters' dialect tag tokens (a tagged model served as an
+            adapter: its tags' trained embeddings, used only by its requests)
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -98,6 +103,9 @@ class LoRAConfig(BaseModel):
         "lm_to_dit_proj",
         "res_to_dit_proj",
     ]
+    target_modules_residual_lm: Optional[List[str]] = None
+    max_mlp_loras: Optional[int] = None
+    tag_rows: int = 0
 
 
 class TurboConfig(BaseModel):

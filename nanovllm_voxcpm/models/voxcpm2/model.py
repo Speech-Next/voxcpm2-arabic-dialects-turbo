@@ -253,6 +253,9 @@ class Cpm4MLP(nn.Module):
             if max_lora_rank > 0 and "down_proj" in lora_targets
             else RowParallelLinear(intermediate_size, hidden_size, bias=False)
         )
+        # how many adapters with MLP LoRA the fused int8 layers keep merged weights for (voxcpm_kernels.fused_layer)
+        self.max_mlp_loras = (max_loras if lora_config is None or lora_config.max_mlp_loras is None
+                              else lora_config.max_mlp_loras)
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -315,8 +318,10 @@ class Cpm4Model(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        extra = lora_config.tag_rows if lora_config is not None and lora_domain == LM_LORA_DOMAIN else 0
         self.embed_tokens = (
-            VocabParallelEmbedding(config.vocab_size, config.hidden_size) if config.vocab_size > 0 else nn.Identity()
+            VocabParallelEmbedding(config.vocab_size, config.hidden_size, extra_rows=extra)
+            if config.vocab_size > 0 else nn.Identity()
         )
         self.layers = nn.ModuleList(
             [
@@ -568,9 +573,13 @@ class VoxCPM2Model(nn.Module):
         residual_lm_config = config.lm_config.model_copy(deep=True)
         residual_lm_config.num_hidden_layers = config.residual_lm_num_layers
         residual_lm_config.vocab_size = 0
+        residual_lora_config = lm_lora_config
+        if lm_lora_config is not None and lm_lora_config.target_modules_residual_lm is not None:
+            residual_lora_config = lm_lora_config.model_copy(
+                update={"target_modules_lm": list(lm_lora_config.target_modules_residual_lm)})
         self.residual_lm = Cpm4Model(
             residual_lm_config,
-            lora_config=lm_lora_config,
+            lora_config=residual_lora_config,
             use_rope=not config.residual_lm_no_rope,
         )
 
