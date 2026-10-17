@@ -201,19 +201,50 @@ def _build_ops(decoder: nn.Module, slots: int, fused: bool = True) -> list:
     return ops
 
 
-def _state_tensors(ops) -> list[torch.Tensor]:
+def _state_holders(ops) -> list:
     out = []
     for op in ops:
         inner = op.ops if isinstance(op, _ResidualUnit) else [op]  # fused ops hold .state themselves
-        out += [o.state for o in inner if getattr(o, "state", None) is not None]
+        out += [o for o in inner if getattr(o, "state", None) is not None]
     return out
+
+
+def _state_tensors(ops) -> list[torch.Tensor]:
+    return [o.state for o in _state_holders(ops)]
+
+
+def flatten_states(holders: list) -> torch.Tensor | None:
+    """Moves every holder's ``.state`` [slots, ...] into one buffer [slots, total]: each state becomes a view of its
+    columns, with the buffer's row stride as its slot stride (the kernels read ``state.stride(0)``). A released slot is
+    then zeroed, and a cached context copied, by one kernel instead of one per layer. Values and shapes are unchanged.
+    None (states left as they are) when they differ in device, dtype or slot count."""
+    states = [h.state for h in holders]
+    if not states or len({(t.device, t.dtype, t.size(0)) for t in states}) != 1:
+        return None
+    slots = states[0].size(0)
+    align = max(1, 16 // states[0].element_size())  # every state starts 16-byte aligned in every slot row
+    offs, total = [], 0
+    for t in states:
+        offs.append(total)
+        total += -(-t[0].numel() // align) * align
+    flat = torch.zeros(slots, total, device=states[0].device, dtype=states[0].dtype)
+    for h, t, off in zip(holders, states, offs):
+        inner = tuple(t.shape[1:])
+        strides, step = [], 1
+        for d in reversed(inner):  # contiguous within a slot
+            strides.insert(0, step)
+            step *= d
+        view = flat.as_strided((slots, *inner), (total, *strides), flat.storage_offset() + off)
+        view.copy_(t)
+        h.state = view
+    return flat
 
 
 class SlotStreamingVAEDecoder:
     """Drop-in replacement for nanovllm's BatchedStreamingVAEDecoder.
 
-    ``decode_chunks`` returns a view into a graph-owned buffer; consume it
-    before the next call.
+    ``decode_chunks`` (and ``decode_first`` / ``decode_first_rest``) return a view into a graph-owned buffer; consume
+    it (or enqueue its copy on the current stream) before the next call.
     """
 
     def __init__(
@@ -227,15 +258,23 @@ class SlotStreamingVAEDecoder:
         fused: bool = False,
         context_cache_size: int = 64,
         extra_chunk_frames: Sequence[int] = (),
+        first_phases: int = 0,
     ):
         """``extra_chunk_frames``: chunk lengths besides ``chunk_frames`` that also get CUDA graphs (a patch decoded
-        in two pieces, e.g. 1 + 3 frames for an early first audio); other lengths run eagerly."""
+        in two pieces, e.g. 1 + 3 frames for an early first audio); other lengths run eagerly.
+
+        ``first_phases``: a stream's first frame can also be decoded in two pieces, its first ``first_phases`` /
+        stride of the audio (``decode_first``), then the rest of the frame (``decode_first_rest``). The split is at the
+        output phases of the first transposed conv (stride 8: 5 ms of 48 kHz audio per phase); the pieces are the
+        frame's audio. Needs the fused ops; 0 (or no fused transposed conv) disables it, see ``split_phases``."""
         self.max_streams = max_streams
         self.dummy_slot = max_streams
         self.latent_dim = latent_dim
         self.chunk_frames = chunk_frames
         self.ops = _build_ops(decoder, max_streams + 1, fused=fused)
+        self._flat = flatten_states(_state_holders(self.ops))  # one buffer for every layer's state, or None
         self.states = _state_tensors(self.ops)
+        self._state_bufs = [self._flat] if self._flat is not None else self.states  # what a slot's state is copied as
         self.device = self.states[0].device
         self.dtype = self.states[0].dtype
         self.graph_batch_sizes = tuple(sorted(b for b in graph_batch_sizes if b <= max_streams)) or (max_streams,)
@@ -243,10 +282,17 @@ class SlotStreamingVAEDecoder:
         self.use_cuda_graph = use_cuda_graph
         self._slot_of: dict[Hashable, int] = {}
         self._free = list(range(max_streams - 1, -1, -1))
-        # graphs and their outputs by (batch bucket, chunk frames); one input buffer per chunk length
-        self._graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
-        self._graph_out: dict[tuple[int, int], torch.Tensor] = {}
-        frames = sorted({chunk_frames, *(t for t in extra_chunk_frames if 0 < t)})
+        # the first frame in two pieces: the first transposed conv's snaked input is kept per slot between them
+        self.split_phases, self.split_stride, self._split_at, self._pending = 0, 0, None, None
+        k = next((i for i, op in enumerate(self.ops) if isinstance(op, FusedSnakeTransposeConv)), None)
+        if first_phases and k is not None and 0 < first_phases < self.ops[k].S:
+            self.split_phases, self.split_stride, self._split_at = first_phases, self.ops[k].S, k
+            self._pending = torch.zeros(max_streams + 1, self.ops[k].C_in, 1, device=self.device, dtype=self.dtype)
+        # graphs and their outputs by (batch bucket, chunk frames or "first" / "first_rest"); one input buffer per
+        # chunk length
+        self._graphs: dict[tuple[int, int | str], torch.cuda.CUDAGraph] = {}
+        self._graph_out: dict[tuple[int, int | str], torch.Tensor] = {}
+        frames = sorted({chunk_frames, *(t for t in extra_chunk_frames if 0 < t), *((1,) if self.split_phases else ())})
         self._zs = {t: torch.zeros(self.max_graph_batch, latent_dim, t, device=self.device, dtype=self.dtype)
                     for t in frames}
         self._z = self._zs[chunk_frames]
@@ -263,35 +309,72 @@ class SlotStreamingVAEDecoder:
             x = op(x, idx)
         return x
 
+    def _forward_first(self, z: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        """A one-frame chunk up to the first transposed conv, then its first split_phases output phases onwards. That
+        conv's state is not advanced; its snaked input waits in _pending for _forward_first_rest."""
+        k = self._split_at
+        x = z
+        for op in self.ops[:k]:
+            x = op(x, idx)
+        y = self.ops[k].snaked(x)
+        self._pending.index_copy_(0, idx, y)
+        x = self.ops[k].phases(y, idx, 0, self.split_phases)
+        for op in self.ops[k + 1:]:
+            x = op(x, idx)
+        return x
+
+    def _forward_first_rest(self, idx: torch.Tensor) -> torch.Tensor:
+        """The frame's remaining output phases of the first transposed conv, which then advances its state, onwards."""
+        k = self._split_at
+        tconv = self.ops[k]
+        y = self._pending.index_select(0, idx)
+        x = tconv.phases(y, idx, self.split_phases, tconv.S)
+        tconv.state.index_copy_(0, idx, y)
+        for op in self.ops[k + 1:]:
+            x = op(x, idx)
+        return x
+
+    def _graph_forward(self, key: int | str, b: int) -> torch.Tensor:
+        if key == "first":
+            return self._forward_first(self._zs[1][:b], self._idx[:b])
+        if key == "first_rest":
+            return self._forward_first_rest(self._idx[:b])
+        return self._forward(self._zs[key][:b], self._idx[:b])
+
     @torch.inference_mode()
     def warmup(self, latent_channels: int | None = None, chunk_size: int | None = None) -> None:
-        """Compile the Triton kernels and capture one CUDA graph per batch-size bucket."""
+        """Compile the Triton kernels and capture one CUDA graph per batch-size bucket (and chunk kind)."""
         self._idx.fill_(self.dummy_slot)
         self._forward(self._z[:1], self._idx[:1])
+        if self.split_phases:
+            self._forward_first(self._zs[1][:1], self._idx[:1])
+            self._forward_first_rest(self._idx[:1])
         if not self.use_cuda_graph:
             return
         pool = None
-        for t in sorted(self._zs, reverse=True):  # the longest chunk first: the shared pool's largest graph
-            z = self._zs[t]
+        # the longest chunk first: the shared pool's largest graph; the first frame's pieces last (the smallest)
+        keys = sorted(self._zs, reverse=True) + (["first", "first_rest"] if self.split_phases else [])
+        for key in keys:
             for b in reversed(self.graph_batch_sizes):
                 side = torch.cuda.Stream()
                 side.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(side):
-                    self._forward(z[:b], self._idx[:b])
+                    self._graph_forward(key, b)
                 torch.cuda.current_stream().wait_stream(side)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, pool=pool):
-                    out = self._forward(z[:b], self._idx[:b])
+                    out = self._graph_forward(key, b)
                 pool = graph.pool() if pool is None else pool
-                self._graphs[(b, t)] = graph
-                self._graph_out[(b, t)] = out
+                self._graphs[(b, key)] = graph
+                self._graph_out[(b, key)] = out
         torch.cuda.synchronize()
-        for s in self.states:
+        for s in self._state_bufs:
             s.zero_()
 
     # -- slot management ------------------------------------------------------
     def _slots_for(self, stream_ids: Sequence[Hashable]) -> list[int]:
-        slots, fresh = [], []
+        """Each stream's slot; a new stream takes a free one, whose state is already zero (see release)."""
+        slots = []
         for sid in stream_ids:
             slot = self._slot_of.get(sid)
             if slot is None:
@@ -299,12 +382,7 @@ class SlotStreamingVAEDecoder:
                     raise RuntimeError(f"more than {self.max_streams} concurrent VAE streams")
                 slot = self._free.pop()
                 self._slot_of[sid] = slot
-                fresh.append(slot)
             slots.append(slot)
-        if fresh:
-            new = self._index(fresh)  # pinned + non_blocking: a pageable copy would wait for the queued GPU work
-            for s in self.states:
-                s.index_fill_(0, new, 0)
         return slots
 
     def has_stream(self, stream_id: Hashable) -> bool:
@@ -312,13 +390,22 @@ class SlotStreamingVAEDecoder:
         return stream_id in self._slot_of
 
     def release(self, stream_id: Hashable) -> None:
+        """Frees the stream's slot and zeroes its state now, queued after the stream's last decode: a free slot is
+        always zero, so a new stream's first decode (the first audio of a burst) need not clear 324 KB per stream."""
         slot = self._slot_of.pop(stream_id, None)
         if slot is not None:
+            if self._flat is not None:
+                self._flat[slot].zero_()
+            else:
+                for s in self.states:
+                    s[slot].zero_()
             self._free.append(slot)
 
     def clear(self) -> None:
         self._slot_of.clear()
         self._free = list(range(self.max_streams - 1, -1, -1))
+        for s in self._state_bufs:  # every slot is free again: zero, as release leaves them
+            s.zero_()
 
     def _prime(self, slots, initial_contexts, new_streams, context_keys=None) -> None:
         """Run new streams' context latents [1, D, T] through the decoder to set their causal state.
@@ -360,7 +447,7 @@ class SlotStreamingVAEDecoder:
         if hits:
             src = self._index([self._ctx_rows[k] for _, k in hits])
             dst = self._index([s for s, _ in hits])
-            for state, cache in zip(self.states, self._ctx_cache):
+            for state, cache in zip(self._state_bufs, self._ctx_cache):
                 state.index_copy_(0, dst, cache.index_select(0, src))
             for _, k in hits:
                 self._ctx_rows.move_to_end(k)
@@ -368,7 +455,7 @@ class SlotStreamingVAEDecoder:
     def _store_contexts(self, keyed: list[tuple[int, Hashable]]) -> None:
         if self._ctx_cache is None:
             self._ctx_cache = [torch.empty(self.context_cache_size, *s.shape[1:], device=s.device, dtype=s.dtype)
-                               for s in self.states]
+                               for s in self._state_bufs]
         rows = []
         for _, key in keyed:
             if len(self._ctx_rows) < self.context_cache_size:
@@ -378,11 +465,41 @@ class SlotStreamingVAEDecoder:
             self._ctx_rows[key] = row
             rows.append(row)
         src, dst = self._index([s for s, _ in keyed]), self._index(rows)
-        for state, cache in zip(self.states, self._ctx_cache):
+        for state, cache in zip(self._state_bufs, self._ctx_cache):
             cache.index_copy_(0, dst, state.index_select(0, src))
 
     def _index(self, values: list[int]) -> torch.Tensor:
         return torch.tensor(values, dtype=torch.long, device="cpu").pin_memory().to(self.device, non_blocking=True)
+
+    def _begin(self, stream_ids, initial_contexts, context_keys) -> list[int]:
+        new_streams = [sid not in self._slot_of for sid in stream_ids]
+        slots = self._slots_for(stream_ids)
+        if initial_contexts is not None:
+            self._prime(slots, initial_contexts, new_streams, context_keys)
+        return slots
+
+    def _run(self, key: int | str, z: torch.Tensor | None, slots: list[int]) -> torch.Tensor:
+        """Replay the bucket's graph for ``key`` (eager when there is none), on these slots."""
+        bsz = len(slots)
+        bucket = next((b for b in self.graph_batch_sizes if b >= bsz), None)
+        if self._graphs and bucket is not None and (bucket, key) in self._graphs:
+            if z is not None:
+                buf = self._zs[z.size(-1)]
+                buf[:bsz].copy_(z)
+                if bucket > bsz:
+                    buf[bsz:bucket].zero_()
+            self._idx[:bsz].copy_(torch.tensor(slots, dtype=torch.long, device="cpu").pin_memory(), non_blocking=True)
+            if bucket > bsz:
+                self._idx[bsz:bucket].fill_(self.dummy_slot)
+            self._graphs[(bucket, key)].replay()
+            return self._graph_out[(bucket, key)][:bsz]
+        idx = self._index(slots)
+        step = self.max_graph_batch
+        if key == "first":
+            return torch.cat([self._forward_first(z[i : i + step], idx[i : i + step]) for i in range(0, bsz, step)])
+        if key == "first_rest":
+            return torch.cat([self._forward_first_rest(idx[i : i + step]) for i in range(0, bsz, step)])
+        return torch.cat([self._forward(z[i : i + step], idx[i : i + step]) for i in range(0, bsz, step)], dim=0)
 
     # -- public API ------------------------------------------------------------
     @torch.inference_mode()
@@ -400,22 +517,32 @@ class SlotStreamingVAEDecoder:
         """
         if len(stream_ids) != z_chunks.size(0):
             raise ValueError("stream_ids length must match z_chunks batch size")
-        new_streams = [sid not in self._slot_of for sid in stream_ids]
-        slots = self._slots_for(stream_ids)
-        if initial_contexts is not None:
-            self._prime(slots, initial_contexts, new_streams, context_keys)
+        slots = self._begin(stream_ids, initial_contexts, context_keys)
         z = z_chunks.to(self.dtype)
-        bsz, t = z.size(0), z.size(-1)
-        if self._graphs and t in self._zs and bsz <= self.max_graph_batch:
-            bucket = next(b for b in self.graph_batch_sizes if b >= bsz)
-            buf = self._zs[t]
-            buf[:bsz].copy_(z)
-            self._idx[:bsz].copy_(torch.tensor(slots, dtype=torch.long, device="cpu").pin_memory(), non_blocking=True)
-            if bucket > bsz:
-                buf[bsz:bucket].zero_()
-                self._idx[bsz:bucket].fill_(self.dummy_slot)
-            self._graphs[(bucket, t)].replay()
-            return self._graph_out[(bucket, t)][:bsz]
-        idx = self._index(slots)
-        step = self.max_graph_batch
-        return torch.cat([self._forward(z[i : i + step], idx[i : i + step]) for i in range(0, bsz, step)], dim=0)
+        key = z.size(-1) if z.size(-1) in self._zs else -1  # -1: no graph, eager
+        return self._run(key, z, slots)
+
+    @torch.inference_mode()
+    def decode_first(
+        self,
+        z_frame: torch.Tensor,
+        stream_ids: Sequence[Hashable],
+        initial_contexts: Sequence[torch.Tensor | None] | None = None,
+        context_keys: Sequence[Hashable | None] | None = None,
+    ) -> torch.Tensor:
+        """The first ``split_phases`` / ``split_stride`` of a one-frame chunk's audio [B, 1, hop * split_phases /
+        split_stride] (arguments as ``decode_chunks``). ``decode_first_rest`` with the same streams decodes the rest
+        of that frame and must come before any other decode of them."""
+        if not self.split_phases:
+            raise RuntimeError("decode_first needs first_phases (and the fused decoder)")
+        if len(stream_ids) != z_frame.size(0) or z_frame.size(-1) != 1:
+            raise ValueError("decode_first: one frame [B, D, 1] per stream id")
+        slots = self._begin(stream_ids, initial_contexts, context_keys)
+        return self._run("first", z_frame.to(self.dtype), slots)
+
+    @torch.inference_mode()
+    def decode_first_rest(self, stream_ids: Sequence[Hashable]) -> torch.Tensor:
+        """The rest of the frames that ``decode_first`` started for these streams [B, 1, hop - its length]."""
+        if not self.split_phases:
+            raise RuntimeError("decode_first_rest needs first_phases (and the fused decoder)")
+        return self._run("first_rest", None, [self._slot_of[sid] for sid in stream_ids])
