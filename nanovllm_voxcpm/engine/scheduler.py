@@ -88,6 +88,8 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         turbo = getattr(config.model_config, "turbo", None)
         self.max_prefill_seqs = getattr(turbo, "prefill_max_seqs", 0) or self.max_num_seqs
+        # streams before new requests (TurboConfig.stream_guard_ms, 0 = off): see _admit_loop
+        self.stream_guard = (getattr(turbo, "stream_guard_ms", 0) or 0) / 1000
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -172,10 +174,25 @@ class Scheduler:
         # model-level prefix caches (VoxCPM2 ref_prefix_cache) shrink the prefill; optional callback
         prefix_hint = getattr(callbacks, "cached_prefix_tokens", None)
         running_ids = None  # adapters of the running sequences, built once and kept up to date in this pass
+        # Streams before new requests: while a running stream's player has less than stream_guard of audio queued,
+        # a prefill step (which pauses every stream) admits only waiting streams whose players have even less (a
+        # head start's continuation, a preempted sequence: their own gap grows while they wait); the decode step
+        # that follows refills the others. New requests wait for the next step with enough slack.
+        slack = None
+        buffer_of = getattr(callbacks, "stream_buffer", None) if self.stream_guard > 0 else None
+        if buffer_of is not None and running:
+            slack = min((b for b in map(buffer_of, running) if b is not None), default=None)
+            if slack is not None and slack >= self.stream_guard:
+                slack = None
         for _ in range(len(waiting)):
             if not waiting or budget[0] >= max_seqs:
                 break
             seq = waiting.popleft()
+            if slack is not None:
+                b = buffer_of(seq) if seq.has_stream else None
+                if b is None or b > slack:  # a new request, or a stream with more audio left than a running one
+                    waiting.appendleft(seq)
+                    break
             if not seq.has_stream and self.num_streams >= self.max_num_seqs:
                 # every stream slot is taken: a new request waits, a resuming one (preempted, continuation) may run
                 deferred_waiting.append(seq)

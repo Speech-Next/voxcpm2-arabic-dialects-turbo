@@ -327,6 +327,65 @@ def test_continuation_resumes_at_the_front_despite_the_cap():
     assert list(sch.waiting) == [c]
 
 
+class _Buffers:
+    """Scheduler callbacks: every sequence schedulable, a stream's queued audio from ``buf`` (seconds; absent: None)."""
+
+    def __init__(self, buf):
+        self.buf = buf
+
+    def on_seq_added(self, seq): pass
+    def on_seq_running(self, seq): pass
+    def on_seq_waiting(self, seq): pass
+    def on_seq_removed(self, seq, was_running): pass
+    def can_schedule(self, running_ids, seq): return True
+    def stream_buffer(self, seq): return self.buf.get(seq.seq_id)
+
+
+def _guarded(guard_ms, buf, max_num_seqs=4):
+    cfg = _config(max_num_seqs=max_num_seqs)
+    cfg.model_config.turbo.stream_guard_ms = guard_ms
+    return Scheduler(cfg, callbacks=_Buffers(buf))
+
+
+def test_a_new_request_waits_while_a_playing_stream_is_short_of_audio():
+    buf = {"a": 0.1}
+    sch = _guarded(300, buf)
+    a, b = _seq("a", [1]), _seq("b", [2])
+    sch.add(a)
+    assert sch.schedule() == ([a], True)  # nothing playing yet: admitted
+    a.append_token(9)  # (its patch, as the engine's postprocess appends it)
+    sch.add(b)
+    assert sch.schedule() == ([a], False)  # a has 100 ms queued (< 300): decode it, b waits
+    assert list(sch.waiting) == [b]
+    a.append_token(9)
+    buf["a"] = 0.5
+    assert sch.schedule() == ([b], True)  # enough slack: b's prefill
+    off = _guarded(0, {"a": 0.1})  # guard off: the original prefill-first order
+    off.add(a2 := _seq("a", [1]))
+    off.schedule()
+    off.add(b2 := _seq("b", [2]))
+    assert off.schedule() == ([b2], True)
+
+
+def test_a_waiting_stream_with_less_audio_than_the_playing_ones_goes_first():
+    buf = {"a": 0.2}
+    sch = _guarded(300, buf)
+    a, c = _seq("a", [1]), _seq("c", [3])
+    sch.add(a)
+    sch.schedule()
+    a.append_token(9)
+    cont = _seq("h", [4, 5])  # a head start's continuation: its stream is playing the head's audio
+    cont.has_stream = True
+    sch.add(c)
+    sch.add(cont, front=True)
+    buf["h"] = 0.25  # more than a's 200 ms: a decodes first
+    assert sch.schedule() == ([a], False)
+    a.append_token(9)
+    buf["h"] = 0.05  # less: its prefill, and only it (c, a new request, still waits)
+    assert sch.schedule() == ([cont], True)
+    assert list(sch.waiting) == [c]
+
+
 def test_new_request_at_the_front_does_not_block_a_resuming_one():
     sch = Scheduler(_config(max_num_seqs=2))
     r = _seq("r", [1])

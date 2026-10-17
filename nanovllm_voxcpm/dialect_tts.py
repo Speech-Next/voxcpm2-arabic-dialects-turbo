@@ -55,11 +55,13 @@ def resolve(spec: str) -> str:
 
 def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | None = None, w8a8: bool = True) -> dict:
     """The measured low-latency configuration: distilled 2-step LocDiT (``dit``), int8 layers, head start of
-    ``head_tokens`` tokens (0 = off), int16 audio chunks, a stream's leading silence capped at 2 patches (320 ms).
+    ``head_tokens`` tokens (0 = off), int16 audio chunks, a stream's leading silence capped at 2 patches (320 ms),
+    and no new request admitted while a playing stream has less than 150 ms of audio queued at its player.
     dit_cache: with the original LocDiT (``dit`` None), reuse its middle layers on some solver steps ("light",
     "medium" or a plan, see models/voxcpm2/dit_cache.py).
     w8a8=False: bf16 layers (quality measurements of a model whose SmoothQuant statistics were not calibrated)."""
-    cfg = {"pcm16_output": True, "head_tokens": head_tokens, "head_patches": 3, "lead_silence_patches": 2}
+    cfg = {"pcm16_output": True, "head_tokens": head_tokens, "head_patches": 3, "lead_silence_patches": 2,
+           "stream_guard_ms": 150}
     if w8a8:
         cfg.update(w8a8=True, w8a8_targets=["base_lm", "residual_lm", "feat_encoder", "feat_decoder"])
     if dit and dit_cache:
