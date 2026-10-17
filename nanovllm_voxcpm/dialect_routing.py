@@ -34,10 +34,11 @@ Bahraini group was measured with it). A route keyed by a name wins over one keye
 ``routes={**DEFAULT_ROUTES, "qatari": "qatari"}`` sends "qatari" alone to the qatari adapter. Only the adapters the
 table uses are loaded.
 
-Cost (one A10, int8, 600 KV blocks): the speed of the default engine (first audio p95 at 200 requests 94-95 vs
-93-96 ms) and less memory than it (20.6 vs 21.9 GiB peak: 4 adapters instead of 11, plus teacher-v3's merged MLP
-weights, 1 GB). In int8 the tagged requests run the merged int8 weights at every batch size, as the adapters do;
-SmoothQuant statistics are the base model's (teacher-v3's own, max-combined with them, changed nothing on #2).
+Cost (one A10, int8, 600 KV blocks, the 2-step LocDiT): the speed of the default engine (first audio p95 at 200
+requests 94-95 vs 93-96 ms) and less memory than it (20.6 vs 21.9 GiB peak: 4 adapters instead of 11, plus
+teacher-v3's merged MLP weights, 1 GB). In int8 the tagged requests run the merged int8 weights at every batch size,
+as the adapters do; SmoothQuant statistics are the base model's (teacher-v3's own, max-combined with them, changed
+nothing on #2). A 2:4 sparse FFN (sparse24) cannot take the tagged adapter's MLP LoRA: the engine refuses to start.
 """
 
 from __future__ import annotations

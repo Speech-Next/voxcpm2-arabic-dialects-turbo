@@ -41,3 +41,57 @@ def test_seg_swiglu_and_down_follow_the_remap(M):
         assert torch.equal(hq[rows], ref_hq) and torch.equal(hs[rows], ref_hs), entry
         ref = _gemm(ref_hq, ref_hs, d, torch.bfloat16, residual=x[rows])
         assert torch.equal(out[rows], ref), entry
+
+
+def _layer(lora_targets, prune: bool):
+    """One base_lm decoder layer (VoxCPM2's shapes) with LoRA on ``lora_targets``, random weights; ``prune``: its MLP
+    weights 2:4-pruned (a sparse24 checkpoint)."""
+    import json
+    import os
+
+    from nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig, VoxCPM2Config
+    from nanovllm_voxcpm.models.voxcpm2.model import Cpm4DecoderLayer
+    from voxcpm_kernels import sparse24 as S
+
+    cfg_path = os.path.join(os.path.dirname(__file__), "data", "voxcpm2_config.json")
+    if not os.path.exists(cfg_path):
+        pytest.skip("no VoxCPM2 config.json at tests/data")
+    lm = VoxCPM2Config.model_validate(json.load(open(cfg_path))).lm_config
+    lora = LoRAConfig(max_loras=2, max_lora_rank=8, target_modules_lm=lora_targets, max_mlp_loras=1)
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device("cuda")
+    try:
+        layer = Cpm4DecoderLayer(lm, True, lora, use_rope=True)
+    finally:
+        torch.set_default_device(None)
+        torch.set_default_dtype(torch.float32)
+    g = torch.Generator(device="cuda").manual_seed(0)
+    for name, p in layer.named_parameters():
+        if "lora" in name:
+            continue
+        with torch.no_grad():
+            p.copy_(torch.ones_like(p) if p.dim() == 1 else torch.randn(p.shape, device="cuda", generator=g) * 0.02)
+    if prune:
+        with torch.no_grad():
+            for m in (layer.mlp.gate_up_proj, layer.mlp.down_proj):
+                m.weight.copy_(S.prune_24(m.weight.float()).to(m.weight.dtype))
+    return layer
+
+
+def test_mlp_lora_on_a_sparse_ffn_fails_at_load():
+    """Dialect routing (a tagged adapter's MLP LoRA) and a 2:4 sparse FFN do not mix: the fused layer refuses at
+    construction; the same sparse layer with attention-only LoRA keeps its sparse FFN."""
+    from voxcpm_kernels import sparse24 as S
+    from voxcpm_kernels.fused_layer import FusedCpm4Layer
+
+    if not S.available():
+        pytest.skip("sparse24 extension unavailable")
+    attn = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    fused = FusedCpm4Layer(_layer(attn, prune=True), quantize=True, min_rows=128, name="base_lm.layers.0")
+    assert fused.sp24 is not None and fused.mlp_stacks is None
+    with pytest.raises(NotImplementedError, match="2:4 sparse FFN"):
+        FusedCpm4Layer(_layer(attn + ["gate_proj", "up_proj", "down_proj"], prune=True), quantize=True, min_rows=128,
+                       name="base_lm.layers.0")
+    dense = FusedCpm4Layer(_layer(attn + ["gate_proj", "up_proj", "down_proj"], prune=False), quantize=True,
+                           min_rows=128, name="base_lm.layers.0")
+    assert dense.sp24 is None and dense.mlp_stacks is not None

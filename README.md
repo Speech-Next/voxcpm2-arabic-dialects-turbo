@@ -87,14 +87,19 @@ from nanovllm_voxcpm import RoutedDialectTTS
 tts = await RoutedDialectTTS.load()   # same arguments and methods as DialectTTS; dialects: tts.dialects
 ```
 
-| mode | engine | CER | WER | UTMOS | dialect ID | first audio p95, 200 requests | GPU memory |
-|---|---|---:|---:|---:|---:|---:|---:|
-| fast | default | 5.4 % | 16.0 % | 2.14 | 67 % | 93-96 ms | 21.9 GiB |
-| fast | routed | 4.9 % | 14.7 % | 2.10 | 64 % | 94-95 ms | 20.6 GiB |
-| quality | default | 5.3 % | 15.5 % | 2.40 | 67 % | 271 ms | 20.8 GiB |
-| quality | routed | 4.6 % | 14.1 % | 2.37 | 63 % | 271 ms | 19.5 GiB |
+| mode | engine | CER | WER | UTMOS | dialect ID |
+|---|---|---:|---:|---:|---:|
+| fast, 3 steps (default) | default | 5.3 % | 16.0 % | 2.23 | 67 % |
+| fast, 3 steps (default) | routed | 4.7 % | 14.1 % | 2.20 | 64 % |
+| fast, 2 steps | default | 5.4 % | 16.0 % | 2.14 | 67 % |
+| fast, 2 steps | routed | 4.9 % | 14.7 % | 2.10 | 64 % |
+| quality | default | 5.3 % | 15.5 % | 2.40 | 67 % |
+| quality | routed | 4.6 % | 14.1 % | 2.37 | 63 % |
 
 Same held-out set and settings as above (int8), the default re-measured next to the routed engine. Routing lowers CER
-and WER (WER significantly in both modes, CER in quality mode) and costs 0.03-0.04 UTMOS and 3-4 points of dialect ID.
+and WER (significantly, except CER with 2 steps) and costs 0.03-0.04 UTMOS and 3-4 points of dialect ID against the
+default with the same LocDiT. Speed and memory, measured with 2 steps and in quality mode (int8, 600 KV blocks): first
+audio p95 at 200 requests 94-95 ms routed vs 93-96 ms default (quality mode 270 vs 271 ms), peak GPU memory 20.6 vs
+21.9 GiB (19.5 vs 20.8 GiB).
 
 License: MIT. VoxCPM2 weights: Apache-2.0.
