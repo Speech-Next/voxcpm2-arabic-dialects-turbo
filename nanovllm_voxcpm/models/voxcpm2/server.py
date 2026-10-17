@@ -536,7 +536,8 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
             t_put = time.perf_counter()
             items = []
             for seq in output:
-                items.append(stream_item(seq.seq_id, seq.custom_payload.generated_waveforms[-1]))
+                if not seq.custom_payload.muted:  # (leading silence past TurboConfig.lead_silence_patches)
+                    items.append(stream_item(seq.seq_id, seq.custom_payload.generated_waveforms[-1]))
                 if seq.is_finished and not getattr(seq.custom_payload, "chained", False):  # head start continues
                     items.append({"type": "stream", "id": seq.seq_id, "data": None})
             if items:

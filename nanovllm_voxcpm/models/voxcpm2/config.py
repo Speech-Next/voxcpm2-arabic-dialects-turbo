@@ -165,6 +165,11 @@ class TurboConfig(BaseModel):
     head_tokens: int = 0
     head_patches: int = 3
     head_min_rest: int = 8
+    # A stream's leading silence (-1 = as generated): after this many silent patches (below -50 dBFS) at its start,
+    # further silent patches are generated but not streamed, until the first patch with sound. With head start, a
+    # head of nothing but silence (3 patches) was followed by a continuation that again began with a pause: 0.77 s
+    # before the first word (2.5 % of #2's clips; 0.1 % without head start). Speech is unchanged.
+    lead_silence_patches: int = -1
 
 
 class VoxCPM2Config(BaseModel):

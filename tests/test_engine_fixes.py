@@ -522,6 +522,51 @@ def test_continuation_survives_unregister_voice_and_goes_first():
     assert eng.is_finished() and eng.model_runner.slots == set()
 
 
+def _streamed(eng, seq_id, steps=40):
+    """Per generated patch of ``seq_id``'s stream (head and continuation): True = streamed (the server skips muted)."""
+    out = []
+    for _ in range(steps):
+        if eng.is_finished():
+            break
+        out += [not s.custom_payload.muted for s in eng.step() if s.seq_id == seq_id]
+    return out
+
+
+def _silent_first(n):
+    """A runner output whose patch is silent for the first n patches of each stream, then with sound; a pause
+    (silent patches 9 and 10) later in the sentence."""
+    count = {}
+
+    def make(t, is_prefill):
+        k = count[t.seq_id] = count.get(t.seq_id, 0) + 1
+        return {"latents": np.full((PATCH, FEAT), 0.5, np.float32), "stop_flag": 0,
+                "waveforms": np.ones(8, np.float32), "patch_silent": k <= n or k in (9, 10)}
+    return make
+
+
+@pytest.mark.parametrize("cap, silent, muted", [
+    (2, 5, [3, 4, 5]),  # a silent head (patches 1-3) and a continuation that pauses again: 3 of them not streamed
+    (2, 2, []),  # a natural pause of 2 patches stays
+    (-1, 5, []),  # cap off: as generated
+])
+def test_leading_silence_past_the_cap_is_not_streamed(cap, silent, muted):
+    eng = _voxcpm2_engine(max_model_len=128)
+    eng.lead_silence_patches = cap
+    eng.model_runner.make_output = _silent_first(silent)
+    eng.add_request("r", _words(20), max_generate_length=14)
+    streamed = _streamed(eng, "r")
+    assert len(streamed) == 14  # every patch was generated (the head's 3 and the continuation's 11)
+    assert [k for k, on in enumerate(streamed, 1) if not on] == muted  # the later pause (9, 10) always streams
+
+
+def test_leading_silence_without_head_start():
+    eng = _voxcpm2_engine(max_model_len=128)
+    eng.lead_silence_patches = 1
+    eng.model_runner.make_output = _silent_first(3)
+    eng.add_request("r", _words(20), max_generate_length=6, head_start=False)
+    assert _streamed(eng, "r") == [True, False, False, True, True, True]
+
+
 def test_cancel_while_the_head_ends_also_cancels_its_continuation():
     eng = _voxcpm2_engine(max_model_len=128)
     eng.add_request("r1", _words(20), max_generate_length=20)
