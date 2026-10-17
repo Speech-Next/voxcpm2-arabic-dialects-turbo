@@ -24,7 +24,9 @@ import numpy as np
 from nanovllm_voxcpm.arabic_text import has_arabic, normalize as normalize_text
 
 DEFAULT_MODEL = "VoxCPM-Kernel/VoxCPM2-Arabic-Dialects"
-DEFAULT_DIT = "VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k2_dmd.pt"  # distilled from these adapters
+# 3 steps, distilled from these adapters; ":student_k2_dmd.pt", 2 steps, is 11 ms faster at 200 requests and less
+# natural (the model card)
+DEFAULT_DIT = "VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k3.pt"
 NOT_ARABIC = frozenset({"hindi_english"})  # dialects whose text is not read as Arabic
 _INT16_SCALE = np.float32(1 / 32768)
 
