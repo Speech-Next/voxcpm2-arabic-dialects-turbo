@@ -12,7 +12,27 @@ from nanovllm_voxcpm.models.voxcpm2.model import VoxCPM2Model
 
 _LORA_WEIGHTS_FILE = "lora_weights.safetensors"
 _LORA_CONFIG_FILE = "lora_config.json"
+# a tagged model's training state (VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3 lora/): its LoRA, its dialect tags'
+# embeddings (base_lm.embed_tokens.tag_embed) and train_state.json ({"lora": {r, alpha, ...}, "dialects": [...]})
+_TAGGED_DIR = "lora"
+_TAGGED_WEIGHTS_FILE = "trainable.safetensors"
+_TAGGED_STATE_FILE = "train_state.json"
+_TAG_EMBED_KEY = "base_lm.embed_tokens.tag_embed"
 _TARGET_ORDER = {"q": 0, "k": 1, "v": 2}
+
+
+def is_tagged_adapter(path: str) -> bool:
+    """A tagged model's directory with its unmerged training state (lora/trainable.safetensors, train_state.json)
+    and dialects.json: served as an adapter of the base model, its tags as extra embedding rows."""
+    p = Path(path)
+    return (p / _TAGGED_DIR / _TAGGED_WEIGHTS_FILE).is_file() and (p / _TAGGED_DIR / _TAGGED_STATE_FILE).is_file() \
+        and (p / "dialects.json").is_file()
+
+
+def tagged_adapter_state(path: str) -> dict:
+    """train_state.json of a tagged adapter (is_tagged_adapter)."""
+    with (Path(path) / _TAGGED_DIR / _TAGGED_STATE_FILE).open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 @dataclass
@@ -25,17 +45,33 @@ class _CollectedModule:
 
 
 def load_voxcpm2_lora_checkpoint(path: str, *, tp_size: int = 1) -> LoRAModelPayload | list[LoRAModelPayload]:
-    checkpoint_dir = Path(path)
-    _validate_checkpoint_dir(checkpoint_dir)
-    checkpoint_config = _load_checkpoint_config(checkpoint_dir)
+    """An adapter directory (lora_weights.safetensors, lora_config.json) or a tagged model's (is_tagged_adapter: its
+    LoRA, flagged exact_merge, and its tag embeddings, in the order of train_state.json's "dialects")."""
+    tagged = is_tagged_adapter(path)
+    checkpoint_dir = Path(path) / _TAGGED_DIR if tagged else Path(path)
+    if tagged:
+        checkpoint_config = tagged_adapter_state(path)["lora"]
+        weights_file = _TAGGED_WEIGHTS_FILE
+    else:
+        _validate_checkpoint_dir(checkpoint_dir)
+        checkpoint_config = _load_checkpoint_config(checkpoint_dir)
+        weights_file = _LORA_WEIGHTS_FILE
     alpha = _resolve_alpha(checkpoint_config)
-    collected_modules = _load_collected_modules(checkpoint_dir)
+    collected_modules = _load_collected_modules(checkpoint_dir, weights_file)
     if not collected_modules:
         raise ValueError("LoRA checkpoint does not contain any supported module weights")
 
     rank = _resolve_rank(collected_modules, checkpoint_config)
     base_modules = {name: _build_module_payload(module, rank, alpha) for name, module in collected_modules.items()}
     base_payload = LoRAModelPayload(modules=base_modules, rank=rank, alpha=alpha)
+    if tagged:
+        if tp_size > 1:
+            raise ValueError("a tagged adapter needs tensor parallel size 1")
+        with safe_open(checkpoint_dir / weights_file, framework="pt", device="cpu") as f:
+            if _TAG_EMBED_KEY not in f.keys():
+                raise ValueError(f"tagged adapter without {_TAG_EMBED_KEY}: {checkpoint_dir / weights_file}")
+            base_payload.tag_embed = f.get_tensor(_TAG_EMBED_KEY).to(torch.float32)
+        base_payload.exact_merge = True
     if tp_size <= 1:
         return _pin_payload(base_payload)
     return [_pin_payload(_shard_payload_for_rank(base_payload, rank_idx, tp_size)) for rank_idx in range(tp_size)]
@@ -93,14 +129,15 @@ def _resolve_rank(collected_modules: dict[str, _CollectedModule], checkpoint_con
     return rank
 
 
-def _load_collected_modules(checkpoint_dir: Path) -> dict[str, _CollectedModule]:
+def _load_collected_modules(checkpoint_dir: Path,
+                            weights_file: str = _LORA_WEIGHTS_FILE) -> dict[str, _CollectedModule]:
     # Adapter weights are typically HtoD-copied on the first request that
     # needs them. We pin the CPU staging tensors up front so `.to("cuda",
     # non_blocking=True)` at slot-load time is a real DMA transfer (pinned
     # memory path is ~2x faster than pageable and does not block the CPU).
     cuda_available = torch.cuda.is_available()
     collected: dict[str, _CollectedModule] = {}
-    with safe_open(checkpoint_dir / _LORA_WEIGHTS_FILE, framework="pt", device="cpu") as f:
+    with safe_open(checkpoint_dir / weights_file, framework="pt", device="cpu") as f:
         for key in f.keys():
             parsed = _parse_weight_key(key)
             if parsed is None:
@@ -229,7 +266,9 @@ def _pin_payload(payload: LoRAModelPayload) -> LoRAModelPayload:
             effective_rank=module_payload.effective_rank,
             scaling=module_payload.scaling,
         )
-    return LoRAModelPayload(modules=pinned_modules, rank=payload.rank, alpha=payload.alpha)
+    return LoRAModelPayload(modules=pinned_modules, rank=payload.rank, alpha=payload.alpha,
+                            tag_embed=payload.tag_embed, tag_row_start=payload.tag_row_start,
+                            exact_merge=payload.exact_merge)
 
 
 def _shard_module_payload(module_name: str, module_payload: LoRAModulePayload, rank: int, tp_size: int):

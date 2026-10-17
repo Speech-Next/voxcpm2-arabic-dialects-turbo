@@ -11,6 +11,10 @@ the dialects in turn. Arabic requests speak sentence i of ar_dialects.txt, hindi
 warm-up pairs each request with another voice: the engine caches a voice's first request, text included, and
 repeating it would measure the cache. Prints, per level, TTFB average / p50 / p95 and the average time until the last
 audio chunk.
+
+--route: per-dialect routing (RoutedDialectTTS: the adapters the routes use and --tagged-model's LoRA in one engine);
+the voices' dialects then follow its routing table (e.g. Saudi and Hindi voices on the adapters, Jordanian,
+Palestinian and Qatari ones on teacher-v3).
 """
 
 import argparse
@@ -20,7 +24,8 @@ import time
 
 import numpy as np
 
-from nanovllm_voxcpm import DialectTTS
+from nanovllm_voxcpm import DialectTTS, RoutedDialectTTS
+from nanovllm_voxcpm.dialect_routing import DEFAULT_TAGGED_MODEL
 from nanovllm_voxcpm.dialect_tts import DEFAULT_DIT, DEFAULT_MODEL
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -67,11 +72,21 @@ async def burst(tts, reqs):
 
 async def main(args):
     levels = [int(x) for x in args.levels.split(",")]
-    async with await DialectTTS.load(args.model, args.dit, max_concurrency=max(levels), kv_blocks=args.kv_blocks) as tts:
+    kw = dict(max_concurrency=args.max_concurrency or max(levels), kv_blocks=args.kv_blocks,
+              w8a8=args.precision == "int8")
+    if args.route:
+        tts = await RoutedDialectTTS.load(args.model, args.tagged_model, args.dit, **kw)
+    else:
+        tts = await DialectTTS.load(args.model, args.dit, **kw)
+    async with tts:
         folder = voice_folder(args.voices)
         voices = sorted(f[:-4] for f in os.listdir(folder) if f.endswith(".wav"))
         for v in voices:
             await tts.add_voice(v, os.path.join(folder, f"{v}.wav"))
+        if args.route:
+            routes = [tts.route(d) for _, d, _ in requests(len(voices), voices, tts.dialects)]
+            n_adapters = sum(r.model == "adapters" for r in routes)
+            print(f"routing: {n_adapters} of {len(voices)} voices on the adapters model, the others on the tagged one")
         # every voice once: a voice's first request also encodes its reference, which no measured burst should pay
         await burst(tts, requests(len(voices), voices, tts.dialects, shift=3))
         print("| requests at once | TTFB avg | TTFB p50 | TTFB p95 | whole sentence, avg |")
@@ -97,6 +112,10 @@ if __name__ == "__main__":
     ap.add_argument("--dit", default=DEFAULT_DIT, help="'none' for the model's own LocDiT")
     ap.add_argument("--kv-blocks", type=int, default=600, help="KV cache blocks of 256 tokens; 400 for --dit none at "
                                                                "200 requests (its CUDA graphs are larger)")
+    ap.add_argument("--max-concurrency", type=int, help="requests the engine runs at once (default: the largest level)")
+    ap.add_argument("--precision", choices=["int8", "bf16"], default="int8", help="the layers")
+    ap.add_argument("--route", action="store_true", help="per-dialect routing: the adapters and --tagged-model's LoRA")
+    ap.add_argument("--tagged-model", default=DEFAULT_TAGGED_MODEL)
     args = ap.parse_args()
     args.dit = None if args.dit == "none" else args.dit
     asyncio.run(main(args))

@@ -127,9 +127,10 @@ def _tile_order(pid, NUM_N, NUM_T, GROUP_T: tl.constexpr):
 
 @triton.jit
 def _seg_w8a8_gemm(
-    a_ptr, w_ptr, c_ptr, a_scale_ptr, w_scale_ptr, bias_ptr, tiles_ptr,
+    a_ptr, w_ptr, c_ptr, a_scale_ptr, w_scale_ptr, bias_ptr, tiles_ptr, remap_ptr,
     M, N, K, NUM_N, NUM_T,
-    HAS_BIAS: tl.constexpr, GROUP_T: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr, HAS_REMAP: tl.constexpr, GROUP_T: tl.constexpr, BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid = tl.program_id(0)
     t, pid_n = _tile_order(pid, NUM_N, NUM_T, GROUP_T)
@@ -137,7 +138,10 @@ def _seg_w8a8_gemm(
     r1 = tl.minimum(tl.load(tiles_ptr + 3 * t + 1), M)  # a graph's table may cover more rows than its batch
     if r0 >= r1:
         return
-    wi = tl.load(tiles_ptr + 3 * t + 2).to(tl.int64)
+    wi = tl.load(tiles_ptr + 3 * t + 2)
+    if HAS_REMAP:  # a stack holding only some adapters' weights: the tile's weight index (slot + 1) -> its entry
+        wi = tl.load(remap_ptr + wi)
+    wi = wi.to(tl.int64)
     rm = r0 + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
@@ -160,9 +164,10 @@ def _seg_w8a8_gemm(
 
 @triton.jit
 def _seg_w8a8_gemm_res(
-    a_ptr, w_ptr, c_ptr, a_scale_ptr, w_scale_ptr, res_ptr, tiles_ptr,
+    a_ptr, w_ptr, c_ptr, a_scale_ptr, w_scale_ptr, res_ptr, tiles_ptr, remap_ptr,
     M, N, K, NUM_N, NUM_T,
-    GROUP_T: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    HAS_REMAP: tl.constexpr, GROUP_T: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     """C = dequant(A @ W_seg^T) + RES."""
     pid = tl.program_id(0)
@@ -171,7 +176,10 @@ def _seg_w8a8_gemm_res(
     r1 = tl.minimum(tl.load(tiles_ptr + 3 * t + 1), M)  # a graph's table may cover more rows than its batch
     if r0 >= r1:
         return
-    wi = tl.load(tiles_ptr + 3 * t + 2).to(tl.int64)
+    wi = tl.load(tiles_ptr + 3 * t + 2)
+    if HAS_REMAP:
+        wi = tl.load(remap_ptr + wi)
+    wi = wi.to(tl.int64)
     rm = r0 + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rk = tl.arange(0, BLOCK_K)
@@ -236,6 +244,50 @@ def _seg_w8a8_gemm_qkv_rope(
     tl.store(c_ptr + offs + HALF, x2.to(c_ptr.dtype.element_ty), mask=rmask[:, None])
 
 
+@triton.jit
+def _seg_w8a8_gemm_swiglu(
+    a_ptr, w_ptr, h_ptr, amax_ptr, a_scale_ptr, w_scale_ptr, tiles_ptr, remap_ptr,
+    M, N, K, NUM_N, NUM_T,
+    HAS_REMAP: tl.constexpr, GROUP_T: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """fused_layer._w8a8_gemm_swiglu with one weight per row segment: interleaved gate/up rows, h = silu(g) * u
+    [M, N/2] and the per-(row, N-tile) max |h| for the quant pass."""
+    pid = tl.program_id(0)
+    t, pid_n = _tile_order(pid, NUM_N, NUM_T, GROUP_T)
+    r0 = tl.load(tiles_ptr + 3 * t)
+    r1 = tl.minimum(tl.load(tiles_ptr + 3 * t + 1), M)
+    if r0 >= r1:
+        return
+    wi = tl.load(tiles_ptr + 3 * t + 2)
+    if HAS_REMAP:
+        wi = tl.load(remap_ptr + wi)
+    wi = wi.to(tl.int64)
+    rm = r0 + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    a = a_ptr + rm.to(tl.int64)[:, None] * K + rk[None, :]
+    b = w_ptr + wi * N * K + rn.to(tl.int64)[None, :] * K + rk[:, None]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        kk = k * BLOCK_K + rk
+        acc += tl.dot(tl.load(a, mask=(rm[:, None] < r1) & (kk[None, :] < K), other=0),
+                      tl.load(b, mask=(rn[None, :] < N) & (kk[:, None] < K), other=0))
+        a += BLOCK_K
+        b += BLOCK_K
+    rmask = rm < r1
+    out = acc.to(tl.float32) * tl.load(a_scale_ptr + rm, mask=rmask, other=0.0)[:, None]
+    out = out * tl.load(w_scale_ptr + wi * N + rn, mask=rn < N, other=0.0)[None, :]
+    g, u = tl.split(tl.reshape(out, (BLOCK_M, BLOCK_N // 2, 2)))
+    h = (g / (1.0 + tl.exp(-g)) * u).to(h_ptr.dtype.element_ty)
+    HN: tl.constexpr = BLOCK_N // 2
+    rh = pid_n * HN + tl.arange(0, HN)
+    half = N // 2
+    rows = rm.to(tl.int64)
+    tl.store(h_ptr + rows[:, None] * half + rh[None, :], h, mask=rmask[:, None] & (rh[None, :] < half))
+    tl.store(amax_ptr + rows * NUM_N + pid_n, tl.max(tl.abs(h.to(tl.float32)), axis=1), mask=rmask)
+
+
 def _block_m(M: int) -> int:
     return 128 if M > 256 else 64
 
@@ -262,27 +314,58 @@ def tiles_for(slots_host, M: int, domain: str, n_weights: int, cache: dict | Non
 # (BLOCK_K, num_warps, num_stages) per kind and BLOCK_M; BLOCK_N = 128 (head_dim for the RoPE kernel). Large tiles for
 # prefill-size calls as int8_linear._LARGE (measured at the A10's 150 W cap), 64-row tiles for decode-size calls.
 _CFG = {("plain", 128): (128, 8, 3), ("res", 128): (128, 8, 3), ("rope", 128): (128, 8, 3),
-        ("plain", 64): (128, 4, 3), ("res", 64): (128, 4, 3), ("rope", 64): (128, 4, 3)}
+        ("plain", 64): (128, 4, 3), ("res", 64): (128, 4, 3), ("rope", 64): (128, 4, 3),
+        ("swiglu", 128): (128, 8, 3), ("swiglu", 64): (128, 4, 3)}
 
 
-def seg_gemm(q, s, w_stack, ws_stack, bias, out_dtype, tiles, n_tiles, bm, residual=None):
-    """int8 [M, K] x per-segment int8 [N, K] -> [M, N] (+ residual)."""
+def seg_gemm(q, s, w_stack, ws_stack, bias, out_dtype, tiles, n_tiles, bm, residual=None, remap=None):
+    """int8 [M, K] x per-segment int8 [N, K] -> [M, N] (+ residual). remap: [1 + slots] int32, a tile's weight index
+    (slot + 1) -> its entry of ``w_stack`` (a stack of only some adapters' weights, e.g. the MLP's)."""
     M, K = q.shape
     N = w_stack.shape[1]
     bn = 128
     num_n = triton.cdiv(N, bn)
     c = torch.empty(M, N, device=q.device, dtype=out_dtype)
     grid = (n_tiles * num_n,)
+    rp = remap if remap is not None else tiles
     if residual is not None:
         bk, warps, stages = _CFG[("res", bm)]
-        _seg_w8a8_gemm_res[grid](q, w_stack, c, s, ws_stack, residual.contiguous(), tiles, M, N, K, num_n, n_tiles,
-                                 GROUP_T=8, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, num_warps=warps, num_stages=stages)
+        _seg_w8a8_gemm_res[grid](q, w_stack, c, s, ws_stack, residual.contiguous(), tiles, rp, M, N, K, num_n, n_tiles,
+                                 HAS_REMAP=remap is not None, GROUP_T=8, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk,
+                                 num_warps=warps, num_stages=stages)
     else:
         bk, warps, stages = _CFG[("plain", bm)]
-        _seg_w8a8_gemm[grid](q, w_stack, c, s, ws_stack, bias if bias is not None else ws_stack, tiles, M, N, K, num_n,
-                             n_tiles, HAS_BIAS=bias is not None, GROUP_T=8, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk,
-                             num_warps=warps, num_stages=stages)
+        _seg_w8a8_gemm[grid](q, w_stack, c, s, ws_stack, bias if bias is not None else ws_stack, tiles, rp, M, N, K,
+                             num_n, n_tiles, HAS_BIAS=bias is not None, HAS_REMAP=remap is not None, GROUP_T=8,
+                             BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, num_warps=warps, num_stages=stages)
     return c
+
+
+def seg_swiglu_gemm_quant(q, s, w_stack, ws_stack, out_dtype, tiles, n_tiles, bm, remap=None):
+    """fused_layer.swiglu_gemm_quant with one weight per row segment (stacked ``swiglu_weights`` layers): int8
+    silu(gate) * up [M, N/2] + per-row scales for the down GEMM."""
+    from .fused_layer import _quant_rows_partials
+
+    M, K = q.shape
+    N = w_stack.shape[1]
+    half = N // 2
+    bn = 128
+    num_n = triton.cdiv(N, bn)
+    h = torch.empty(M, half, device=q.device, dtype=out_dtype)
+    amax = torch.empty(M, num_n, device=q.device, dtype=torch.float32)
+    bk, warps, stages = _CFG[("swiglu", bm)]
+    _seg_w8a8_gemm_swiglu[(n_tiles * num_n,)](
+        q, w_stack, h, amax, s, ws_stack, tiles, remap if remap is not None else tiles, M, N, K, num_n, n_tiles,
+        HAS_REMAP=remap is not None, GROUP_T=8, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, num_warps=warps,
+        num_stages=stages,
+    )
+    hq = torch.empty(M, half, device=q.device, dtype=torch.int8)
+    scale = torch.empty(M, device=q.device, dtype=torch.float32)
+    br, bc = 8, 1024
+    _quant_rows_partials[(triton.cdiv(M, br), triton.cdiv(half, bc))](
+        h, amax, hq, scale, M, half, num_n, NT_P2=triton.next_power_of_2(num_n), BLOCK_R=br, BLOCK_C=bc, num_warps=4,
+    )
+    return hq, scale
 
 
 def seg_qkv_rope_gemm(q, s, w_stack, ws_stack, out_dtype, positions, cos, sin, n_rope_heads, tiles, n_tiles, bm):

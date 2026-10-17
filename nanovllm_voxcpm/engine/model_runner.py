@@ -563,7 +563,7 @@ class BaseModelRunner:
             )
         slot_modules[slot_id] = list(payload.modules.keys())
         for fused in self._fused_lora_layers():
-            fused.refresh_lora(slot_id)
+            fused.refresh_lora(slot_id, payload)
 
     def _fused_lora_layers(self) -> list:
         """Fused decoder layers holding merged per-adapter weights (voxcpm_kernels FusedCpm4Layer.stacks)."""

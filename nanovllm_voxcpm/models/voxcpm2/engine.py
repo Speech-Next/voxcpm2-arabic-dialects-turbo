@@ -1,3 +1,5 @@
+import json
+import os
 import re
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -13,7 +15,7 @@ from nanovllm_voxcpm.config import Config
 from nanovllm_voxcpm.engine.llm_engine import LLMEngineBase
 from nanovllm_voxcpm.engine.sequence import Sequence
 from nanovllm_voxcpm.models.voxcpm2.config import VoxCPM2Config
-from nanovllm_voxcpm.models.voxcpm2.lora_loader import load_voxcpm2_lora_checkpoint
+from nanovllm_voxcpm.models.voxcpm2.lora_loader import load_voxcpm2_lora_checkpoint, tagged_adapter_state
 from nanovllm_voxcpm.models.voxcpm2.runner import RunnerTask, VoxCPM2Payload, VoxCPM2Runner
 from nanovllm_voxcpm.models.voxcpm2.utils import mask_multichar_chinese_tokens
 
@@ -96,6 +98,9 @@ class VoxCPM2Engine(LLMEngineBase):
     locenc_cache_enabled = False
     head_tokens, head_patches, head_min_rest = 0, 3, 8  # head start off
     _pretok_cache: dict | None = None
+    _tag_remap: dict = {}  # (instances built without __init__, e.g. in tests: no tagged adapters)
+    tag_rows = _tag_rows_used = 0
+
     def __init__(self, config: Config[VoxCPM2Config]):
         self.n_decode_pad_frames = 12
         self.feat_dim = config.model_config.feat_dim
@@ -107,6 +112,12 @@ class VoxCPM2Engine(LLMEngineBase):
         self.block_size = config.kvcache_block_size
         self.max_model_len = config.max_model_len
         self.tokenizer = mask_multichar_chinese_tokens(LlamaTokenizerFast.from_pretrained(config.model))
+        # tagged adapters (a tagged model's LoRA and dialect tags): their requests' tag ids -> the extra embedding
+        # rows after the vocabulary (LoRAConfig.tag_rows) that hold the tags' trained embeddings
+        self.vocab_size = config.model_config.lm_config.vocab_size
+        self.tag_rows = config.lora_config.tag_rows if config.lora_config is not None else 0
+        self._tag_rows_used = 0
+        self._tag_remap: dict[str, dict[int, int]] = {}
         turbo = config.model_config.turbo
         self.ref_prefix_cache_enabled = turbo.ref_prefix_cache
         self.ref_prefix_cache_size = turbo.ref_prefix_cache_size
@@ -119,7 +130,51 @@ class VoxCPM2Engine(LLMEngineBase):
 
     def register_lora(self, name: str, path: str) -> int:
         payload = load_voxcpm2_lora_checkpoint(path, tp_size=self.model_runner.world_size)
-        return super().register_lora(name, payload)
+        tagged = None
+        if getattr(payload, "tag_embed", None) is not None:
+            tagged = self._tagged_adapter(path, payload)
+        adapter_id = super().register_lora(name, payload)
+        if tagged is not None:
+            remap, tokenizer = tagged
+            self._tag_remap = {**self._tag_remap, name: remap}
+            self._tag_rows_used += len(remap)
+            if tokenizer is not None:
+                self.tokenizer = tokenizer
+                self._pretok_cache = self._pretok_pending = None
+        return adapter_id
+
+    def unregister_lora(self, name: str) -> None:
+        super().unregister_lora(name)
+        self._tag_remap = {k: v for k, v in self._tag_remap.items() if k != name}  # (its rows stay allocated)
+
+    def _tagged_adapter(self, path: str, payload) -> tuple[dict[int, int], object]:
+        """A tagged adapter's (tag id -> extra embedding row) map and the tokenizer that reads its tags as one token
+        each (its own: the base vocabulary with the tags as special tokens; None = the engine's reads them already).
+        Sets the payload's tag_row_start. Its requests, and only theirs, read the tags' trained rows."""
+        n = payload.tag_embed.shape[0]
+        if self._tag_rows_used + n > self.tag_rows:
+            raise ValueError(f"a tagged adapter needs {n} extra embedding rows: LoRAConfig.tag_rows={self.tag_rows}, "
+                             f"{self._tag_rows_used} in use")
+        dialects = tagged_adapter_state(path)["dialects"]  # the order of tag_embed's rows
+        with open(os.path.join(path, "dialects.json"), encoding="utf-8") as f:
+            spec = json.load(f)["tags"]
+        tags = [spec[d] for d in dialects]
+        if len(tags) != n:
+            raise ValueError(f"{n} tag embeddings for {len(tags)} dialects")
+        tok = mask_multichar_chinese_tokens(LlamaTokenizerFast.from_pretrained(path))
+        base_vocab, vocab = self.tokenizer.tokenizer.get_vocab(), tok.tokenizer.get_vocab()
+        if vocab != base_vocab:
+            raise ValueError("a tagged adapter's tokenizer must have the base model's vocabulary (its tags special)")
+        ids = []
+        for t in tags:
+            got = tok(t)
+            if len(got) != 1:
+                raise ValueError(f"the tag {t!r} is not one token in the tagged adapter's tokenizer: {got}")
+            ids.append(got[0])
+        engine_reads_tags = all(self.tokenizer(t) == [i] for t, i in zip(tags, ids))
+        payload.tag_row_start = self.vocab_size + self._tag_rows_used
+        remap = {i: payload.tag_row_start + k for k, i in enumerate(ids)}
+        return remap, None if engine_reads_tags else tok
 
     def _prefix_match(self, seq: Sequence[VoxCPM2SeqPayload]) -> tuple[int, int]:
         """(cached block, matched tokens) for the longest prefix ``seq`` shares with the cached request of its voice.
@@ -388,6 +443,9 @@ class VoxCPM2Engine(LLMEngineBase):
 
         if text_tokens is None:
             text_tokens = self._text_ids(prompt_text, target_text)
+        remap = self._tag_remap.get(lora_name) if lora_name is not None and self._tag_remap else None
+        if remap:  # a tagged adapter's request: its tags read their trained rows
+            text_tokens = [remap.get(t, t) for t in text_tokens]
         text_tokens = list(text_tokens) + [self.audio_start_token]
         audio_feat = np.zeros((len(text_tokens), self.patch_size, self.feat_dim), dtype=np.float32)
         feat_masks = [False] * len(text_tokens)
