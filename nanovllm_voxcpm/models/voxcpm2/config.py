@@ -165,6 +165,14 @@ class TurboConfig(BaseModel):
     head_tokens: int = 0
     head_patches: int = 3
     head_min_rest: int = 8
+    # Head start under load (0 = every head head_patches long): a head gets up to this many patches, the fewest whose
+    # audio lasts, with head_margin_ms to spare, until its continuation is prefilled after those queued ahead of it
+    # (the heads in their head phase), from the predicted step times (engine/step_cost.py). A burst's heads all end
+    # together and their continuations' prefill (~86 tokens a stream in the user's benchmark: ~0.35 s for 100,
+    # ~0.5 s for 150 streams on one A10) outlasted the 480 ms of a 3-patch head: the players ran dry. Heads that
+    # start with fewer streams ahead of them stay head_patches long; time to first audio does not change.
+    head_patches_max: int = 0
+    head_margin_ms: int = 150
     # A stream's leading silence (-1 = as generated): after this many silent patches (below -50 dBFS) at its start,
     # further silent patches are generated but not streamed, until the first patch with sound. With head start, a
     # head of nothing but silence (3 patches) was followed by a continuation that again began with a pause: 0.77 s
@@ -178,9 +186,10 @@ class TurboConfig(BaseModel):
     # 150 ms (turbo_config), Poisson arrivals at 30-60 requests/s: no gap above 50 ms (without: 0.5-93 % of the
     # streams), TTFA p95 63-191 -> 85-142 ms, first word p99 548-843 -> 543-624 ms.
     stream_guard_ms: int = 0
-    # Mixed steps (False = a step is prefill or decode, the original): a prefill step while streams play also decodes
-    # them (their next patch, through the prefill path with everything before it cached), so admitting a request no
-    # longer pauses the playing streams. Needs the first patch's LocDiT settings to be the others' (no
+    # Mixed steps (False = a step is prefill or decode, the original): a prefill step that resumes streams (a burst's
+    # continuations: long steps) also decodes the running streams that would run out of audio during it (their next
+    # patch, through the prefill path with everything before it cached); steps of new requests only stay plain, so
+    # first audio is as fast as before. Needs the first patch's LocDiT settings to be the others' (no
     # dit_first_t_span, first_steps or first_cfg_steps of their own).
     mix_decode: bool = False
     # Head start for at most this many streams at once (0 = no limit): a request arriving while this many streams are

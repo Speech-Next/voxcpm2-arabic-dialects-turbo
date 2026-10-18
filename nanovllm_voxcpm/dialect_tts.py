@@ -56,12 +56,14 @@ def resolve(spec: str) -> str:
 def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | None = None, w8a8: bool = True) -> dict:
     """The measured low-latency configuration: distilled 2-step LocDiT (``dit``), int8 layers, head start of
     ``head_tokens`` tokens (0 = off), int16 audio chunks, a stream's leading silence capped at 2 patches (320 ms),
-    and no new request admitted while a playing stream has less than 150 ms of audio queued at its player.
+    no new request admitted while a playing stream has less than 150 ms of audio queued at its player, and for
+    requests that start together (#28): heads of up to 5 patches, enough audio for their continuations' prefill,
+    prefill steps of at most 160 ms while streams play, the continuations' steps decoding the streams short of audio.
     dit_cache: with the original LocDiT (``dit`` None), reuse its middle layers on some solver steps ("light",
     "medium" or a plan, see models/voxcpm2/dit_cache.py).
     w8a8=False: bf16 layers (quality measurements of a model whose SmoothQuant statistics were not calibrated)."""
     cfg = {"pcm16_output": True, "head_tokens": head_tokens, "head_patches": 3, "lead_silence_patches": 2,
-           "stream_guard_ms": 150}
+           "stream_guard_ms": 150, "head_patches_max": 5, "mix_decode": True, "step_cap_ms": 160}
     if w8a8:
         cfg.update(w8a8=True, w8a8_targets=["base_lm", "residual_lm", "feat_encoder", "feat_decoder"])
     if dit and dit_cache:
@@ -133,7 +135,7 @@ def adapters_lora_config(adapters: dict[str, str], max_rank: int | None = None):
 
 async def start_engine(path: str, dit: str | None, adapters: dict[str, str], lora_config, *, max_concurrency: int,
                        head_tokens: int, dit_cache, gpu_memory_utilization: float, kv_blocks: int, device: int,
-                       w8a8: bool, smooth_stats: str | None = None, prefill_tokens: int = 4096):
+                       w8a8: bool, smooth_stats: str | None = None, prefill_tokens: int = 16384):
     """(server, sample rate): the engine on the model directory ``path`` in the low-latency configuration
     (turbo_config), with ``adapters`` (name -> directory) registered. smooth_stats: SmoothQuant statistics for its
     int8 layers (default: the model's own, use_model_calibration). prefill_tokens: the most tokens one prefill step
@@ -150,8 +152,8 @@ async def start_engine(path: str, dit: str | None, adapters: dict[str, str], lor
         else:
             use_model_calibration(path)
     server = VoxCPM.from_pretrained(
-        model=path, devices=[device], max_num_seqs=max_concurrency, max_model_len=1024, max_num_batched_tokens=prefill_tokens,
-        gpu_memory_utilization=gpu_memory_utilization, lora_config=lora_config,
+        model=path, devices=[device], max_num_seqs=max_concurrency, max_model_len=1024,
+        max_num_batched_tokens=prefill_tokens, gpu_memory_utilization=gpu_memory_utilization, lora_config=lora_config,
     )
     await server.wait_for_ready()
     for name, adapter_path in adapters.items():
@@ -235,13 +237,13 @@ class DialectTTS:
     async def load(cls, model: str = DEFAULT_MODEL, dit: str | None = DEFAULT_DIT, *, max_concurrency: int = 256,
                    head_tokens: int = 8, dit_cache: str | dict | None = None, gpu_memory_utilization: float = 0.85,
                    kv_blocks: int = 600, device: int = 0, w8a8: bool = True,
-                   prefill_tokens: int = 4096) -> "DialectTTS":
+                   prefill_tokens: int = 16384) -> "DialectTTS":
         """Start the engine on ``model`` (local directory or Hugging Face repo with ``adapters/<dialect>/``).
 
         dit: the distilled 2-step LocDiT (path or ``repo:file``; None = the model's own LocDiT, slower).
         head_tokens: the first audio comes from the text's first <= head_tokens tokens (0 = from the whole text).
         dit_cache: with dit=None, "light" or "medium": reuse the LocDiT's middle layers on 2 or 4 of its 9 steps.
-        prefill_tokens: the most tokens one prefill step computes.
+        prefill_tokens: the most tokens one prefill step computes (16384: a burst's continuations in fewer steps).
         """
         path = resolve(model)
         tags_path = os.path.join(path, "dialects.json")

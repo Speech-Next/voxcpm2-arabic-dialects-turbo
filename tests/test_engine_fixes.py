@@ -451,21 +451,37 @@ def _playing(sch, *seqs):
         s.append_token(9)
 
 
-def test_a_mixed_step_decodes_the_playing_streams_too():
-    sch = _timed({"a": 0.5}, mix_decode=True)
-    a, b = _seq("a", [1]), _seq("b", [2])
-    sch.add(a)
-    assert sch.schedule() == ([a], True) and sch.mixed == []  # nothing playing yet: a plain prefill
-    a.append_token(9)
-    sch.add(b)
-    assert sch.schedule() == ([b, a], True)  # b's prefill, a's next patch in the same step
-    assert sch.mixed == [a] and sch.last_step == (True, 2, 2)
-    a.append_token(9), b.append_token(9)
-    assert sch.schedule() == ([a, b], False) and sch.mixed == []  # nothing waits: a decode step
-    off = _timed({"a": 0.5})  # mix_decode off: the prefill step pauses a
-    _playing(off, a2 := _seq("a", [1]))
-    off.add(b2 := _seq("b", [2]))
-    assert off.schedule() == ([b2], True) and off.mixed == []
+def _resuming(seq_id, tokens):
+    """A stream waiting to resume (a head start's continuation): it keeps its stream."""
+    seq = _seq(seq_id, tokens)
+    seq.has_stream = True
+    return seq
+
+
+def test_a_resuming_step_decodes_the_streams_short_of_audio_too():
+    buf = {"a": 0.05, "c": 0.5}
+    sch = _timed(buf, mix_decode=True)  # 10 ms a token
+    _playing(sch, a := _seq("a", [1]), c := _seq("c", [3]))
+    sch.add(b := _seq("b", [2]))
+    assert sch.schedule() == ([b], True) and sch.mixed == []  # new requests only (first audio): a plain prefill
+    b.append_token(9)
+    buf["b"], buf["h"] = 0.5, 0.0
+    sch.add(h := _resuming("h", [4, 5]), front=True)
+    assert sch.schedule() == ([h, a], True)  # predicted 50 ms (+ 50): a rides along, b and c sit it out
+    assert sch.mixed == [a] and sch.last_step == (True, 2, 3)
+    off = _timed({"a": 0.05, "h": 0.0})  # mix_decode off: the prefill step pauses a
+    _playing(off, _seq("a", [1]))
+    off.add(h2 := _resuming("h", [4, 5]), front=True)
+    assert off.schedule() == ([h2], True) and off.mixed == []
+
+
+def test_waiting_continuations_go_by_their_queued_audio():
+    buf = {"x": 0.3, "y": 0.1, "z": 0.2}
+    sch = _timed(buf)
+    sch.add(n := _seq("n", [1]))
+    for k in "xyz":
+        sch.add(_resuming(k, [2]), front=True)
+    assert [s.seq_id for s in sch.waiting] == ["y", "z", "x", "n"]
 
 
 def test_the_step_cap_bounds_a_prefill_step_while_streams_play():
@@ -494,10 +510,10 @@ def test_the_step_cap_bounds_a_prefill_step_while_streams_play():
 
 
 def test_the_step_cap_counts_the_mixed_rows():
-    sch = _timed({"a": 0.5, "b": 0.5}, step_cap_ms=50, mix_decode=True)
+    sch = _timed({"a": 0.05, "b": 0.05, "c": 0.0, "d": 0.0}, step_cap_ms=50, mix_decode=True)
     _playing(sch, a := _seq("a", [1]), b := _seq("b", [2]))
-    c, d = _seq("c", [3, 3]), _seq("d", [4, 4])
-    sch.add(c), sch.add(d)
+    c, d = _resuming("c", [3, 3]), _resuming("d", [4, 4])
+    sch.add(c, front=True), sch.add(d, front=True)
     seqs, prefill = sch.schedule()  # a and b ride along: 20 ms, c 20 ms, d would make 60
     assert prefill and seqs == [c, a, b] and list(sch.waiting) == [d]
 
@@ -633,7 +649,7 @@ def test_a_mixed_step_gives_its_running_sequences_their_decode_inputs():
     eng = _MixedEngine()
     eng.add_sequence(_seq("a", [1]))
     eng.step()  # a's prefill
-    eng.add_sequence(_seq("b", [2]))
+    eng.add_sequence(_resuming("b", [2]), front=True)  # (a continuation)
     eng.log.clear()
     seqs = eng.step()  # b's prefill, a's next patch
     assert {s.seq_id for s in seqs} == {"a", "b"}
@@ -691,18 +707,74 @@ def test_head_start_checks_the_whole_request_length():
 
 def test_head_start_for_at_most_head_start_limit_streams_at_once():
     eng = _voxcpm2_engine(max_model_len=128)
-    eng.head_start_limit, eng._head_phase = 2, set()
+    eng.head_start_limit, eng._head_phase = 2, {}
     h1, h2, w = (eng.add_request(f"r{i}", _words(20), max_generate_length=20) for i in range(3))
     assert h1.custom_payload.chain is not None and h2.custom_payload.chain is not None
-    assert w.custom_payload.chain is None and eng._head_phase == {"r0", "r1"}  # r2: prefilled whole
+    assert w.custom_payload.chain is None and set(eng._head_phase) == {"r0", "r1"}  # r2: prefilled whole
+    assert eng._head_phase["r0"] == 20 + 1 + 3  # its continuation's tokens: text, audio start, the head's patches
     for _ in range(3):  # the heads' prefill and patches; they end and queue their continuations
         eng.step()
-    assert eng._head_phase == {"r0", "r1"}  # continuations queued, not prefilled yet
+    assert set(eng._head_phase) == {"r0", "r1"}  # continuations queued, not prefilled yet
     eng.step()  # their prefill
-    assert eng._head_phase == set()
+    assert not eng._head_phase
     assert eng.add_request("r3", _words(20), max_generate_length=20).custom_payload.chain is not None
     eng.cancel_sequence("r3")
-    assert eng._head_phase == set()
+    assert not eng._head_phase
+
+
+def test_head_patches_cover_the_continuation_prefill_ahead():
+    from nanovllm_voxcpm.engine.step_cost import head_patches_for
+
+    plan = lambda backlog: head_patches_for(backlog, 0.003, 0.05, 0.16, 3, 5, 0.15, 0.02)  # noqa: E731
+    assert plan(0.0) == (3, True)  # 480 ms - 150 >= 2 decode steps + its own continuation
+    assert plan(0.3) == (4, True)
+    assert plan(0.6) == (5, False)  # none covers it: the most
+
+
+def test_heads_under_load_are_longer_and_continue_after_their_patches():
+    eng = _voxcpm2_engine(max_model_len=256)
+    eng.head_patches_max, eng.head_margin, eng.patch_seconds, eng._head_phase = 5, 0.15, 0.16, {}
+    eng.step_cost = SimpleNamespace(prefill=SimpleNamespace(coef=(0.02, 0.0, 0.01)),
+                                    seconds=lambda rows, tokens, prefill: 0.0,  # 10 ms a prefilled token
+                                    observe=lambda *a: None)
+    first = eng.add_request("r0", _words(20), max_generate_length=40)  # its continuation: 24 tokens, 0.24 s
+    second = eng.add_request("r1", _words(20), max_generate_length=40)  # after r0's: 0.51 s
+    assert first.custom_payload.max_generate_length == 3 and second.custom_payload.max_generate_length == 5
+    assert eng._head_phase == {"r0": 24, "r1": 26}
+    cont = _steps_until_chained(eng, "r1")
+    assert len(cont.custom_payload.generated_waveforms) == 5
+    assert eng.scheduler.waiting[0].custom_payload.max_generate_length <= 40 - 5  # the rest of the request
+
+
+def _loaded(per_token):
+    eng = _voxcpm2_engine(max_model_len=256, max_num_seqs=8)
+    eng.head_patches_max, eng.head_margin, eng.patch_seconds, eng._head_phase = 5, 0.15, 0.16, {}
+    eng.step_cost = SimpleNamespace(prefill=SimpleNamespace(coef=(0.0, 0.0, per_token)), observe=lambda *a: None,
+                                    seconds=lambda rows, tokens, prefill: 0.0)
+    return eng
+
+
+def test_heads_are_lengthened_when_the_burst_grows():
+    eng = _loaded(0.005)  # 5 ms a prefilled token: a continuation of 24 tokens, 0.12 s
+    first = eng.add_request("r0", _words(20), max_generate_length=40)
+    assert first.custom_payload.max_generate_length == 3
+    eng.step()  # its prefill
+    eng.step_cost.prefill.coef = (0.0, 0.0, 0.012)  # the steps turn out slower (a bigger burst, a slower GPU)
+    eng.add_request("r1", _words(20), max_generate_length=40)
+    eng.step()  # re-planned before it: r0's own continuation (0.29 s) no longer fits in 3 patches - 150 ms
+    assert first.custom_payload.max_generate_length == 4 and eng._head_phase["r0"] == 25
+
+
+def test_a_head_waits_while_even_the_longest_would_not_last():
+    eng = _loaded(0.01)  # 10 ms a token: each continuation 0.24-0.26 s
+    heads = [eng.add_request(f"r{i}", _words(20), max_generate_length=40) for i in range(3)]
+    assert [h.custom_payload.max_generate_length for h in heads] == [3, 5, 5]
+    assert eng.head_fits(heads[0]) and eng.head_fits(heads[1]) and not eng.head_fits(heads[2])
+    seqs = eng.step()
+    assert {s.seq_id for s in seqs} == {"r0", "r1"} and list(eng.scheduler.waiting) == [heads[2]]
+    for _ in range(4):  # r0 ends after 3 patches, its continuation is prefilled: r2's wait is shorter
+        eng.step()
+    assert "r0" not in eng._head_phase and heads[2].status != SequenceStatus.WAITING
 
 
 def _steps_until_chained(eng, seq_id):
@@ -895,9 +967,15 @@ def test_step_cost_starts_from_its_prior_and_follows_the_measured_steps():
     for rows, tokens in ((10, 1000), (50, 4000), (200, 1600), (30, 300)) * 40:
         cost.observe(rows, tokens, True, 0.01 + 0.0001 * rows + 0.00005 * tokens)
     assert abs(cost.seconds(100, 2000, True) - 0.12) < 0.01
+    for tokens in (8, 40, 200) * 100:  # small prefill steps (first audio: launch-bound) have a fit of their own
+        cost.observe(4, tokens, True, 0.035)
+    assert abs(cost.seconds(100, 2000, True) - 0.12) < 0.01 and abs(cost.seconds(4, 40, True) - 0.035) < 0.003
     cost.observe(0, 0, True, 1.0)  # an empty step, a host stall: ignored
     cost.observe(5, 5, False, 30.0)
     assert abs(cost.seconds(200, 200, False) - 2 * 0.0886) < 0.01
+    for _ in range(5):  # a compile or a pause: at most twice the prediction counts
+        cost.observe(50, 2000, True, 2.0)
+    assert abs(cost.seconds(100, 2000, True) - 0.12) < 0.03 and min(cost.prefill.coef) >= 0.0
 
 
 def test_turbo_config_rejects_unknown_keys_and_accepts_the_repos_own():

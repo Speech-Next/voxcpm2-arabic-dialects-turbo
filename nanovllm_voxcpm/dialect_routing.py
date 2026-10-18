@@ -165,7 +165,7 @@ class RoutedDialectTTS:
                    dit: str | None = DEFAULT_DIT, *, routes: dict[str, str] | None = None, max_concurrency: int = 256,
                    head_tokens: int = 8, dit_cache: str | dict | None = None, gpu_memory_utilization: float = 0.85,
                    kv_blocks: int = 600, device: int = 0, w8a8: bool = True,
-                   smooth_stats: str | None = None, prefill_tokens: int = 4096) -> "RoutedDialectTTS":
+                   smooth_stats: str | None = None, prefill_tokens: int = 16384) -> "RoutedDialectTTS":
         """Start the engine on ``model`` (adapters/) with the adapters the routes use and ``tagged_model``'s LoRA
         (a local directory or a Hugging Face repo; only its lora/ and tokenizer files are read). One LocDiT ``dit``
         for every request. Other arguments as DialectTTS.load; smooth_stats: SmoothQuant statistics for the int8
