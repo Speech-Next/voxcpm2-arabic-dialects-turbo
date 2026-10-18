@@ -16,7 +16,7 @@ _PREFILL_PRIOR = (0.0196, 0.00023, 0.0000363)
 _DECODE_AT = [(1,), (64,), (256,)]
 _PREFILL_AT = [(1, 64), (32, 1500), (64, 4096), (256, 2048)]
 _SMALL_PRIOR = (0.026, 0.0002, 0.00002)
-_SMALL_AT = [(1, 8), (16, 128), (64, 512)]
+_SMALL_AT = [(1, 8), (16, 128), (64, 300), (4, 480)]  # (not on one line: tokens = 8 x rows left the fit singular)
 SMALL = 512  # tokens
 
 
@@ -25,7 +25,10 @@ class _Fit:
         self.decay = decay
         x = np.array([(1.0, *p) for p in at])
         y = x @ np.array(prior)
-        self.prior_xx, self.prior_xy = x.T @ x, x.T @ y
+        # a little ridge toward the prior on top: the system stays solvable whatever the steps (all one size, steps
+        # with tokens in proportion to rows)
+        ridge = 1e-6 * np.diag(np.maximum((x * x).sum(0), 1.0))
+        self.prior_xx, self.prior_xy = x.T @ x + ridge, x.T @ y + ridge @ np.array(prior)
         self.xx = np.zeros_like(self.prior_xx)
         self.xy = np.zeros_like(self.prior_xy)
         self.coef = tuple(float(c) for c in prior)
@@ -37,8 +40,12 @@ class _Fit:
         seconds = min(seconds, 2.0 * float(v @ np.array(self.coef)) + 0.01)
         self.xx = self.decay * self.xx + np.outer(v, v)
         self.xy = self.decay * self.xy + v * seconds
-        coef = np.linalg.solve(self.prior_xx + self.xx, self.prior_xy + self.xy)
-        self.coef = tuple(max(float(c), 0.0) for c in coef)  # (no step gets cheaper with more rows or tokens)
+        try:
+            coef = np.linalg.solve(self.prior_xx + self.xx, self.prior_xy + self.xy)
+        except np.linalg.LinAlgError:  # (not expected with the ridge; the engine's step must never fail on it)
+            return
+        if np.all(np.isfinite(coef)):
+            self.coef = tuple(max(float(c), 0.0) for c in coef)  # (no step gets cheaper with more rows or tokens)
 
 
 class StepCost:

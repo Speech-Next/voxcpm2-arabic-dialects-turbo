@@ -981,6 +981,10 @@ def test_step_cost_starts_from_its_prior_and_follows_the_measured_steps():
     for _ in range(5):  # a compile or a pause: at most twice the prediction counts
         cost.observe(50, 2000, True, 2.0)
     assert abs(cost.seconds(100, 2000, True) - 0.12) < 0.03 and min(cost.prefill.coef) >= 0.0
+    fresh = StepCost()  # steps whose tokens are in proportion to their rows (one head each): the fit stays solvable
+    for rows in (1, 2, 4, 8, 16, 32, 64) * 200:
+        fresh.observe(rows, 8 * rows, True, 0.026 + 0.0003 * rows)
+    assert abs(fresh.seconds(16, 128, True) - (0.026 + 0.0003 * 16)) < 0.005
 
 
 def test_turbo_config_rejects_unknown_keys_and_accepts_the_repos_own():
