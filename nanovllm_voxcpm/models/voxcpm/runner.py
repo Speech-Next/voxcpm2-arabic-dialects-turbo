@@ -114,7 +114,7 @@ class VoxCPMRunner(BaseModelRunner):
             .numpy()
         )
 
-    def run(self, seqs: list[RunnerTask[VoxCPMPayload]], is_prefill: bool):
+    def run(self, seqs: list[RunnerTask[VoxCPMPayload]], is_prefill: bool, first_patch: bool = True):
         positions = self.prepare_prefill_context(seqs) if is_prefill else self.prepare_decode_context(seqs)
         inputs = {"positions": positions}
 

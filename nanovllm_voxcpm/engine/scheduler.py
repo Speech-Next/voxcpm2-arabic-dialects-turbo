@@ -111,6 +111,7 @@ class Scheduler:
         self.mixed: list[Sequence] = []
         self._playing = False  # the last admission pass saw a playing stream
         self._resumes = False  # the next prefill step resumes a stream (a continuation, a preempted sequence)
+        self.resuming = False  # the last prefill step resumed one (no first-patch LocDiT settings for it)
         self._paused = False  # the last step was a prefill step that paused playing streams (no mixed rows)
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
@@ -318,7 +319,7 @@ class Scheduler:
             scheduled_seqs, self._admitted, (_, tokens), self._budget = self._admitted, [], self._budget, [0, 0]
             if self.mix_decode and self._playing and self._resumes:
                 self._ride(scheduled_seqs, tokens)
-            self._resumes = False
+            self.resuming, self._resumes = self._resumes, False
             self.last_step = (True, len(scheduled_seqs) + len(self.mixed), tokens + len(self.mixed))
             self._paused = self._playing and not self.mixed
             return _by_adapter(scheduled_seqs + self.mixed), True

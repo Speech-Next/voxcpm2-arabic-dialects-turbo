@@ -275,7 +275,9 @@ class LLMEngineBase:
                 prepared.clear()
             else:
                 runner_tasks = [self.preprocess_seq(seq, is_prefill and id(seq) not in ride) for seq in seqs]
-            outputs = self.model_runner.call("run", runner_tasks, is_prefill)
+            # a prefill step of only new streams: their first patch, with the first patch's LocDiT settings
+            first = is_prefill and not ride and not getattr(self.scheduler, "resuming", False)
+            outputs = self.model_runner.call("run", runner_tasks, is_prefill, first)
 
             for seq, output in zip(seqs, outputs):
                 self.postprocess_seq(seq, output, is_prefill and id(seq) not in ride)

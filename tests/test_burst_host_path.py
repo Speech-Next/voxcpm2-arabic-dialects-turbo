@@ -601,7 +601,7 @@ class _FakeRunner:
 
     def call(self, name, *args):
         if name == "run":
-            tasks, is_prefill = args
+            tasks, is_prefill = args[:2]
             self.runs.append((tasks, is_prefill, list(self.copies)))  # (the copies made before this run)
             if self.overlap_hook is not None:
                 self.overlap_hook()

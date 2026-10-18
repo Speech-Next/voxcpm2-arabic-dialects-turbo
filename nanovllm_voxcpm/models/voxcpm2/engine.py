@@ -147,11 +147,6 @@ class VoxCPM2Engine(LLMEngineBase):
         self.step_cap, self.head_hold = turbo.step_cap_ms / 1000, turbo.head_hold
         self._head_phase: dict[str, int] = {}
         self._text_lens: dict[str, int] = {}
-        if turbo.mix_decode and (turbo.dit_first_t_span is not None or turbo.first_steps is not None
-                                 or turbo.first_cfg_steps != turbo.cfg_steps):
-            raise ValueError("mix_decode: a mixed step decodes its running sequences through the prefill path, whose "
-                             "LocDiT is the first patch's: dit_first_t_span, first_steps and first_cfg_steps must be "
-                             "unset")
         self.step_cost = StepCost()  # the scheduler's time model (step_cap_ms, realtime_margin_ms)
         vae = config.model_config.audio_vae_config
         rates = vae.decoder_rates if vae is not None else [8, 6, 5, 2, 2, 2]
