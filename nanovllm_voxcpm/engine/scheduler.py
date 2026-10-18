@@ -103,6 +103,9 @@ class Scheduler:
         # _admit_loop
         self.step_cap = (getattr(turbo, "step_cap_ms", 0) or 0) / 1000
         self.mix_decode = bool(getattr(turbo, "mix_decode", False))
+        # resume_lazy_ms (#31): with mix_decode, waiting streams that still have audio for a decode step and their own
+        # prefill after it (this margin to spare) wait for a later, fuller prefill step instead of starting a small one
+        self.resume_lazy = (getattr(turbo, "resume_lazy_ms", 0) or 0) / 1000
         margin = getattr(turbo, "realtime_margin_ms", -1)
         self.realtime_margin = margin / 1000 if isinstance(margin, (int, float)) and margin >= 0 else None
         # the last step: (is_prefill, rows, tokens computed), for the callbacks' step time model; mixed: the running
@@ -250,6 +253,18 @@ class Scheduler:
         if self.stream_guard > 0 and least is not None and least < self.stream_guard:
             slack = least
         fits = getattr(callbacks, "head_fits", None)
+        # resume_lazy: a prefill step for waiting streams once the most urgent of them (the first: earliest deadline)
+        # could not wait for one more decode step; until then they wait together (fewer, fuller steps: each pays the
+        # fixed cost and pauses the streams that do not ride) and new requests behind them go ahead
+        lazy = False
+        if self.resume_lazy > 0 and mixable and cost is not None and waiting and waiting[0].has_stream:
+            first_wait = waiting[0]
+            b0 = buffer_of(first_wait)
+            if b0 is not None:
+                hint0 = prefix_hint(first_wait) if prefix_hint is not None else 0
+                rows = len(running)
+                need = cost(rows, rows, False) + cost(1 + others, first_wait.num_tokens - hint0 + others, True)
+                lazy = b0 > need + self.resume_lazy
         realtime = None
         if self.realtime_margin is not None and cost is not None:
             realtime = patch - self.realtime_margin
@@ -257,6 +272,9 @@ class Scheduler:
             if not waiting or budget[0] >= max_seqs:
                 break
             seq = waiting.popleft()
+            if lazy and seq.has_stream:  # (resume_lazy: not yet)
+                deferred_waiting.append(seq)
+                continue
             mixed = mixable and (self._resumes or seq.has_stream)  # the step decodes the short streams too
             if slack is not None and not (mixed and seq.has_stream):
                 b = buffer_of(seq) if seq.has_stream else None

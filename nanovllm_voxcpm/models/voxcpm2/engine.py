@@ -914,18 +914,17 @@ class VoxCPM2Engine(LLMEngineBase):
         return plan(backlog, own)[1]
 
     def _whole_in_time(self, seq: Sequence[VoxCPM2SeqPayload], tokens: int) -> bool:
-        """At the end of a head (TurboConfig.mid_tokens): would its whole continuation (``tokens`` to prefill),
-        after the continuations already waiting, be prefilled before its player runs out of the audio it has, with
-        head_margin to spare? The continuations' steps also carry every other stream (mix_decode), as _head_plan."""
+        """At the end of a head (TurboConfig.mid_tokens): would its whole continuation (``tokens`` to prefill) be
+        prefilled before its player runs out of the audio it has, with head_margin to spare, after the next prefill
+        of every other stream in its head phase (in a burst they all come due about when this one does, as in
+        _plan_head)? The continuations' steps also carry every other stream (mix_decode), as _head_plan."""
         buf = self.stream_buffer(seq)
         if buf is None or self.step_cost is None:
             return True
         a, b, c = self.step_cost.prefill.coef
-        queued = 0.0
-        for s in self.scheduler.waiting:
-            if not s.has_stream:
-                break
-            queued += b + c * self._head_phase.get(s.seq_id, 0)
+        mine = self._head_phase.get(seq.seq_id)
+        others = len(self._head_phase) - (mine is not None)
+        queued = b * others + c * (self._head_sum - (mine or 0))
         own = b + c * tokens
         rows = len(self.scheduler.running) + len(self.scheduler.waiting)
         step = a + (b + c) * rows
