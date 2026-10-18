@@ -178,6 +178,23 @@ class TurboConfig(BaseModel):
     # 150 ms (turbo_config), Poisson arrivals at 30-60 requests/s: no gap above 50 ms (without: 0.5-93 % of the
     # streams), TTFA p95 63-191 -> 85-142 ms, first word p99 548-843 -> 543-624 ms.
     stream_guard_ms: int = 0
+    # Mixed steps (False = a step is prefill or decode, the original): a prefill step while streams play also decodes
+    # them (their next patch, through the prefill path with everything before it cached), so admitting a request no
+    # longer pauses the playing streams. Needs the first patch's LocDiT settings to be the others' (no
+    # dit_first_t_span, first_steps or first_cfg_steps of their own).
+    mix_decode: bool = False
+    # Head start for at most this many streams at once (0 = no limit): a request arriving while this many streams are
+    # in their head phase (a head generating, or its continuation waiting for its prefill) is prefilled whole. Each
+    # continuation is a prefill that comes due when its head ends; a burst's continuations come due together and the
+    # step that prefills them pauses every stream (the user's WebSocket benchmark: one stall per request at 40-200
+    # requests at once). With the limit, a burst's first requests start fast and the rest whole.
+    head_start_limit: int = 0
+    # While streams play, a prefill (or mixed) step is filled only while its predicted time stays under this (0 = no
+    # cap; the first sequence also when the least playing buffer covers it): it bounds the wait between two chunks.
+    step_cap_ms: int = 0
+    # A new request waits while a decode step of every stream would take longer than a patch's audio (160 ms) minus
+    # this margin (-1 = off): the streams would fall behind real time. Predicted step times: engine/step_cost.py.
+    realtime_margin_ms: int = -1
 
 
 class VoxCPM2Config(BaseModel):

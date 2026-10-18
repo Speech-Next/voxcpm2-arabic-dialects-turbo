@@ -421,6 +421,101 @@ def test_stream_bookkeeping_through_preempt_cancel_and_finish():
     assert sch.num_streams == 0
 
 
+class _Timed(_Buffers):
+    """_Buffers with a time model: a step costs ``per_row`` per row and ``per_token`` per token (prefill), or
+    ``decode_row`` per row (decode)."""
+
+    patch_seconds = 0.16
+
+    def __init__(self, buf, per_row=0.0, per_token=0.01, decode_row=0.05):
+        super().__init__(buf)
+        self.per_row, self.per_token, self.decode_row = per_row, per_token, decode_row
+
+    def step_seconds(self, rows, tokens, prefill):
+        return self.per_row * rows + self.per_token * tokens if prefill else self.decode_row * rows
+
+
+def _timed(buf, max_num_seqs=4, **turbo):
+    cfg = _config(max_num_seqs=max_num_seqs)
+    for k, v in turbo.items():
+        setattr(cfg.model_config.turbo, k, v)
+    return Scheduler(cfg, callbacks=_Timed(buf))
+
+
+def _playing(sch, *seqs):
+    """seqs admitted, prefilled and holding their first patch (as the engine's postprocess appends it)."""
+    for s in seqs:
+        sch.add(s)
+    assert sch.schedule() == (list(seqs), True)
+    for s in seqs:
+        s.append_token(9)
+
+
+def test_a_mixed_step_decodes_the_playing_streams_too():
+    sch = _timed({"a": 0.5}, mix_decode=True)
+    a, b = _seq("a", [1]), _seq("b", [2])
+    sch.add(a)
+    assert sch.schedule() == ([a], True) and sch.mixed == []  # nothing playing yet: a plain prefill
+    a.append_token(9)
+    sch.add(b)
+    assert sch.schedule() == ([b, a], True)  # b's prefill, a's next patch in the same step
+    assert sch.mixed == [a] and sch.last_step == (True, 2, 2)
+    a.append_token(9), b.append_token(9)
+    assert sch.schedule() == ([a, b], False) and sch.mixed == []  # nothing waits: a decode step
+    off = _timed({"a": 0.5})  # mix_decode off: the prefill step pauses a
+    _playing(off, a2 := _seq("a", [1]))
+    off.add(b2 := _seq("b", [2]))
+    assert off.schedule() == ([b2], True) and off.mixed == []
+
+
+def test_the_step_cap_bounds_a_prefill_step_while_streams_play():
+    sch = _timed({"a": 0.5}, step_cap_ms=50)  # 10 ms a token
+    _playing(sch, a := _seq("a", [1]))
+    b, c, d = _seq("b", [2, 2, 2]), _seq("c", [3, 3, 3]), _seq("d", [4] * 20)
+    for s in (b, c):
+        sch.add(s)
+    assert sch.schedule() == ([b], True) and list(sch.waiting) == [c]  # b: 30 ms, b + c: 60 > 50
+    b.append_token(9)
+    assert sch.schedule() == ([a, b], False)  # c alone would fit, but a decode step comes between two pauses
+    a.append_token(9), b.append_token(9)
+    assert sch.schedule() == ([c], True)
+    one = _timed({"a": 0.5}, step_cap_ms=50)
+    _playing(one, _seq("a", [1]))
+    one.add(d)
+    assert one.schedule() == ([d], True)  # 200 ms alone: the first one goes when the least buffer covers it
+    sch2 = _timed({"a": 0.15}, step_cap_ms=50)
+    _playing(sch2, _seq("a", [1]))
+    sch2.add(d2 := _seq("d", [4] * 20))
+    assert sch2.schedule()[1] is False and list(sch2.waiting) == [d2]  # 200 ms > 150 ms of buffer: decode first
+    idle = _timed({}, step_cap_ms=50)  # nothing plays: no cap
+    for s in (e := _seq("e", [5] * 3), f := _seq("f", [6] * 3)):
+        idle.add(s)
+    assert idle.schedule() == ([e, f], True)
+
+
+def test_the_step_cap_counts_the_mixed_rows():
+    sch = _timed({"a": 0.5, "b": 0.5}, step_cap_ms=50, mix_decode=True)
+    _playing(sch, a := _seq("a", [1]), b := _seq("b", [2]))
+    c, d = _seq("c", [3, 3]), _seq("d", [4, 4])
+    sch.add(c), sch.add(d)
+    seqs, prefill = sch.schedule()  # a and b ride along: 20 ms, c 20 ms, d would make 60
+    assert prefill and seqs == [c, a, b] and list(sch.waiting) == [d]
+
+
+def test_a_new_request_waits_while_the_streams_would_fall_behind_real_time():
+    sch = _timed({}, realtime_margin_ms=9)  # a decode step: 50 ms a row: 3 rows = 150 ms < 160 - 9
+    _playing(sch, *(seqs := [_seq(f"s{i}", [i + 1]) for i in range(3)]))
+    late = _seq("late", [9])
+    sch.add(late)
+    assert sch.schedule() == (seqs, False) and list(sch.waiting) == [late]  # 4 rows: 200 ms > 151
+    cont = _seq("h", [4, 5])  # a stream already playing (a continuation) is not held back
+    cont.has_stream = True
+    sch.add(cont, front=True)
+    for s in seqs:
+        s.append_token(9)
+    assert sch.schedule() == ([cont], True) and list(sch.waiting) == [late]
+
+
 # --- 4. cancels during a step, VAE stream slots ---------------------------------------------------------------------
 
 
@@ -508,6 +603,48 @@ def test_more_requests_than_vae_streams_wait_instead_of_failing():
     assert eng.model_runner.slots == set() and eng.scheduler.num_streams == 0
 
 
+class _MixedEngine(_Engine):
+    """_Engine with mixed steps: every stream that has a patch is playing; records how each step's sequences went."""
+
+    def __init__(self):
+        super().__init__(max_num_seqs=4, stop_at=3)
+        self.scheduler.callbacks = None
+        cfg = _config(max_num_seqs=4)
+        cfg.model_config.turbo.mix_decode = True
+        self.scheduler = Scheduler(cfg, callbacks=self)
+        self.log = []
+
+    def stream_buffer(self, seq):
+        return 0.5 if seq.num_completion_tokens else None
+
+    def preprocess_seq(self, seq, is_prefill):
+        self.log.append(("pre", seq.seq_id, is_prefill))
+        return super().preprocess_seq(seq, is_prefill)
+
+    def postprocess_seq(self, seq, outputs, is_prefill):
+        self.log.append(("post", seq.seq_id, is_prefill))
+        super().postprocess_seq(seq, outputs, is_prefill)
+
+    def after_prefill(self, seqs):
+        self.log.append(("after", tuple(s.seq_id for s in seqs)))
+
+
+def test_a_mixed_step_gives_its_running_sequences_their_decode_inputs():
+    eng = _MixedEngine()
+    eng.add_sequence(_seq("a", [1]))
+    eng.step()  # a's prefill
+    eng.add_sequence(_seq("b", [2]))
+    eng.log.clear()
+    seqs = eng.step()  # b's prefill, a's next patch
+    assert {s.seq_id for s in seqs} == {"a", "b"}
+    assert set(eng.log) == {("pre", "b", True), ("pre", "a", False), ("post", "b", True), ("post", "a", False),
+                            ("after", ("b",))}
+    a = next(s for s in seqs if s.seq_id == "a")
+    assert a.num_completion_tokens == 2 and eng.model_runner.slots == {"a", "b"}
+    _run(eng)
+    assert eng.model_runner.slots == set() and eng.scheduler.num_streams == 0
+
+
 # --- 5. head start --------------------------------------------------------------------------------------------------
 
 FEAT, PATCH = 4, 2
@@ -550,6 +687,22 @@ def test_head_start_checks_the_whole_request_length():
     assert not eng.scheduler.waiting
     head = eng.add_request("r", _words(20), max_generate_length=20)
     assert head.custom_payload.chain is not None and list(eng.scheduler.waiting) == [head]
+
+
+def test_head_start_for_at_most_head_start_limit_streams_at_once():
+    eng = _voxcpm2_engine(max_model_len=128)
+    eng.head_start_limit, eng._head_phase = 2, set()
+    h1, h2, w = (eng.add_request(f"r{i}", _words(20), max_generate_length=20) for i in range(3))
+    assert h1.custom_payload.chain is not None and h2.custom_payload.chain is not None
+    assert w.custom_payload.chain is None and eng._head_phase == {"r0", "r1"}  # r2: prefilled whole
+    for _ in range(3):  # the heads' prefill and patches; they end and queue their continuations
+        eng.step()
+    assert eng._head_phase == {"r0", "r1"}  # continuations queued, not prefilled yet
+    eng.step()  # their prefill
+    assert eng._head_phase == set()
+    assert eng.add_request("r3", _words(20), max_generate_length=20).custom_payload.chain is not None
+    eng.cancel_sequence("r3")
+    assert eng._head_phase == set()
 
 
 def _steps_until_chained(eng, seq_id):
@@ -729,6 +882,22 @@ def test_cuda_ext_failure_is_cached_and_reported_without_a_message(monkeypatch, 
         cuda_ext.available.cache_clear()
     assert attempts == ["nope"]
     assert "RuntimeError" in capsys.readouterr().out
+
+
+def test_step_cost_starts_from_its_prior_and_follows_the_measured_steps():
+    from nanovllm_voxcpm.engine.step_cost import StepCost
+
+    cost = StepCost()
+    assert 0.08 < cost.seconds(200, 200, False) < 0.1  # the A10 prior: 15.6 + 0.365 * 200 ms
+    for rows in (8, 64, 128, 200, 256) * 40:  # a GPU twice as slow
+        cost.observe(rows, rows, False, 2 * (0.0156 + 0.000365 * rows))
+    assert abs(cost.seconds(200, 200, False) - 2 * 0.0886) < 0.01
+    for rows, tokens in ((10, 1000), (50, 4000), (200, 1600), (30, 300)) * 40:
+        cost.observe(rows, tokens, True, 0.01 + 0.0001 * rows + 0.00005 * tokens)
+    assert abs(cost.seconds(100, 2000, True) - 0.12) < 0.01
+    cost.observe(0, 0, True, 1.0)  # an empty step, a host stall: ignored
+    cost.observe(5, 5, False, 30.0)
+    assert abs(cost.seconds(200, 200, False) - 2 * 0.0886) < 0.01
 
 
 def test_turbo_config_rejects_unknown_keys_and_accepts_the_repos_own():

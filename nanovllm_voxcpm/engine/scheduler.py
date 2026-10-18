@@ -72,6 +72,10 @@ from nanovllm_voxcpm.engine.sequence import Sequence, SequenceStatus
 from nanovllm_voxcpm.engine.block_manager import BlockManager
 
 
+# step_cap: what a prefill step may leave of the least playing buffer at the least (s), for the time model's error
+_PAUSE_MARGIN = 0.03
+
+
 def _by_adapter(seqs: list[Sequence]) -> list[Sequence]:
     """A step's sequences grouped by LoRA adapter (stable; base-model sequences last): every adapter's rows are
     one contiguous segment, which the segmented GEMMs of merged adapter weights (voxcpm_kernels.seg_gemm) need.
@@ -90,6 +94,20 @@ class Scheduler:
         self.max_prefill_seqs = getattr(turbo, "prefill_max_seqs", 0) or self.max_num_seqs
         # streams before new requests (TurboConfig.stream_guard_ms, 0 = off): see _admit_loop
         self.stream_guard = (getattr(turbo, "stream_guard_ms", 0) or 0) / 1000
+        # while streams play: prefill steps that decode the playing streams too (TurboConfig.mix_decode), steps of
+        # bounded length (step_cap_ms, 0 = off) and new requests only while the streams keep real time
+        # (realtime_margin_ms, -1 = off), judged with the callbacks' predicted step times (step_seconds): see
+        # _admit_loop
+        self.step_cap = (getattr(turbo, "step_cap_ms", 0) or 0) / 1000
+        self.mix_decode = bool(getattr(turbo, "mix_decode", False))
+        margin = getattr(turbo, "realtime_margin_ms", -1)
+        self.realtime_margin = margin / 1000 if isinstance(margin, (int, float)) and margin >= 0 else None
+        # the last step: (is_prefill, rows, tokens computed), for the callbacks' step time model; mixed: the running
+        # sequences a prefill step decodes as well (mix_decode)
+        self.last_step = (False, 0, 0)
+        self.mixed: list[Sequence] = []
+        self._playing = False  # the last admission pass saw a playing stream
+        self._paused = False  # the last step was a prefill step that paused playing streams (no mixed rows)
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -178,12 +196,34 @@ class Scheduler:
         # a prefill step (which pauses every stream) admits only waiting streams whose players have even less (a
         # head start's continuation, a preempted sequence: their own gap grows while they wait); the decode step
         # that follows refills the others. New requests wait for the next step with enough slack.
-        slack = None
-        buffer_of = getattr(callbacks, "stream_buffer", None) if self.stream_guard > 0 else None
-        if buffer_of is not None and running:
-            slack = min((b for b in map(buffer_of, running) if b is not None), default=None)
-            if slack is not None and slack >= self.stream_guard:
-                slack = None
+        slack = least = None
+        buffer_of = getattr(callbacks, "stream_buffer", None)
+        if buffer_of is not None and running and (self.stream_guard > 0 or self.step_cap > 0 or self.mix_decode):
+            least = min((b for b in map(buffer_of, running) if b is not None), default=None)
+        # While streams play (least: the least audio queued at a running stream's player):
+        # - step_cap: a prefill step takes sequences only while its predicted time (callbacks.step_seconds(rows,
+        #   tokens, prefill)) stays under step_cap; its first one also when that keeps the least buffer above a
+        #   margin. A prefill step pauses every playing stream; the cap bounds the pause (and the wait between two
+        #   chunks of a stream: the user's benchmark counts every wait longer than a chunk's audio).
+        # - mix_decode: a prefill step decodes the running sequences too (their next patch, as a decode step would),
+        #   so it is no pause: the cap then bounds the step, rows included.
+        # - realtime_margin: a new request waits while a decode step of every stream would take longer than a
+        #   patch's audio minus the margin (callbacks.patch_seconds): the streams would fall behind real time.
+        cost = getattr(callbacks, "step_seconds", None)
+        self._playing = least is not None
+        mix = self.mix_decode and least is not None
+        ride = len(running) - budget[0] if mix else 0  # running sequences this step decodes as well
+        cap = first_cap = None
+        if self.step_cap > 0 and cost is not None and least is not None:
+            cap = self.step_cap
+            first_cap = max(cap, least - _PAUSE_MARGIN + (getattr(callbacks, "patch_seconds", 0.16) if mix else 0.0))
+        if cap is not None and not mix and self._paused:
+            return  # two pauses in a row would make one longer than the cap: a decode step comes between
+        if self.stream_guard > 0 and least is not None and least < self.stream_guard and not (mix and cap):
+            slack = least
+        realtime = None
+        if self.realtime_margin is not None and cost is not None:
+            realtime = getattr(callbacks, "patch_seconds", 0.16) - self.realtime_margin
         for _ in range(len(waiting)):
             if not waiting or budget[0] >= max_seqs:
                 break
@@ -193,14 +233,24 @@ class Scheduler:
                 if b is None or b > slack:  # a new request, or a stream with more audio left than a running one
                     waiting.appendleft(seq)
                     break
+            hint = prefix_hint(seq) if prefix_hint is not None else 0
+            late = False
+            if cap is not None:
+                t = cost(budget[0] + 1 + ride, budget[1] + seq.num_tokens - hint + ride, True)
+                late = t > (first_cap if budget[0] == 0 else cap)
+            if not seq.has_stream and not late and realtime is not None:
+                rows = len(running) + 1
+                late = cost(rows, rows, False) > realtime
+            if late:
+                waiting.appendleft(seq)
+                break
             if not seq.has_stream and self.num_streams >= self.max_num_seqs:
                 # every stream slot is taken: a new request waits, a resuming one (preempted, continuation) may run
                 deferred_waiting.append(seq)
                 if self.num_streams == len(running):  # none waits to resume
                     break
                 continue
-            hint = prefix_hint(seq) if prefix_hint is not None else 0
-            if budget[1] + seq.num_tokens - hint > self.max_num_batched_tokens or not bm.can_allocate(seq):
+            if budget[1] + seq.num_tokens - hint + ride > self.max_num_batched_tokens or not bm.can_allocate(seq):
                 waiting.appendleft(seq)
                 break
             if callbacks is not None:
@@ -228,9 +278,18 @@ class Scheduler:
     def schedule(self) -> tuple[list[Sequence], bool]:
         # prefill
         self._admit()
+        self.mixed = []
         if self._admitted:
-            scheduled_seqs, self._admitted, self._budget = self._admitted, [], [0, 0]
-            return _by_adapter(scheduled_seqs), True
+            scheduled_seqs, self._admitted, (_, tokens), self._budget = self._admitted, [], self._budget, [0, 0]
+            if self.mix_decode and self._playing:  # the running ones ride along: their next patch, as decoded
+                fresh = {id(seq) for seq in scheduled_seqs}
+                for seq in self.running:
+                    if id(seq) not in fresh and self.block_manager.can_append(seq):
+                        self.block_manager.may_append(seq)
+                        self.mixed.append(seq)
+            self.last_step = (True, len(scheduled_seqs) + len(self.mixed), tokens + len(self.mixed))
+            self._paused = self._playing and not self.mixed
+            return _by_adapter(scheduled_seqs + self.mixed), True
 
         # decode
         scheduled_seqs = []
@@ -248,6 +307,8 @@ class Scheduler:
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
         self.running.extendleft(reversed(scheduled_seqs))
+        self.last_step = (False, len(scheduled_seqs), len(scheduled_seqs))
+        self._paused = False
         return _by_adapter(scheduled_seqs), False
 
     def preempt(self, seq: Sequence):

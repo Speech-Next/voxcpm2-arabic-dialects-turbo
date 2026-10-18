@@ -15,6 +15,7 @@ from transformers import LlamaTokenizerFast
 from nanovllm_voxcpm.config import Config
 from nanovllm_voxcpm.engine.llm_engine import LLMEngineBase
 from nanovllm_voxcpm.engine.sequence import Sequence
+from nanovllm_voxcpm.engine.step_cost import StepCost
 from nanovllm_voxcpm.models.voxcpm2.config import VoxCPM2Config
 from nanovllm_voxcpm.models.voxcpm2.lora_loader import load_voxcpm2_lora_checkpoint, tagged_adapter_state
 from nanovllm_voxcpm.models.voxcpm2.runner import RunnerTask, VoxCPM2Payload, VoxCPM2Runner
@@ -102,6 +103,9 @@ class VoxCPM2Engine(LLMEngineBase):
     locenc_cache_enabled = False
     head_tokens, head_patches, head_min_rest = 0, 3, 8  # head start off
     lead_silence_patches = -1  # leading silence as generated
+    head_start_limit = 0  # head start for every request long enough
+    _head_phase: set = frozenset()  # (instances built without __init__: never added to)
+    step_cost: StepCost | None = None
     _pretok_cache: dict | None = None
     _tag_remap: dict = {}  # (instances built without __init__, e.g. in tests: no tagged adapters)
     tag_rows = _tag_rows_used = 0
@@ -132,6 +136,16 @@ class VoxCPM2Engine(LLMEngineBase):
         self.voices: dict[str, RegisteredVoice] = {}
         self.head_tokens, self.head_patches, self.head_min_rest = turbo.head_tokens, turbo.head_patches, turbo.head_min_rest
         self.lead_silence_patches = turbo.lead_silence_patches
+        # streams in their head phase (a head generating, its continuation not prefilled yet): TurboConfig
+        # head_start_limit
+        self.head_start_limit = turbo.head_start_limit
+        self._head_phase: set[str] = set()
+        if turbo.mix_decode and (turbo.dit_first_t_span is not None or turbo.first_steps is not None
+                                 or turbo.first_cfg_steps != turbo.cfg_steps):
+            raise ValueError("mix_decode: a mixed step decodes its running sequences through the prefill path, whose "
+                             "LocDiT is the first patch's: dit_first_t_span, first_steps and first_cfg_steps must be "
+                             "unset")
+        self.step_cost = StepCost()  # the scheduler's time model (step_cap_ms, realtime_margin_ms)
         vae = config.model_config.audio_vae_config
         rates = vae.decoder_rates if vae is not None else [8, 6, 5, 2, 2, 2]
         out_rate = vae.out_sample_rate if vae is not None else 48000
@@ -160,6 +174,11 @@ class VoxCPM2Engine(LLMEngineBase):
         negative: the player has been waiting that long. None: nothing streamed yet."""
         end = seq.custom_payload.play_end
         return None if end is None else end - time.perf_counter()
+
+    def step_seconds(self, rows: int, tokens: int, prefill: bool) -> float:
+        """Predicted seconds of a step of ``rows`` sequences computing ``tokens`` tokens (the scheduler's time
+        model, fitted to the steps run so far)."""
+        return self.step_cost.seconds(rows, tokens, prefill)
 
     def unregister_lora(self, name: str) -> None:
         super().unregister_lora(name)
@@ -231,6 +250,8 @@ class VoxCPM2Engine(LLMEngineBase):
 
     def on_seq_running(self, seq: Sequence[VoxCPM2SeqPayload]) -> None:
         super().on_seq_running(seq)
+        if self._head_phase and seq.custom_payload.chain is None:  # a continuation's prefill: its head phase ends
+            self._head_phase.discard(seq.seq_id)
         # claim the cached prefix right after block allocation (same scheduling pass as the budget hint)
         payload = seq.custom_payload
         payload.prefix_block = None
@@ -425,7 +446,8 @@ class VoxCPM2Engine(LLMEngineBase):
         Returns the queued sequence (the head, with head start)."""
         if max_generate_length < 1:
             raise ValueError(f"max_generate_length must be >= 1, got {max_generate_length}")
-        if head_start is not False and self.head_tokens > 0 and max_generate_length > self.head_patches:
+        if (head_start is not False and self.head_tokens > 0 and max_generate_length > self.head_patches
+                and not (self.head_start_limit and len(self._head_phase) >= self.head_start_limit)):
             split = self._split_head(prompt_text, target_text, voice, clone_mode)
             if split is not None:
                 head_ids, full_ids = split
@@ -449,6 +471,8 @@ class VoxCPM2Engine(LLMEngineBase):
                                         self.head_patches, temperature, cfg_value, lora_name, seed, voice, clone_mode,
                                         head_start=False, text_tokens=head_ids)
                 head.custom_payload.chain = chain
+                if self.head_start_limit:
+                    self._head_phase.add(seq_id)
                 self._release_text(prompt_text + target_text)
                 return head
         ref = self.prepare_audio(ref_audio_latents) if ref_audio_latents is not None else None
@@ -714,7 +738,11 @@ class VoxCPM2Engine(LLMEngineBase):
 
     def step(self):
         with self.stepping():  # a cancel during the step runs after it: it also reaches a continuation queued here
+            t0 = time.perf_counter()
             seqs = super().step()
+            if seqs and self.step_cost is not None:
+                prefill, rows, tokens = self.scheduler.last_step
+                self.step_cost.observe(rows, tokens, prefill, time.perf_counter() - t0)
             for seq in reversed(seqs):  # continuations go to the front of the queue, in this step's order
                 if seq.stoped and seq.custom_payload.chain is not None:
                     try:
@@ -722,6 +750,8 @@ class VoxCPM2Engine(LLMEngineBase):
                     except ValueError:  # e.g. its LoRA was unregistered meanwhile: the stream ends with the head
                         seq.custom_payload.chained = False
                     if not seq.custom_payload.chained:
+                        if self._head_phase:
+                            self._head_phase.discard(seq.seq_id)
                         self.model_runner.call("release_sequence_state", seq.seq_id)
             return seqs
 
@@ -732,6 +762,8 @@ class VoxCPM2Engine(LLMEngineBase):
             self.lora_manager.on_sequence_finished(seq.adapter_id, was_running=was_running)
             self.model_runner.call("lora_on_sequence_finished", seq.adapter_id, was_running)
             return
+        if self._head_phase:  # (cancelled in its head phase)
+            self._head_phase.discard(seq.seq_id)
         super().on_seq_removed(seq, was_running=was_running)
 
     def encode_latents(self, wav: torch.Tensor, align_size: int = -1) -> np.ndarray:

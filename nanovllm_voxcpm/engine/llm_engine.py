@@ -263,19 +263,24 @@ class LLMEngineBase:
                 return seqs
 
             prepared = self._prepared
+            # a mixed step (TurboConfig.mix_decode): a prefill step that also decodes these running sequences; the
+            # runner's prefill path takes their decode inputs (the last patch, everything before it cached)
+            ride = {id(seq) for seq in self.scheduler.mixed} if is_prefill and self.scheduler.mixed else ()
+            fresh = [seq for seq in seqs if id(seq) not in ride] if ride else seqs
             if is_prefill:
-                self.on_prefill_admitted([seq for seq in seqs if not prepared or seq not in prepared])
+                self.on_prefill_admitted([seq for seq in fresh if not prepared or seq not in prepared])
             if prepared and is_prefill:
-                runner_tasks = [prepared.pop(seq, None) or self.preprocess_seq(seq, True) for seq in seqs]
+                runner_tasks = [self.preprocess_seq(seq, False) if id(seq) in ride
+                                else prepared.pop(seq, None) or self.preprocess_seq(seq, True) for seq in seqs]
                 prepared.clear()
             else:
-                runner_tasks = [self.preprocess_seq(seq, is_prefill) for seq in seqs]
+                runner_tasks = [self.preprocess_seq(seq, is_prefill and id(seq) not in ride) for seq in seqs]
             outputs = self.model_runner.call("run", runner_tasks, is_prefill)
 
             for seq, output in zip(seqs, outputs):
-                self.postprocess_seq(seq, output, is_prefill)
+                self.postprocess_seq(seq, output, is_prefill and id(seq) not in ride)
             if is_prefill:
-                self.after_prefill(seqs)
+                self.after_prefill(fresh)
 
             for seq in seqs:
                 if seq.stoped:

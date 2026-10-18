@@ -133,10 +133,11 @@ def adapters_lora_config(adapters: dict[str, str], max_rank: int | None = None):
 
 async def start_engine(path: str, dit: str | None, adapters: dict[str, str], lora_config, *, max_concurrency: int,
                        head_tokens: int, dit_cache, gpu_memory_utilization: float, kv_blocks: int, device: int,
-                       w8a8: bool, smooth_stats: str | None = None):
+                       w8a8: bool, smooth_stats: str | None = None, prefill_tokens: int = 4096):
     """(server, sample rate): the engine on the model directory ``path`` in the low-latency configuration
     (turbo_config), with ``adapters`` (name -> directory) registered. smooth_stats: SmoothQuant statistics for its
-    int8 layers (default: the model's own, use_model_calibration)."""
+    int8 layers (default: the model's own, use_model_calibration). prefill_tokens: the most tokens one prefill step
+    computes (max_num_batched_tokens)."""
     # the engine process reads its configuration from the environment when it starts
     os.environ["NANOVLLM_VOXCPM2_TURBO"] = json.dumps(turbo_config(dit, head_tokens, dit_cache, w8a8))
     if kv_blocks:
@@ -149,7 +150,7 @@ async def start_engine(path: str, dit: str | None, adapters: dict[str, str], lor
         else:
             use_model_calibration(path)
     server = VoxCPM.from_pretrained(
-        model=path, devices=[device], max_num_seqs=max_concurrency, max_model_len=1024, max_num_batched_tokens=4096,
+        model=path, devices=[device], max_num_seqs=max_concurrency, max_model_len=1024, max_num_batched_tokens=prefill_tokens,
         gpu_memory_utilization=gpu_memory_utilization, lora_config=lora_config,
     )
     await server.wait_for_ready()
@@ -233,12 +234,14 @@ class DialectTTS:
     @classmethod
     async def load(cls, model: str = DEFAULT_MODEL, dit: str | None = DEFAULT_DIT, *, max_concurrency: int = 256,
                    head_tokens: int = 8, dit_cache: str | dict | None = None, gpu_memory_utilization: float = 0.85,
-                   kv_blocks: int = 600, device: int = 0, w8a8: bool = True) -> "DialectTTS":
+                   kv_blocks: int = 600, device: int = 0, w8a8: bool = True,
+                   prefill_tokens: int = 4096) -> "DialectTTS":
         """Start the engine on ``model`` (local directory or Hugging Face repo with ``adapters/<dialect>/``).
 
         dit: the distilled 2-step LocDiT (path or ``repo:file``; None = the model's own LocDiT, slower).
         head_tokens: the first audio comes from the text's first <= head_tokens tokens (0 = from the whole text).
         dit_cache: with dit=None, "light" or "medium": reuse the LocDiT's middle layers on 2 or 4 of its 9 steps.
+        prefill_tokens: the most tokens one prefill step computes.
         """
         path = resolve(model)
         tags_path = os.path.join(path, "dialects.json")
@@ -248,7 +251,7 @@ class DialectTTS:
         server, sample_rate = await start_engine(
             path, dit, adapters, adapters_lora_config(adapters), max_concurrency=max_concurrency,
             head_tokens=head_tokens, dit_cache=dit_cache, gpu_memory_utilization=gpu_memory_utilization,
-            kv_blocks=kv_blocks, device=device, w8a8=w8a8)
+            kv_blocks=kv_blocks, device=device, w8a8=w8a8, prefill_tokens=prefill_tokens)
         return cls(server, sorted(adapters), sample_rate, tags)
 
     async def add_voice(self, name: str, audio: str | bytes, text: str | None = None, audio_format: str = "wav",
