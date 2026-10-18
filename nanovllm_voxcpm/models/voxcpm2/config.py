@@ -207,12 +207,6 @@ class TurboConfig(BaseModel):
     # first audio is as fast as before. Needs the first patch's LocDiT settings to be the others' (no
     # dit_first_t_span, first_steps or first_cfg_steps of their own).
     mix_decode: bool = False
-    # With mix_decode (#31): a waiting stream (a continuation) that has audio left for one more decode step and its own
-    # prefill after it, with this margin (ms) to spare, waits; a prefill step for the waiting streams comes once the
-    # most urgent of them cannot wait, and takes as many as step_cap allows (0 = off: a step as soon as one waits).
-    # A burst's continuations came due at different times and were prefilled in many small steps, each paying the
-    # fixed cost and pausing the streams that did not ride.
-    resume_lazy_ms: int = 0
     # Head start for at most this many streams at once (0 = no limit): a request arriving while this many streams are
     # in their head phase (a head generating, or its continuation waiting for its prefill) is prefilled whole. Each
     # continuation is a prefill that comes due when its head ends; a burst's continuations come due together and the

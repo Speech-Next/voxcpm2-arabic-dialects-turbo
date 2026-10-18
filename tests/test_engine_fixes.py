@@ -475,23 +475,6 @@ def test_a_resuming_step_decodes_the_streams_short_of_audio_too():
     assert off.schedule() == ([h2], True) and off.mixed == []
 
 
-def test_waiting_streams_with_audio_to_spare_wait_for_a_fuller_prefill_step():
-    buf = {"a": 0.5, "h": 0.4}
-    sch = _timed(buf, mix_decode=True, resume_lazy_ms=50)  # 10 ms a token, 50 ms a decode row
-    _playing(sch, a := _seq("a", [1]))
-    sch.add(h := _resuming("h", [4, 5]), front=True)  # 0.4 s left > a decode step (50) + its own step (30) + 50
-    sch.add(n := _seq("n", [6]))
-    assert sch.schedule() == ([n], True) and list(sch.waiting) == [h]  # h waits, the new request goes ahead
-    n.append_token(9)
-    buf["h"] = 0.1  # its audio runs low: its step comes now
-    seqs, prefill = sch.schedule()
-    assert prefill and h in seqs
-    eager = _timed({"a": 0.5, "h": 0.4}, mix_decode=True)  # resume_lazy off: a step for h at once
-    _playing(eager, _seq("a", [1]))
-    eager.add(h2 := _resuming("h", [4, 5]), front=True)
-    assert h2 in eager.schedule()[0]
-
-
 def test_waiting_continuations_go_by_their_queued_audio():
     buf = {"x": 0.3, "y": 0.1, "z": 0.2}
     sch = _timed(buf)
