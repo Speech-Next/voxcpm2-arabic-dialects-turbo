@@ -7,11 +7,12 @@ checks pass (and skips without CUDA).
 
 An in-process engine (no adapters) starts --n seeded requests and decodes them for a few steps. Then the same decode
 step runs twice, through the decode path and through the prefill path (the step's VAE state advances twice; the
-latents and stop flags do not depend on it), and once more as a mixed step: a prefill step of a new request with the
-running ones riding along (Scheduler.mixed). Checks:
+latents and stop flags do not depend on it), and once more as a mixed step: a prefill step that resumes a stream (here
+a preempted one; mixed steps are only for resuming steps) with the running ones riding along (Scheduler.mixed), every
+stream reporting an empty buffer. Checks:
   1 the prefill path's latents match the decode path's (cosine > 0.999 per row; both read the same K/V, only the
     attention kernels differ) and its stop flags are the same
-  2 a mixed step returns one patch per sequence, the new request's first and every running one's next, and the
+  2 a mixed step returns one patch per sequence, the resumed stream's next and every running one's next, and the
     engine keeps going (every request ends)
 """
 
@@ -70,14 +71,18 @@ def main(args) -> int:
     if not ok:
         fails.append("latents")
     # (the last token's KV was written twice, with the same values); now a mixed step
-    eng.add_request("late", texts[args.n], seed=99, max_generate_length=200)
-    before = {s.seq_id: len(s.custom_payload.generated_waveforms) for s in eng.scheduler.running}
+    sch = eng.scheduler
+    resumed = sch.running.pop()
+    sch.preempt(resumed)
+    eng.stream_buffer = lambda seq: 0.0  # every stream is short of audio: all of them ride along
+    before = {s.seq_id: len(s.custom_payload.generated_waveforms) for s in [*sch.running, resumed]}
     stepped = eng.step()
-    mixed = [s.seq_id for s in eng.scheduler.mixed]
+    del eng.stream_buffer
+    mixed = [s.seq_id for s in sch.mixed]
     after = {s.seq_id: len(s.custom_payload.generated_waveforms) for s in stepped}
-    ok = (sorted(mixed) == sorted(before) and "late" in after and after["late"] == 1
-          and all(after[k] == v + 1 for k, v in before.items()))
-    print(f"[{'PASS' if ok else 'FAIL'}] a mixed step: the new request's first patch and {len(mixed)} running "
+    ok = (sorted(mixed) == sorted(k for k in before if k != resumed.seq_id)
+          and all(after.get(k) == v + 1 for k, v in before.items()))
+    print(f"[{'PASS' if ok else 'FAIL'}] a mixed step: the resumed stream's next patch and {len(mixed)} running "
           f"ones' next")
     if not ok:
         fails.append("mixed step")

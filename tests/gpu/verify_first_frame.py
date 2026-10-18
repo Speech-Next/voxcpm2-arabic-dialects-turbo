@@ -67,6 +67,22 @@ def run(dec, B: int, tag: str, zs) -> dict:
     return out
 
 
+def run_mid(dec, B: int, tag: str, zs) -> dict:
+    """A stream that already played a patch, its next patch split as a prefill step's (a mixed step's riders,
+    TurboConfig.mix_decode): the usual 1 + 3 frames on ('u', i), decode_first + decode_first_rest + 3 on ('s', i)."""
+    usual, split = [(tag, "mu", i) for i in range(B)], [(tag, "ms", i) for i in range(B)]
+    for ids in (usual, split):
+        dec.decode_chunks(zs[0], ids)
+    out = {"u0": dec.decode_chunks(zs[1][..., :1].contiguous(), usual).clone()}
+    out["sa"] = dec.decode_first(zs[1][..., :1].contiguous(), split).clone()
+    out["sb"] = dec.decode_first_rest(split).clone()
+    for name, ids in (("u", usual), ("s", split)):
+        out[name + "13"] = dec.decode_chunks(zs[1][..., 1:].contiguous(), ids).clone()
+    for sid in usual + split:
+        dec.release(sid)
+    return out
+
+
 def main() -> int:
     if not torch.cuda.is_available():
         print("no CUDA: skipped")
@@ -94,6 +110,15 @@ def main() -> int:
                                ("next patch", r["up1"], r["sp1"])):
                 s = snr(a, b)
                 check(f"2 {name} matches the usual decode (B={B}, graphs={graphs})", s > 50, f"SNR {s:.1f} dB")
+            m = run_mid(dec, B, f"g{graphs}", zs)
+            n = m["sa"].size(-1)
+            check(f"4 mid-stream: first part = the frame's first {n} samples (B={B}, graphs={graphs})",
+                  torch.equal(m["sa"], m["u0"][..., :n]))
+            whole = torch.cat([m["sa"], m["sb"]], -1)
+            for name, a, b in (("frame", m["u0"], whole), ("frames 1-3", m["u13"], m["s13"])):
+                s = snr(a, b)
+                check(f"4 mid-stream {name} matches the usual decode (B={B}, graphs={graphs})", s > 50,
+                      f"SNR {s:.1f} dB")
         del dec
         torch.cuda.empty_cache()
     for B in batches:
