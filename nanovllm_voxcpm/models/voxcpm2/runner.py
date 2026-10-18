@@ -44,7 +44,8 @@ def _pinned_concat(arrays: list[np.ndarray]) -> torch.Tensor:
 
 
 # NANOVLLM_KERNEL_TRACE=<file>: a torch.profiler kernel table of prefill steps with at least
-# NANOVLLM_KERNEL_TRACE_MIN_BS sequences (default 128), the first NANOVLLM_KERNEL_TRACE_SKIP (default 2) skipped
+# NANOVLLM_KERNEL_TRACE_MIN_BS sequences (default 128), the first NANOVLLM_KERNEL_TRACE_SKIP (default 2) skipped;
+# NANOVLLM_KERNEL_TRACE_COUNT (default 1) steps, the k-th (k > 0) to <file>.<k>
 _TRACE_PATH = os.environ.get("NANOVLLM_KERNEL_TRACE")
 _trace_seen = [0]
 
@@ -54,17 +55,21 @@ def _kernel_trace(is_prefill: bool, bs: int):
         return None
     _trace_seen[0] += 1
     skip = int(os.environ.get("NANOVLLM_KERNEL_TRACE_SKIP", "2"))
-    if _trace_seen[0] <= skip or _trace_seen[0] > skip + 1:
+    count = int(os.environ.get("NANOVLLM_KERNEL_TRACE_COUNT", "1"))
+    if _trace_seen[0] <= skip or _trace_seen[0] > skip + count:
         return None
     from torch.profiler import ProfilerActivity, profile
 
     return profile(activities=[ProfilerActivity.CUDA])
 
 
-def _dump_kernel_trace(trace) -> None:
-    with open(_TRACE_PATH, "w") as f:
+def _dump_kernel_trace(trace, bs: int) -> None:
+    k = _trace_seen[0] - int(os.environ.get("NANOVLLM_KERNEL_TRACE_SKIP", "2")) - 1
+    path = _TRACE_PATH if k == 0 else f"{_TRACE_PATH}.{k}"
+    with open(path, "w") as f:
+        f.write(f"prefill step, {bs} rows\n")
         f.write(trace.key_averages().table(sort_by="cuda_time_total", row_limit=60, max_name_column_width=70))
-    trace.export_chrome_trace(_TRACE_PATH + ".json")
+    trace.export_chrome_trace(path + ".json")
 
 
 @dataclass
@@ -361,7 +366,7 @@ class VoxCPM2Runner(BaseModelRunner):
         with trace:
             out = self._run(seqs, is_prefill)
             torch.cuda.synchronize()
-        _dump_kernel_trace(trace)
+        _dump_kernel_trace(trace, len(seqs))
         return out
 
     def _noise_seeds(self, seqs: list[RunnerTask[VoxCPM2Payload]]) -> np.ndarray:

@@ -178,6 +178,16 @@ class TurboConfig(BaseModel):
     # waits). No underruns in bursts beyond what the A10 can cover (#28's WebSocket benchmark: about 110 at once and
     # up), at the cost of time to first audio there (p95 at 150 / 200 at once: ~0.15 -> 0.8 / 1.7 s).
     head_hold: bool = False
+    # Head start under load, an intermediate stage (#31; 0 = off): a head whose audio would run out before its
+    # whole continuation is prefilled (a burst: ~65 tokens a stream, ~0.8 s for 200 on one A10) is continued first
+    # with the text's first <= mid_tokens tokens (a word-boundary prefix; with stage_kv_reuse its prefill computes
+    # only the tokens after the head's), for at most mid_patches_max patches, enough to last until the whole
+    # continuation is prefilled; then with the whole text. Streams that are in time go to the whole text at once.
+    mid_tokens: int = 0
+    mid_patches_max: int = 10
+    # A head start's continuation (or intermediate stage) takes the KV of the prefix it shares with the stage
+    # before it (the voice and that stage's text) from that stage's first block instead of computing it again.
+    stage_kv_reuse: bool = False
     # A stream's leading silence (-1 = as generated): after this many silent patches (below -50 dBFS) at its start,
     # further silent patches are generated but not streamed, until the first patch with sound. With head start, a
     # head of nothing but silence (3 patches) was followed by a continuation that again began with a pause: 0.77 s

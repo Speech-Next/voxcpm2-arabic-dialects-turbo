@@ -29,6 +29,11 @@ _CJK = re.compile("[\u4e00-\u9fff]")  # the tokenizer wrapper splits multi-chara
 _LEADING_TAG = re.compile(r"<reserved_\d+>")  # a tagged model's dialect tag in front of the text
 
 
+# An intermediate stage's patches per token of its text (TurboConfig.mid_tokens): below the speaking rate (#28's
+# Egyptian texts: ~0.68 patches a token) so that the stage stops before the speech of its text's end
+_PATCHES_PER_TOKEN = 0.5
+
+
 def _is_silent(wave) -> bool:
     """A streamed chunk (float in [-1, 1] or int16 PCM) below -50 dBFS RMS."""
     x = np.asarray(wave)
@@ -107,6 +112,9 @@ class VoxCPM2Engine(LLMEngineBase):
     lead_silence_patches = -1  # leading silence as generated
     head_start_limit = 0  # head start for every request long enough
     head_patches_max, head_margin, step_cap, head_hold = 0, 0.15, 0.0, False  # every head head_patches long
+    mid_tokens, mid_patches_max, stage_kv_reuse = 0, 10, False  # no intermediate stage, every stage prefilled whole
+    # stream id -> (KV block kept from its finished stage, the token ids it holds KV for, their PreparedAudio)
+    _stream_prefix = MappingProxyType({})
     _head_phase = MappingProxyType({})  # (instances built without __init__: read-only, never added to)
     _head_sum = 0  # the sum of _head_phase's values
     step_cost: StepCost | None = None
@@ -145,6 +153,9 @@ class VoxCPM2Engine(LLMEngineBase):
         self.head_start_limit = turbo.head_start_limit
         self.head_patches_max, self.head_margin = turbo.head_patches_max, turbo.head_margin_ms / 1000
         self.step_cap, self.head_hold = turbo.step_cap_ms / 1000, turbo.head_hold
+        self.mid_tokens, self.mid_patches_max = turbo.mid_tokens, turbo.mid_patches_max
+        self.stage_kv_reuse = turbo.stage_kv_reuse
+        self._stream_prefix: dict[str, tuple[int, list, PreparedAudio | None]] = {}
         self._head_phase: dict[str, int] = {}
         self._text_lens: dict[str, int] = {}
         if turbo.mix_decode and (turbo.dit_first_t_span is not None or turbo.first_steps is not None
@@ -232,41 +243,64 @@ class VoxCPM2Engine(LLMEngineBase):
         ref_hash list, element for element: the comparison starts after it (a cloned voice is ~50 positions).
         """
         payload = seq.custom_payload
-        entry = self.ref_prefix_blocks.get(payload.ref_key)
-        if entry is None:
-            return -1, 0
-        block, tokens, ref = entry
-        n = min(len(tokens), len(seq) - 1)  # at least one position must run to produce the first patch
-        memo = payload.prefix_memo
-        if memo is not None and memo[0] is entry and memo[1] == n:
-            return block, memo[2]
-        k = min(len(ref.ref_hash), n) if ref is not None and ref is payload.ref_audio else 0
+        best = (-1, 0)
+        entry = self.ref_prefix_blocks.get(payload.ref_key) if payload.ref_key is not None else None
+        if entry is not None:
+            n = min(len(entry[1]), len(seq) - 1)  # at least one position must run to produce the first patch
+            memo = payload.prefix_memo
+            if memo is not None and memo[0] is entry and memo[1] == n:
+                best = (entry[0], memo[2])
+            else:
+                best = (entry[0], self._shared(seq, entry, n))
+                payload.prefix_memo = (entry, n, best[1])
+        own = self._stream_prefix.get(seq.seq_id) if self._stream_prefix else None
+        if own is not None and own[3] is not seq:  # the stage before it (stage_kv_reuse)
+            k = self._shared(seq, own, min(len(own[1]), len(seq) - 1))
+            if k > best[1]:
+                best = (own[0], k)
+        return best
+
+    @staticmethod
+    def _shared(seq: Sequence[VoxCPM2SeqPayload], entry: tuple, n: int) -> int:
+        """The positions ``seq``'s first ``n`` tokens share with ``entry``'s (pinned block, token ids, reference)."""
+        tokens, ref = entry[1], entry[2]
+        k = min(len(ref.ref_hash), n) if ref is not None and ref is seq.custom_payload.ref_audio else 0
         ids = seq.token_ids
         if n - k > 16:  # the first position from k whose tokens differ (or n), compared in C
-            k = next(compress(count(k), map(ne, islice(ids, k, n), islice(tokens, k, None))), n)
-        else:
-            while k < n and ids[k] == tokens[k]:
-                k += 1
-        payload.prefix_memo = (entry, n, k)
-        return block, k
+            return next(compress(count(k), map(ne, islice(ids, k, n), islice(tokens, k, None))), n)
+        while k < n and ids[k] == tokens[k]:
+            k += 1
+        return k
 
     def cached_prefix_tokens(self, seq: Sequence[VoxCPM2SeqPayload]) -> int:
-        if not self.ref_prefix_cache_enabled or seq.custom_payload.ref_key is None:
+        if not self._may_share(seq):
             return 0
         return self._prefix_match(seq)[1]
 
+    def _may_share(self, seq: Sequence[VoxCPM2SeqPayload]) -> bool:
+        """A cached prefix can apply: its voice's (ref_prefix_cache) or its stream's stage before it."""
+        return ((self.ref_prefix_cache_enabled and seq.custom_payload.ref_key is not None)
+                or bool(self._stream_prefix and seq.seq_id in self._stream_prefix))
+
     def on_seq_running(self, seq: Sequence[VoxCPM2SeqPayload]) -> None:
         super().on_seq_running(seq)
-        if self._head_phase and seq.custom_payload.chain is None:  # a continuation's prefill: its head phase ends
+        chain = seq.custom_payload.chain
+        if self._head_phase and chain is None:  # a continuation's prefill: its head phase ends
             self._phase_pop(seq.seq_id)
+        elif self._head_phase and chain is not None and chain.get("stage") and seq.seq_id in self._head_phase:
+            # an intermediate stage's prefill: the stream's next one is the whole continuation's, after its patches
+            self._phase_set(seq.seq_id, self._stage_tokens(chain, chain.get("cont_tokens", 0), chain["stage_len"])
+                            + chain.get("done", 0) + (seq.custom_payload.max_generate_length or 0))
         # claim the cached prefix right after block allocation (same scheduling pass as the budget hint)
         payload = seq.custom_payload
         payload.prefix_block = None
-        if not self.ref_prefix_cache_enabled or payload.ref_key is None or seq.num_cached_tokens:
+        if seq.num_cached_tokens or not self._may_share(seq):
             return
         block, k = self._prefix_match(seq)
         if k:
-            self.ref_prefix_blocks.move_to_end(payload.ref_key)
+            entry = self.ref_prefix_blocks.get(payload.ref_key) if payload.ref_key is not None else None
+            if entry is not None and entry[0] == block:
+                self.ref_prefix_blocks.move_to_end(payload.ref_key)
             payload.prefix_block = block
             seq.num_cached_tokens = k
 
@@ -290,6 +324,32 @@ class VoxCPM2Engine(LLMEngineBase):
     def after_prefill(self, seqs) -> None:
         if self.ref_prefix_cache_enabled:
             self._remember_prefixes(seqs)
+        if self._stream_prefix:  # continuations prefilled: the stage blocks they copied from go
+            for seq in seqs:
+                own = self._stream_prefix.get(seq.seq_id)
+                if own is not None and own[3] is not seq:
+                    self._drop_stage_prefix(seq.seq_id)
+
+    def _keep_stage_prefix(self, seq: Sequence[VoxCPM2SeqPayload]) -> None:
+        """A head start stage ends (stage_kv_reuse): keep its first KV block (the voice, its text) for its
+        continuation to copy the shared prefix from; dropped once that is prefilled (or never queued)."""
+        self._drop_stage_prefix(seq.seq_id)
+        if not seq.block_table:
+            return
+        block_id = seq.block_table[0]
+        self.scheduler.block_manager.blocks[block_id].ref_count += 1  # (the sequence's own release leaves it)
+        n = min(seq.num_prompt_tokens, self.block_size)
+        self._stream_prefix[seq.seq_id] = (block_id, seq.token_ids[:n], seq.custom_payload.ref_audio, seq)
+
+    def _drop_stage_prefix(self, seq_id: str) -> None:
+        own = self._stream_prefix.pop(seq_id, None) if self._stream_prefix else None
+        if own is None:
+            return
+        bm = self.scheduler.block_manager
+        block = bm.blocks[own[0]]
+        block.ref_count -= 1
+        if block.ref_count == 0:
+            bm._deallocate_block(own[0])
 
     def _remember_prefixes(self, seqs: list[Sequence[VoxCPM2SeqPayload]]) -> None:
         """After a prefill step, pin a copy of the first KV block of each voice's first request."""
@@ -407,6 +467,8 @@ class VoxCPM2Engine(LLMEngineBase):
             and len(seq.custom_payload.generated_waveforms) >= seq.custom_payload.max_generate_length
         ):
             seq.stoped = True
+        if seq.stoped and payload.chain is not None and self.stage_kv_reuse:
+            self._keep_stage_prefix(seq)
 
     def prepare_audio(self, latents: np.ndarray) -> PreparedAudio:
         latents = np.ascontiguousarray(latents, dtype=np.float32).reshape(-1, self.feat_dim)
@@ -475,9 +537,22 @@ class VoxCPM2Engine(LLMEngineBase):
                              temperature=temperature, cfg_value=cfg_value, lora_name=lora_name, seed=seed,
                              voice=voice, voice_entry=entry, clone_mode=clone_mode, text_ids=full_ids)
                 patches, cont = self.head_patches, 0
-                if self.head_patches_max > self.head_patches or self.head_start_limit:
+                if self.mid_tokens > self.head_tokens:  # #31: an intermediate stage, for a head whose whole
+                    # continuation would come too late
+                    mid = self._split_head(prompt_text, target_text, voice, clone_mode, limit=self.mid_tokens)
+                    if mid is not None and len(mid[0]) >= len(head_ids) + self.head_min_rest:
+                        chain["mid_ids"] = mid[0]
+                if self.head_patches_max > self.head_patches or self.head_start_limit or "mid_ids" in chain:
                     cont = self._continuation_tokens(full_ids, prompt_text, prompt_latents, ref_audio_latents,
                                                      entry, clone_mode)
+                    # the whole continuation's prefill before any reuse, and the prompt text's ids (the voice's
+                    # cached prefix holds them: no stage reuses them)
+                    chain["cont_tokens"] = cont
+                    chain["prompt_ids"] = self._prompt_text_len(prompt_text, entry, clone_mode)
+                    cont = self._stage_tokens(chain, cont, len(head_ids))
+                    if "mid_ids" in chain:  # the head lasts until its next prefill: the intermediate one, if needed
+                        cont = min(cont, self._stage_tokens(chain, self._mid_tokens(chain), len(head_ids)))
+                chain["stage_len"] = len(head_ids)  # the text the head holds (its continuation may reuse its KV)
                 if self.head_patches_max > self.head_patches and self.step_cost is not None:
                     patches = min(self._plan_head(cont), max_generate_length - 1)
                 head = self.add_request(seq_id, target_text, prompt_text, prompt_latents, ref_audio_latents,
@@ -671,12 +746,15 @@ class VoxCPM2Engine(LLMEngineBase):
         self._release_text(prompt_text + target_text)
         return ids
 
-    def _split_head(self, prompt_text, target_text, voice, clone_mode) -> tuple[list[int], list[int]] | None:
+    def _split_head(self, prompt_text, target_text, voice, clone_mode,
+                    limit: int | None = None) -> tuple[list[int], list[int]] | None:
         """Head start: (ids of prompt_text + head, ids of prompt_text + target_text), the head being the longest
         word-boundary prefix of target_text with at most head_tokens tokens (cut at the last clause boundary
         inside it when that keeps half of it), or the first word when that alone is longer (up to twice
         head_tokens: a whole-text fallback put 22 of 200 requests' full texts into the head step at 6 tokens);
-        None when the target is short enough to prefill whole."""
+        None when the target is short enough to prefill whole. limit: in place of head_tokens (an intermediate
+        stage's prefix, mid_tokens)."""
+        limit = limit or self.head_tokens
         if voice is not None:
             entry = self.voices.get(voice)
             if entry is not None and (clone_mode or ("prompt_ref" if entry.text else "ref")) != "ref":
@@ -690,17 +768,17 @@ class VoxCPM2Engine(LLMEngineBase):
         if tag is not None:  # the head counts text, not the dialect tag in front of it
             start = tag.end()
         first = next((k for k, o in enumerate(offs) if o[1] > start), len(ids))  # first token of the target
-        if len(ids) - first <= self.head_tokens + self.head_min_rest:
+        if len(ids) - first <= limit + self.head_min_rest:
             return None
         best = clause = None
-        for k in range(first + 1, min(first + self.head_tokens, len(ids) - 1) + 1):
+        for k in range(first + 1, min(first + limit, len(ids) - 1) + 1):
             o = offs[k][0]
             if o > start and o < len(text) and text[o] == " " and offs[k - 1][1] <= o:  # a word starts at token k
                 best = k
                 if text[o - 1] in ",،;؛:":
                     clause = k
         if best is None:  # the first word alone is longer than head_tokens: it is the head (up to twice that)
-            best = next((k for k in range(first + 1, min(first + 2 * self.head_tokens, len(ids) - 1) + 1)
+            best = next((k for k in range(first + 1, min(first + 2 * limit, len(ids) - 1) + 1)
                          if text[offs[k][0]:offs[k][0] + 1] == " " and offs[k - 1][1] <= offs[k][0]), None)
             if best is None:
                 return None
@@ -727,6 +805,30 @@ class VoxCPM2Engine(LLMEngineBase):
                     self._text_lens[text] = len(self.tokenizer(text))
                 cached = min(self.block_size, n_ref + 2 + (self._text_lens[text] if text else 0))
         return max(1, total - cached)
+
+    def _prompt_text_len(self, prompt_text, entry, clone_mode) -> int:
+        """Token ids of the prompt text a request's text starts with (a prompt_ref voice's transcript, prompt_text)."""
+        mode = clone_mode or ("prompt_ref" if entry is not None and entry.text else "ref")
+        text = entry.text if entry is not None and mode != "ref" else prompt_text
+        if not text:
+            return 0
+        if entry is None:
+            return len(self.tokenizer(text))
+        if text not in self._text_lens:  # (a voice's transcript: a few, kept)
+            self._text_lens[text] = len(self.tokenizer(text))
+        return self._text_lens[text]
+
+    def _stage_tokens(self, chain: dict, tokens: int, prev_len: int) -> int:
+        """A head start stage's prefill tokens: ``tokens`` (its prefill after the voice's cached prefix) less, with
+        stage_kv_reuse, the text the stage before it holds (``prev_len`` ids, the prompt text aside)."""
+        if not self.stage_kv_reuse:
+            return tokens
+        return max(1, tokens - (prev_len - chain.get("prompt_ids", 0)))
+
+    @staticmethod
+    def _mid_tokens(chain: dict) -> int:
+        """The intermediate stage's prefill before any reuse: the whole continuation's, with its shorter text."""
+        return chain["cont_tokens"] - (len(chain["text_ids"]) - len(chain["mid_ids"]))
 
     def _head_plan(self):
         """TurboConfig.head_patches_max, from the predicted step times: plan(backlog, tokens) -> (patches, covered),
@@ -811,27 +913,66 @@ class VoxCPM2Engine(LLMEngineBase):
             return True
         return plan(backlog, own)[1]
 
+    def _whole_in_time(self, seq: Sequence[VoxCPM2SeqPayload], tokens: int) -> bool:
+        """At the end of a head (TurboConfig.mid_tokens): would its whole continuation (``tokens`` to prefill),
+        after the continuations already waiting, be prefilled before its player runs out of the audio it has, with
+        head_margin to spare? The continuations' steps also carry every other stream (mix_decode), as _head_plan."""
+        buf = self.stream_buffer(seq)
+        if buf is None or self.step_cost is None:
+            return True
+        a, b, c = self.step_cost.prefill.coef
+        queued = 0.0
+        for s in self.scheduler.waiting:
+            if not s.has_stream:
+                break
+            queued += b + c * self._head_phase.get(s.seq_id, 0)
+        own = b + c * tokens
+        rows = len(self.scheduler.running) + len(self.scheduler.waiting)
+        step = a + (b + c) * rows
+        steps = math.ceil((queued + own) / max(self.step_cap - step, 0.02)) if self.step_cap > 0 else 2
+        return buf - self.head_margin >= queued + own + steps * step
+
+    def _mid_patches(self, chain: dict, mid_len: int, done: int, rest: int) -> int:
+        """An intermediate stage's patches: as many as its text has speech for, its last head_min_rest tokens
+        aside (about _PATCHES_PER_TOKEN a token, less the patches spoken already), at most mid_patches_max."""
+        speech = int(_PATCHES_PER_TOKEN * (mid_len - chain.get("prompt_ids", 0) - self.head_min_rest))
+        return max(1, min(speech - done, self.mid_patches_max, rest - 1))
+
     def _continue_head(self, seq: Sequence[VoxCPM2SeqPayload]) -> bool:
         """Queue the whole request after a finished head: its patches become prompt audio (after the voice's
-        own prompt audio, if any); seed, noise step, LoRA and stream id carry over. False: nothing was queued."""
+        own prompt audio, if any); seed, noise step, LoRA and stream id carry over. False: nothing was queued.
+        TurboConfig.mid_tokens: a head whose whole continuation would come too late (_whole_in_time) is continued
+        with the text's first mid_tokens tokens first (an intermediate stage, itself continued the same way when it
+        ends); its patches join the prompt audio of the whole continuation."""
         chain, payload = seq.custom_payload.chain, seq.custom_payload
         n = len(payload.generated_waveforms)
+        done = chain.get("done", 0) + n  # the stream's patches so far (an intermediate stage: the head's too)
         # cap: a continuation never speaks slower than ~4 tokens (characters) a second; a model that keeps
         # generating past that (silence, babble) is cut off
-        rest = min(chain["max_generate_length"] - n, int(1.5 * len(chain["text_ids"])) + 20)
+        rest = min(chain["max_generate_length"] - done, int(1.5 * len(chain["text_ids"])) + 20)
         if rest < 1:
             return False
         # Leading silent patches (a sentence often starts with a short pause) are not given as prompt audio: a
         # prompt of nothing but silence was continued as silence, never reaching the stop (measured: 400 silent
         # patches). They were streamed already; the continuation starts after them.
+        prior = chain.get("prior")  # an intermediate stage's: the earlier stages' prompt audio (None: silence)
         silent = payload.patch_silent or [_is_silent(w) for w in payload.generated_waveforms[-n:]]
         k = 0
-        while k < n and silent[-n + k]:
+        while prior is None and k < n and silent[-n + k]:
             k += 1
         feats = payload.feats[-n:][k:]
         head = (np.concatenate([f.reshape(-1, self.feat_dim) for f in feats], axis=0).astype(np.float32)
                 if feats else None)
+        if prior is not None:
+            head = prior if head is None else np.concatenate([prior, head], axis=0)
+        prev = chain.get("stage_len", 0)  # the text ids the stage that ended holds
+        mid = chain.get("mid_ids") if not chain.get("stage") else None
+        whole = self._stage_tokens(chain, chain.get("cont_tokens", 0), prev) + done  # the whole continuation's
+        if mid is not None and self._whole_in_time(seq, whole):
+            mid = None
         kw = dict(chain)
+        for key in ("mid_ids", "cont_tokens", "prompt_ids", "stage_len", "stage", "prior", "done"):
+            kw.pop(key, None)
         prompt, prompt_text, ref = kw.pop("prompt_latents"), kw.pop("prompt_text"), kw.pop("ref_audio_latents")
         voice, mode, entry = kw.pop("voice"), kw.pop("clone_mode"), kw.pop("voice_entry")
         if voice is not None:  # resolve the registered voice into latents, as add_request does
@@ -847,10 +988,18 @@ class VoxCPM2Engine(LLMEngineBase):
             kw["prompt_latents"] = prompt
         kw["prompt_text"], kw["ref_audio_latents"], kw["max_generate_length"] = prompt_text, ref, rest
         kw["text_tokens"] = kw.pop("text_ids")
+        if mid is not None:  # the intermediate stage: the text's first mid_tokens tokens, for a few patches
+            kw["text_tokens"] = mid
+            kw["max_generate_length"] = self._mid_patches(chain, len(mid), done, rest)
         new = self.add_request(seq.seq_id, head_start=False, resume=True, **kw)
         new.custom_payload.seed_step = payload.seed_step
         new.custom_payload.lead_silent = payload.lead_silent  # the stream's leading silence goes on counting
         new.custom_payload.play_end = payload.play_end  # and its player keeps playing the head's audio
+        if mid is not None:
+            new.custom_payload.chain = dict(chain, stage=1, stage_len=len(mid), prior=head, done=done)
+        if self._head_phase and seq.seq_id in self._head_phase:  # the stream's next prefill
+            nxt = self._stage_tokens(chain, self._mid_tokens(chain), prev) + done if mid is not None else whole
+            self._phase_set(seq.seq_id, nxt)
         return True
 
     def step(self):
@@ -869,12 +1018,17 @@ class VoxCPM2Engine(LLMEngineBase):
                     except ValueError:  # e.g. its LoRA was unregistered meanwhile: the stream ends with the head
                         seq.custom_payload.chained = False
                     if not seq.custom_payload.chained:
+                        self._drop_stage_prefix(seq.seq_id)
                         if self._head_phase:
                             self._phase_pop(seq.seq_id)
                         self.model_runner.call("release_sequence_state", seq.seq_id)
             return seqs
 
     def on_seq_removed(self, seq: Sequence, *, was_running: bool) -> None:
+        if self._stream_prefix and not (seq.stoped and getattr(seq.custom_payload, "chain", None) is not None):
+            own = self._stream_prefix.get(seq.seq_id)
+            if own is not None and own[3] is not seq:  # (a continuation cancelled before its prefill)
+                self._drop_stage_prefix(seq.seq_id)
         if seq.stoped and getattr(seq.custom_payload, "chain", None) is not None:
             # a finished head: its continuation keeps the stream's VAE state (seamless audio); step() releases it
             # if no continuation gets queued

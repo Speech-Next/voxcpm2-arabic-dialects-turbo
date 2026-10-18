@@ -790,6 +790,76 @@ def _steps_until_chained(eng, seq_id):
     raise AssertionError("the head was not continued")
 
 
+def _staged(per_token, mid_tokens=16):
+    """_loaded with #31's intermediate stage (head: 3 ids, intermediate: mid_tokens ids, whole: one per word) and stage
+    KV reuse; records the KV copies."""
+    eng = _loaded(per_token)
+    eng.mid_tokens, eng.mid_patches_max, eng.stage_kv_reuse, eng._stream_prefix = mid_tokens, 6, True, {}
+    eng._split_head = lambda prompt_text, target_text, voice, clone_mode, limit=None: (
+        [7] * (limit or 3), [7] * len((prompt_text + target_text).split()))
+    eng.copies, call = [], eng.model_runner.call
+
+    def spy(name, *args):
+        if name == "copy_kv_blocks":
+            eng.copies.append(args[1])
+        return call(name, *args)
+
+    eng.model_runner.call = spy
+    return eng
+
+
+def test_a_continuation_copies_the_prefix_it_shares_with_its_head():
+    eng = _staged(0.0001)  # fast prefill: the whole continuation is in time, no intermediate stage
+    bm = eng.scheduler.block_manager
+    free = len(bm.free_block_ids)
+    eng.add_request("r", _words(40), max_generate_length=40)
+    _steps_until_chained(eng, "r")
+    cont = eng.scheduler.waiting[0]
+    assert cont.custom_payload.chain is None and cont.num_tokens == 40 + 1 + 3  # text, audio start, the head's patches
+    assert "r" in eng._stream_prefix and len(bm.free_block_ids) == free - 1  # the head's block, kept
+    eng.step()  # the continuation's prefill: the head's 3 text ids come from its block
+    assert eng.copies[-1] == [3] and not eng._stream_prefix and len(bm.free_block_ids) == free - 1
+    _run(eng, 80)
+    assert len(bm.free_block_ids) == free and not eng._head_phase and eng._head_sum == 0
+
+
+def test_a_late_head_speaks_the_intermediate_stage_first():
+    eng = _staged(0.01)  # 10 ms a token: the whole continuation (~41 tokens) would outlast the head's 480 ms
+    bm = eng.scheduler.block_manager
+    free = len(bm.free_block_ids)
+    eng.add_request("r", _words(40), max_generate_length=40)
+    assert eng._head_phase["r"] == 16 + 1 - 3 + 3  # the head's next prefill: the intermediate stage's
+    _steps_until_chained(eng, "r")
+    mid = eng.scheduler.waiting[0]
+    chain = mid.custom_payload.chain
+    assert chain is not None and chain["stage"] == 1 and chain["done"] == 3
+    assert mid.custom_payload.max_generate_length == 4  # 0.5 a token of its 16 (2 kept back), less the head's 3
+    assert mid.num_tokens == 16 + 1 + 3
+    eng.step()  # its prefill, with the head's 3 ids copied
+    assert eng.copies[-1] == [3] and eng._head_phase["r"] == 40 + 1 - 16 + 3 + 4  # next: the whole continuation
+    for _ in range(10):
+        if eng.scheduler.waiting:
+            break
+        eng.step()
+    whole = eng.scheduler.waiting[0]
+    assert whole.custom_payload.chain is None and whole.num_tokens == 40 + 1 + 3 + 4  # every earlier patch
+    assert whole.custom_payload.max_generate_length == 40 - 7
+    eng.step()
+    assert eng.copies[-1] == [16]  # the intermediate stage's 16 ids
+    _run(eng, 80)
+    assert len(bm.free_block_ids) == free and not eng._stream_prefix and not eng._head_phase
+
+
+def test_a_cancelled_continuation_frees_the_block_it_would_copy():
+    eng = _staged(0.0001)
+    bm = eng.scheduler.block_manager
+    free = len(bm.free_block_ids)
+    eng.add_request("r", _words(40), max_generate_length=40)
+    _steps_until_chained(eng, "r")
+    eng.cancel_sequence("r")
+    assert not eng._stream_prefix and len(bm.free_block_ids) == free
+
+
 def test_continuation_survives_unregister_voice_and_goes_first():
     eng = _voxcpm2_engine(max_model_len=128, max_num_seqs=1)
     eng.register_voice("v", np.zeros((PATCH * 5, FEAT), np.float32))
