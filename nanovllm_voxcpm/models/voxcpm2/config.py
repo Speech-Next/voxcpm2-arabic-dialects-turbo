@@ -173,6 +173,11 @@ class TurboConfig(BaseModel):
     # start with fewer streams ahead of them stay head_patches long; time to first audio does not change.
     head_patches_max: int = 0
     head_margin_ms: int = 150
+    # With head_patches_max: a new request with a head start waits while even head_patches_max patches would not last
+    # until its continuation is prefilled, or while a burst's continuations are still being prefilled (False = never
+    # waits). No underruns in bursts beyond what the A10 can cover (the user's benchmark: about 110 at once and up),
+    # at the cost of time to first audio there (p95 at 150 / 200 at once: ~0.15 -> 0.8 / 1.7 s).
+    head_hold: bool = False
     # A stream's leading silence (-1 = as generated): after this many silent patches (below -50 dBFS) at its start,
     # further silent patches are generated but not streamed, until the first patch with sound. With head start, a
     # head of nothing but silence (3 patches) was followed by a continuation that again began with a pause: 0.77 s

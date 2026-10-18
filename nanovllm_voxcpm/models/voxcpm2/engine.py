@@ -106,8 +106,9 @@ class VoxCPM2Engine(LLMEngineBase):
     head_tokens, head_patches, head_min_rest = 0, 3, 8  # head start off
     lead_silence_patches = -1  # leading silence as generated
     head_start_limit = 0  # head start for every request long enough
-    head_patches_max, head_margin, step_cap = 0, 0.15, 0.0  # every head head_patches long
+    head_patches_max, head_margin, step_cap, head_hold = 0, 0.15, 0.0, False  # every head head_patches long
     _head_phase = MappingProxyType({})  # (instances built without __init__: read-only, never added to)
+    _head_sum = 0  # the sum of _head_phase's values
     step_cost: StepCost | None = None
     _pretok_cache: dict | None = None
     _tag_remap: dict = {}  # (instances built without __init__, e.g. in tests: no tagged adapters)
@@ -143,7 +144,7 @@ class VoxCPM2Engine(LLMEngineBase):
         # continuation's prefill will compute: TurboConfig head_start_limit, head_patches_max
         self.head_start_limit = turbo.head_start_limit
         self.head_patches_max, self.head_margin = turbo.head_patches_max, turbo.head_margin_ms / 1000
-        self.step_cap = turbo.step_cap_ms / 1000
+        self.step_cap, self.head_hold = turbo.step_cap_ms / 1000, turbo.head_hold
         self._head_phase: dict[str, int] = {}
         self._text_lens: dict[str, int] = {}
         if turbo.mix_decode and (turbo.dit_first_t_span is not None or turbo.first_steps is not None
@@ -257,7 +258,7 @@ class VoxCPM2Engine(LLMEngineBase):
     def on_seq_running(self, seq: Sequence[VoxCPM2SeqPayload]) -> None:
         super().on_seq_running(seq)
         if self._head_phase and seq.custom_payload.chain is None:  # a continuation's prefill: its head phase ends
-            self._head_phase.pop(seq.seq_id, None)
+            self._phase_pop(seq.seq_id)
         # claim the cached prefix right after block allocation (same scheduling pass as the budget hint)
         payload = seq.custom_payload
         payload.prefix_block = None
@@ -484,7 +485,7 @@ class VoxCPM2Engine(LLMEngineBase):
                                         head_start=False, text_tokens=head_ids)
                 head.custom_payload.chain = chain
                 if cont:
-                    self._head_phase[seq_id] = cont + patches
+                    self._phase_set(seq_id, cont + patches)
                 self._release_text(prompt_text + target_text)
                 return head
         ref = self.prepare_audio(ref_audio_latents) if ref_audio_latents is not None else None
@@ -751,8 +752,7 @@ class VoxCPM2Engine(LLMEngineBase):
         """A new head's patches: enough audio to last until its continuation (``tokens`` to prefill) is prefilled
         after those of the streams in their head phase ahead of it."""
         _, b, c = self.step_cost.prefill.coef
-        heads = self._head_phase
-        return self._head_plan()(b * len(heads) + c * sum(heads.values()), tokens + self.head_patches)[0]
+        return self._head_plan()(b * len(self._head_phase) + c * self._head_sum, tokens + self.head_patches)[0]
 
     def _replan_heads(self) -> None:
         """Before a step: lengthen the heads still generating whose audio would no longer last until their
@@ -769,16 +769,25 @@ class VoxCPM2Engine(LLMEngineBase):
                 if p.lead_silent >= 0 and p.generated_waveforms:  # no sound yet: its patches give no audio to play
                     h = max(h, min(len(p.generated_waveforms) + 1, self.head_patches_max))
                 h = min(h, p.chain["max_generate_length"] - 1)
-                if h > p.max_generate_length:
-                    self._head_phase[sid] = tokens + h - p.max_generate_length
+                if h > p.max_generate_length:  # (a value changes: the dict's order and size stay)
+                    self._head_sum += h - p.max_generate_length
                     tokens, p.max_generate_length = tokens + h - p.max_generate_length, h
+                    self._head_phase[sid] = tokens
             backlog += b + c * tokens
 
+    def _phase_set(self, sid: str, tokens: int) -> None:
+        self._head_sum += tokens - self._head_phase.get(sid, 0)
+        self._head_phase[sid] = tokens
+
+    def _phase_pop(self, sid: str) -> None:
+        self._head_sum -= self._head_phase.pop(sid, 0)
+
     def head_fits(self, seq: Sequence[VoxCPM2SeqPayload]) -> bool:
-        """The scheduler's admission test for a new request: False for a head that even head_patches_max patches
-        would not cover (the continuation prefill ahead of it is too long): it waits until enough of it is done, and
-        the requests behind it too. Always True for the first stream in its head phase."""
-        if (not self._head_phase or seq.custom_payload.chain is None or self.step_cost is None
+        """The scheduler's admission test for a new request (TurboConfig.head_hold): False for a head that even
+        head_patches_max patches would not cover (the continuation prefill ahead of it is too long), or while a burst's
+        continuations are being prefilled: it waits, and the requests behind it too. Always True for the first stream
+        in its head phase."""
+        if (not self.head_hold or not self._head_phase or seq.custom_payload.chain is None or self.step_cost is None
                 or self.head_patches_max <= self.head_patches):
             return True
         _, b, c = self.step_cost.prefill.coef
@@ -790,7 +799,7 @@ class VoxCPM2Engine(LLMEngineBase):
         if queued > self.head_margin:  # a burst's continuations are being prefilled: its heads would wait in it
             return False
         plan = self._head_plan()
-        if plan(b * len(self._head_phase) + c * sum(self._head_phase.values()), 0)[1]:
+        if plan(b * len(self._head_phase) + c * self._head_sum, 0)[1]:
             return True  # all of it would be covered (the usual case: no need to find its place)
         backlog, own = 0.0, None
         for sid, tokens in self._head_phase.items():
@@ -861,7 +870,7 @@ class VoxCPM2Engine(LLMEngineBase):
                         seq.custom_payload.chained = False
                     if not seq.custom_payload.chained:
                         if self._head_phase:
-                            self._head_phase.pop(seq.seq_id, None)
+                            self._phase_pop(seq.seq_id)
                         self.model_runner.call("release_sequence_state", seq.seq_id)
             return seqs
 
@@ -873,7 +882,7 @@ class VoxCPM2Engine(LLMEngineBase):
             self.model_runner.call("lora_on_sequence_finished", seq.adapter_id, was_running)
             return
         if self._head_phase:  # (cancelled in its head phase)
-            self._head_phase.pop(seq.seq_id, None)
+            self._phase_pop(seq.seq_id)
         super().on_seq_removed(seq, was_running=was_running)
 
     def encode_latents(self, wav: torch.Tensor, align_size: int = -1) -> np.ndarray:

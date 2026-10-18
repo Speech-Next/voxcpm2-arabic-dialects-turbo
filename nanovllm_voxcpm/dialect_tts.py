@@ -63,7 +63,7 @@ def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | 
     "medium" or a plan, see models/voxcpm2/dit_cache.py).
     w8a8=False: bf16 layers (quality measurements of a model whose SmoothQuant statistics were not calibrated)."""
     cfg = {"pcm16_output": True, "head_tokens": head_tokens, "head_patches": 3, "lead_silence_patches": 2,
-           "stream_guard_ms": 150, "head_patches_max": 5, "mix_decode": True, "step_cap_ms": 160}
+           "stream_guard_ms": 150, "head_patches_max": 5, "mix_decode": True, "step_cap_ms": 160, "head_hold": False}
     if w8a8:
         cfg.update(w8a8=True, w8a8_targets=["base_lm", "residual_lm", "feat_encoder", "feat_decoder"])
     if dit and dit_cache:

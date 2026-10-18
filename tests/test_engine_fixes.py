@@ -767,6 +767,7 @@ def test_heads_are_lengthened_when_the_burst_grows():
 
 def test_a_head_waits_while_even_the_longest_would_not_last():
     eng = _loaded(0.01)  # 10 ms a token: each continuation 0.24-0.26 s
+    eng.head_hold = True
     heads = [eng.add_request(f"r{i}", _words(20), max_generate_length=40) for i in range(3)]
     assert [h.custom_payload.max_generate_length for h in heads] == [3, 5, 5]
     assert eng.head_fits(heads[0]) and eng.head_fits(heads[1]) and not eng.head_fits(heads[2])
@@ -775,6 +776,10 @@ def test_a_head_waits_while_even_the_longest_would_not_last():
     for _ in range(4):  # r0 ends after 3 patches, its continuation is prefilled: r2's wait is shorter
         eng.step()
     assert "r0" not in eng._head_phase and heads[2].status != SequenceStatus.WAITING
+    assert eng._head_sum == sum(eng._head_phase.values())
+    free = _loaded(0.01)  # head_hold off: no waiting, the third head is as long as it gets
+    free_heads = [free.add_request(f"r{i}", _words(20), max_generate_length=40) for i in range(3)]
+    assert free.head_fits(free_heads[2]) and {s.seq_id for s in free.step()} == {"r0", "r1", "r2"}
 
 
 def _steps_until_chained(eng, seq_id):
