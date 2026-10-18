@@ -10,44 +10,50 @@ One NVIDIA A10, installed with `./setup.sh`. The test clones the 32 voices of
 [`VoxCPM-Kernel/Arabic-Hindi-Reference-Voices`](https://huggingface.co/datasets/VoxCPM-Kernel/Arabic-Hindi-Reference-Voices),
 each in its own dialect.
 
-| engine | CER | WER | UTMOS | dialect ID | first audio p95, 200 requests | GPU memory |
+| engine | CER | WER | UTMOS | dialect ID | first audio p95, 64 requests | GPU memory |
 |---|---:|---:|---:|---:|---:|---:|
-| routed (the default, `RoutedDialectTTS`) | 4.6 % | 13.9 % | 2.22 | 64 % | 107 ms | 21.2 GiB |
-| adapters only (`DialectTTS`) | 5.3 % | 16.0 % | 2.23 | 67 % | 105 ms | 22.0 GiB |
+| routed (the default, `RoutedDialectTTS`) | 4.6 % | 13.9 % | 2.22 | 64 % | 42 ms | 21.4 GiB |
+| adapters only (`DialectTTS`) | 5.3 % | 16.0 % | 2.23 | 67 % | 41 ms | 21.9 GiB |
 
-| requests at once | first audio p95, routed | adapters only | whole sentence, routed | adapters only |
-|---:|---:|---:|---:|---:|
-| 1 | 25 ms | 27 ms | 0.42 s | 0.41 s |
-| 64 | 43 ms | 42 ms | 0.96 s | 0.96 s |
-| 128 | 71 ms | 68 ms | 1.50 s | 1.56 s |
-| 200 | 107 ms | 105 ms | 2.14 s | 2.17 s |
-| 256 | 135 ms | 132 ms | 2.65 s | 2.67 s |
+| requests at once | first audio p50, routed | first audio p95, routed | adapters only | whole sentence, routed | adapters only |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 26 ms | 27 ms | 26 ms | 0.43 s | 0.41 s |
+| 64 | 42 ms | 42 ms | 41 ms | 0.97 s | 0.97 s |
+| 128 | 64 ms | 0.33 s | 0.35-0.67 s | 1.70 s | 1.72 s |
+| 200 | 0.39 s | 0.99 s | 1.17 s | 2.62 s | 2.66 s |
+| 256 | 1.13 s | 2.60 s | 2.61 s | 3.35 s | 3.40 s |
 
 - Quality: the held-out evaluation set, 17 dialects × 40 sentences × 2 seeds (1,320 clips), each voice cloned from
   another clip of its speaker, default settings (int8, the 3-step distilled LocDiT). Routed vs adapters only, paired:
   CER −0.7 and WER −2.0 points (significant), UTMOS and DNSMOS unchanged, dialect ID −3.6 points.
 - CER / WER: the better of Whisper large-v3 and Cohere Transcribe Arabic; lower is better. UTMOS: predicted
   naturalness, 1-5. Speed: two alternated runs of each engine, averaged.
+- Bursts: from about 110 requests at once, new requests wait until their audio can play without a gap (#28), so
+  their first audio, and with it the whole sentence, comes later. See Streaming below.
 - Routing: bahraini (the qatari adapter), egyptian, saudi, hejazi and hindi_english on their adapters, the other 13
   dialects of teacher-v3 (and their aliases, e.g. gulf / qatari / emirati, palestinian / jordanian) on teacher-v3.
-- Other LocDiTs: `dit="VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k2_dmd.pt"` (2 steps, ~10 ms faster
-  at 200 requests, less natural), `dit=None` (10 steps with CFG, quality mode, ~270 ms).
+- Other LocDiTs: `dit="VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k2_dmd.pt"` (2 steps, slightly
+  faster, less natural), `dit=None` (10 steps with CFG, quality mode, about 2.5× slower first audio).
 
 Streaming, with requests arriving at random (Poisson, 20 s per rate) and a player that starts at the first audio
 (`python examples/streaming_benchmark.py`):
 
 | requests per second | first audio p95 | first word p95 | streams with a gap > 50 ms |
 |---:|---:|---:|---:|
-| 30 | 80 ms | 456 ms | 0 % |
-| 40 | 97 ms | 460 ms | 0 % |
-| 50 | 118 ms | 488 ms | 0 % |
-| 60 | 142 ms | 509 ms | 0 % |
+| 30 | 88 ms | 466 ms | 0 % |
+| 40 | 102 ms | 480 ms | 0 % |
+| 50 | 132 ms | 482 ms | 0 % |
+| 60 | 150 ms | 493 ms | 0 % |
 
 - First word: when the player reaches the speech's start (the median sentence starts speaking 170 ms into its audio).
 - A stream's leading silence is capped at 320 ms, and no new request starts while a playing stream has less than
   150 ms of audio queued. Without these, 0.5 / 7.4 / 85 / 93 % of the streams had a gap.
-- Requests sent at the same instant: gap-free up to 160. 200 or more at once exceed one A10: gaps of 0.1-0.5 s after
-  the first half second.
+- Requests sent at the same instant: no stream runs dry after its speech began, up to 200 at once (the WebSocket
+  benchmark of [#28](https://github.com/Speech-Next/voxcpm2-arabic-dialects-turbo/issues/28), a player waiting more
+  than 50 ms). Before #28: 52 / 150 / 200 streams ran dry at 100 / 150 / 200 at once.
+  - In a burst, the first chunks get longer: 3-5 patches, enough to last until the rest of the sentence is ready.
+  - Beyond what one A10 covers, new requests wait: their first audio comes later (the table above), the audio never
+    breaks.
 
 ## Install
 
