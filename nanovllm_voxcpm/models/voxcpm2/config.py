@@ -168,15 +168,15 @@ class TurboConfig(BaseModel):
     # Head start under load (0 = every head head_patches long): a head gets up to this many patches, the fewest whose
     # audio lasts, with head_margin_ms to spare, until its continuation is prefilled after those queued ahead of it
     # (the heads in their head phase), from the predicted step times (engine/step_cost.py). A burst's heads all end
-    # together and their continuations' prefill (~86 tokens a stream in the user's benchmark: ~0.35 s for 100,
+    # together and their continuations' prefill (~86 tokens a stream in #28's WebSocket benchmark: ~0.35 s for 100,
     # ~0.5 s for 150 streams on one A10) outlasted the 480 ms of a 3-patch head: the players ran dry. Heads that
     # start with fewer streams ahead of them stay head_patches long; time to first audio does not change.
     head_patches_max: int = 0
     head_margin_ms: int = 150
     # With head_patches_max: a new request with a head start waits while even head_patches_max patches would not last
     # until its continuation is prefilled, or while a burst's continuations are still being prefilled (False = never
-    # waits). No underruns in bursts beyond what the A10 can cover (the user's benchmark: about 110 at once and up),
-    # at the cost of time to first audio there (p95 at 150 / 200 at once: ~0.15 -> 0.8 / 1.7 s).
+    # waits). No underruns in bursts beyond what the A10 can cover (#28's WebSocket benchmark: about 110 at once and
+    # up), at the cost of time to first audio there (p95 at 150 / 200 at once: ~0.15 -> 0.8 / 1.7 s).
     head_hold: bool = False
     # A stream's leading silence (-1 = as generated): after this many silent patches (below -50 dBFS) at its start,
     # further silent patches are generated but not streamed, until the first patch with sound. With head start, a
@@ -200,7 +200,7 @@ class TurboConfig(BaseModel):
     # Head start for at most this many streams at once (0 = no limit): a request arriving while this many streams are
     # in their head phase (a head generating, or its continuation waiting for its prefill) is prefilled whole. Each
     # continuation is a prefill that comes due when its head ends; a burst's continuations come due together and the
-    # step that prefills them pauses every stream (the user's WebSocket benchmark: one stall per request at 40-200
+    # step that prefills them pauses every stream (#28's WebSocket benchmark: one stall per request at 40-200
     # requests at once). With the limit, a burst's first requests start fast and the rest whole.
     head_start_limit: int = 0
     # While streams play, a prefill (or mixed) step is filled only while its predicted time stays under this (0 = no

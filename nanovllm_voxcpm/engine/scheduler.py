@@ -227,7 +227,7 @@ class Scheduler:
         # - step_cap: a prefill step takes sequences only while its predicted time (callbacks.step_seconds(rows,
         #   tokens, prefill)) stays under step_cap; its first one also when that keeps the least buffer above a
         #   margin. A prefill step pauses every playing stream; the cap bounds the pause (and the wait between two
-        #   chunks of a stream: the user's benchmark counts every wait longer than a chunk's audio).
+        #   chunks of a stream: #28's WebSocket benchmark counts every wait longer than a chunk's audio).
         # - mix_decode: a prefill step that resumes streams (a burst's continuations) also decodes the running ones
         #   short of audio (their next patch, as a decode step would), so it is no pause for them: the cap then bounds
         #   the step, those rows included, and the stream guard no longer holds the resuming streams back.
