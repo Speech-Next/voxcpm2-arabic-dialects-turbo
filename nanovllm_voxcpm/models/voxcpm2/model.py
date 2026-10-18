@@ -764,8 +764,9 @@ class VoxCPM2Model(nn.Module):
     def first_patch_differs(self) -> bool:
         """The first patch's LocDiT solve differs from the others' (dit_first_t_span, first_steps, first_cfg_steps)."""
         d = self.feat_decoder
-        return (d.first_t_span_override is not None or d.first_steps != d.inference_timesteps
-                or d.first_cfg_steps != d.cfg_steps)
+        own_grid = d.first_t_span_override is not None and not (
+            d.t_span_override is not None and torch.equal(d.first_t_span_override, d.t_span_override))
+        return own_grid or d.first_steps != d.inference_timesteps or d.first_cfg_steps != d.cfg_steps
 
     def forward_diffusion(
         self,
