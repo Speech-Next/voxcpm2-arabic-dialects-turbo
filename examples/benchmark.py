@@ -9,7 +9,10 @@ clones voice i (in turn) of the .wav files of --voices (a folder or a Hugging Fa
 ("JordanianAnas.wav", "SaudiReem.wav", "HindiPooja.wav" for hindi_english) speaks in that dialect; other voices take
 the dialects in turn. Arabic requests speak sentence i of ar_dialects.txt, hindi_english ones hi_sentences.txt. The
 warm-up pairs each request with another voice: the engine caches a voice's first request, text included, and
-repeating it would measure the cache. Prints, per level, TTFB average / p50 / p95 and the average time until the last
+repeating it would measure the cache. Prints, per level, TTFB average / p50 / p95 / p99 / max, the first word
+(when a player that starts at the first audio plays the speech's start: the first 10 ms frame from which 50 ms stay
+within 25 dB of the request's loudest frame; later if a chunk arrives after its play time) p50 / p95 / p99 / max,
+and the average time until the last
 audio chunk.
 
 The engine is the default, routed one (RoutedDialectTTS: the adapters the routes use and --tagged-model's LoRA in one
@@ -56,16 +59,39 @@ def requests(n, voices, dialects, shift=0):
     return out
 
 
+def speech_start(audio: np.ndarray, sr: int) -> int:
+    """The sample where speech starts: the first 10 ms frame from which 5 frames stay within 25 dB of the loudest."""
+    h = sr // 100
+    if len(audio) < h:
+        return 0
+    frames = audio[: len(audio) // h * h].reshape(-1, h)
+    db = 20 * np.log10(np.sqrt((frames.astype(np.float64) ** 2).mean(1)) + 1e-9)
+    on = np.convolve((db > db.max() - 25).astype(int), np.ones(5, int), "valid") == 5
+    return int(np.argmax(on)) * h if on.any() else 0
+
+
+def first_word(chunks: list[tuple[float, np.ndarray]], sr: int) -> float:
+    """When a player that starts at the first chunk's arrival (and waits for late chunks) plays the speech's start."""
+    s = speech_start(np.concatenate([c for _, c in chunks]), sr)
+    t = start = 0.0
+    for arrival, c in chunks:
+        t = max(t, arrival)  # this chunk starts playing
+        if start + len(c) > s:
+            return t + (s - start) / sr
+        t += len(c) / sr
+        start += len(c)
+    return t
+
+
 async def burst(tts, reqs):
-    """(first audio s, last audio s) of every request, from the instant all were submitted."""
+    """(first audio s, last audio s, first word s) of every request, from the instant all were submitted."""
     t0 = time.perf_counter()
 
     async def one(i, voice, dialect, text):
-        first = last = None
-        async for _ in tts.stream(text, dialect=dialect, voice=voice, seed=1000 + i, max_patches=400):
-            last = time.perf_counter() - t0
-            first = first if first is not None else last
-        return first, last
+        chunks = []
+        async for c in tts.stream(text, dialect=dialect, voice=voice, seed=1000 + i, max_patches=400):
+            chunks.append((time.perf_counter() - t0, c))
+        return chunks[0][0], chunks[-1][0], first_word(chunks, tts.sample_rate)
 
     return await asyncio.gather(*[one(i, *r) for i, r in enumerate(reqs)])
 
@@ -89,8 +115,9 @@ async def main(args):
             print(f"routing: {n_adapters} of {len(voices)} voices on the adapters model, the others on the tagged one")
         # every voice once: a voice's first request also encodes its reference, which no measured burst should pay
         await burst(tts, requests(len(voices), voices, tts.dialects, shift=3))
-        print("| requests at once | TTFB avg | TTFB p50 | TTFB p95 | whole sentence, avg |")
-        print("|---:|---:|---:|---:|---:|")
+        print("| requests at once | TTFB avg | TTFB p50 | TTFB p95 | TTFB p99 | TTFB max | first word p50 | "
+              "first word p95 | first word p99 | first word max | whole sentence, avg |")
+        print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for n in levels:
             await burst(tts, requests(n, voices, tts.dialects, shift=7))  # warm-up, see above
             res = []
@@ -98,8 +125,11 @@ async def main(args):
                 res += await burst(tts, requests(n, voices, tts.dialects))
             ttfb = np.array([r[0] for r in res]) * 1000
             total = np.array([r[1] for r in res])
-            print(f"| {n} | {ttfb.mean():.1f} ms | {np.percentile(ttfb, 50):.1f} ms | {np.percentile(ttfb, 95):.1f} ms | "
-                  f"{total.mean():.2f} s |", flush=True)
+            word = np.array([r[2] for r in res]) * 1000
+            q = lambda x: [np.percentile(x, 50), np.percentile(x, 95), np.percentile(x, 99), x.max()]  # noqa: E731
+            t50, t95, t99, tmax = q(ttfb)
+            print(f"| {n} | {ttfb.mean():.1f} ms | {t50:.1f} ms | {t95:.1f} ms | {t99:.1f} ms | {tmax:.1f} ms | "
+                  + " | ".join(f"{v:.0f} ms" for v in q(word)) + f" | {total.mean():.2f} s |", flush=True)
 
 
 if __name__ == "__main__":

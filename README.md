@@ -33,6 +33,22 @@ each in its own dialect.
 - Other LocDiTs: `dit="VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k2_dmd.pt"` (2 steps, ~10 ms faster
   at 200 requests, less natural), `dit=None` (10 steps with CFG, quality mode, ~270 ms).
 
+Streaming, with requests arriving at random (Poisson, 20 s per rate) and a player that starts at the first audio
+(`python examples/streaming_benchmark.py`):
+
+| requests per second | first audio p95 | first word p95 | streams with a gap > 50 ms |
+|---:|---:|---:|---:|
+| 30 | 80 ms | 456 ms | 0 % |
+| 40 | 97 ms | 460 ms | 0 % |
+| 50 | 118 ms | 488 ms | 0 % |
+| 60 | 142 ms | 509 ms | 0 % |
+
+- First word: when the player reaches the speech's start (the median sentence starts speaking 170 ms into its audio).
+- A stream's leading silence is capped at 320 ms, and no new request starts while a playing stream has less than
+  150 ms of audio queued. Without these, 0.5 / 7.4 / 85 / 93 % of the streams had a gap.
+- Requests sent at the same instant: gap-free up to 160. 200 or more at once exceed one A10: gaps of 0.1-0.5 s after
+  the first half second.
+
 ## Install
 
 Needs Linux, an NVIDIA GPU (Ampere or newer) and the CUDA toolkit (`nvcc`).

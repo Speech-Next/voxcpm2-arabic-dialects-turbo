@@ -327,6 +327,65 @@ def test_continuation_resumes_at_the_front_despite_the_cap():
     assert list(sch.waiting) == [c]
 
 
+class _Buffers:
+    """Scheduler callbacks: every sequence schedulable, a stream's queued audio from ``buf`` (seconds; absent: None)."""
+
+    def __init__(self, buf):
+        self.buf = buf
+
+    def on_seq_added(self, seq): pass
+    def on_seq_running(self, seq): pass
+    def on_seq_waiting(self, seq): pass
+    def on_seq_removed(self, seq, was_running): pass
+    def can_schedule(self, running_ids, seq): return True
+    def stream_buffer(self, seq): return self.buf.get(seq.seq_id)
+
+
+def _guarded(guard_ms, buf, max_num_seqs=4):
+    cfg = _config(max_num_seqs=max_num_seqs)
+    cfg.model_config.turbo.stream_guard_ms = guard_ms
+    return Scheduler(cfg, callbacks=_Buffers(buf))
+
+
+def test_a_new_request_waits_while_a_playing_stream_is_short_of_audio():
+    buf = {"a": 0.1}
+    sch = _guarded(300, buf)
+    a, b = _seq("a", [1]), _seq("b", [2])
+    sch.add(a)
+    assert sch.schedule() == ([a], True)  # nothing playing yet: admitted
+    a.append_token(9)  # (its patch, as the engine's postprocess appends it)
+    sch.add(b)
+    assert sch.schedule() == ([a], False)  # a has 100 ms queued (< 300): decode it, b waits
+    assert list(sch.waiting) == [b]
+    a.append_token(9)
+    buf["a"] = 0.5
+    assert sch.schedule() == ([b], True)  # enough slack: b's prefill
+    off = _guarded(0, {"a": 0.1})  # guard off: the original prefill-first order
+    off.add(a2 := _seq("a", [1]))
+    off.schedule()
+    off.add(b2 := _seq("b", [2]))
+    assert off.schedule() == ([b2], True)
+
+
+def test_a_waiting_stream_with_less_audio_than_the_playing_ones_goes_first():
+    buf = {"a": 0.2}
+    sch = _guarded(300, buf)
+    a, c = _seq("a", [1]), _seq("c", [3])
+    sch.add(a)
+    sch.schedule()
+    a.append_token(9)
+    cont = _seq("h", [4, 5])  # a head start's continuation: its stream is playing the head's audio
+    cont.has_stream = True
+    sch.add(c)
+    sch.add(cont, front=True)
+    buf["h"] = 0.25  # more than a's 200 ms: a decodes first
+    assert sch.schedule() == ([a], False)
+    a.append_token(9)
+    buf["h"] = 0.05  # less: its prefill, and only it (c, a new request, still waits)
+    assert sch.schedule() == ([cont], True)
+    assert list(sch.waiting) == [c]
+
+
 def test_new_request_at_the_front_does_not_block_a_resuming_one():
     sch = Scheduler(_config(max_num_seqs=2))
     r = _seq("r", [1])
@@ -520,6 +579,51 @@ def test_continuation_survives_unregister_voice_and_goes_first():
             break
         eng.step()
     assert eng.is_finished() and eng.model_runner.slots == set()
+
+
+def _streamed(eng, seq_id, steps=40):
+    """Per generated patch of ``seq_id``'s stream (head and continuation): True = streamed (the server skips muted)."""
+    out = []
+    for _ in range(steps):
+        if eng.is_finished():
+            break
+        out += [not s.custom_payload.muted for s in eng.step() if s.seq_id == seq_id]
+    return out
+
+
+def _silent_first(n):
+    """A runner output whose patch is silent for the first n patches of each stream, then with sound; a pause
+    (silent patches 9 and 10) later in the sentence."""
+    count = {}
+
+    def make(t, is_prefill):
+        k = count[t.seq_id] = count.get(t.seq_id, 0) + 1
+        return {"latents": np.full((PATCH, FEAT), 0.5, np.float32), "stop_flag": 0,
+                "waveforms": np.ones(8, np.float32), "patch_silent": k <= n or k in (9, 10)}
+    return make
+
+
+@pytest.mark.parametrize("cap, silent, muted", [
+    (2, 5, [3, 4, 5]),  # a silent head (patches 1-3) and a continuation that pauses again: 3 of them not streamed
+    (2, 2, []),  # a natural pause of 2 patches stays
+    (-1, 5, []),  # cap off: as generated
+])
+def test_leading_silence_past_the_cap_is_not_streamed(cap, silent, muted):
+    eng = _voxcpm2_engine(max_model_len=128)
+    eng.lead_silence_patches = cap
+    eng.model_runner.make_output = _silent_first(silent)
+    eng.add_request("r", _words(20), max_generate_length=14)
+    streamed = _streamed(eng, "r")
+    assert len(streamed) == 14  # every patch was generated (the head's 3 and the continuation's 11)
+    assert [k for k, on in enumerate(streamed, 1) if not on] == muted  # the later pause (9, 10) always streams
+
+
+def test_leading_silence_without_head_start():
+    eng = _voxcpm2_engine(max_model_len=128)
+    eng.lead_silence_patches = 1
+    eng.model_runner.make_output = _silent_first(3)
+    eng.add_request("r", _words(20), max_generate_length=6, head_start=False)
+    assert _streamed(eng, "r") == [True, False, False, True, True, True]
 
 
 def test_cancel_while_the_head_ends_also_cancels_its_continuation():

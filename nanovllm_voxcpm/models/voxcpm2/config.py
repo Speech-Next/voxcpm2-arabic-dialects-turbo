@@ -165,6 +165,19 @@ class TurboConfig(BaseModel):
     head_tokens: int = 0
     head_patches: int = 3
     head_min_rest: int = 8
+    # A stream's leading silence (-1 = as generated): after this many silent patches (below -50 dBFS) at its start,
+    # further silent patches are generated but not streamed, until the first patch with sound. With head start, a
+    # head of nothing but silence (3 patches) was followed by a continuation that again began with a pause: 0.77 s
+    # before the first word (2.5 % of #2's clips; 0.1 % without head start). Speech is unchanged.
+    lead_silence_patches: int = -1
+    # Streams before new requests (0 = off: a prefill step whenever a request waits, the original order). A prefill
+    # step pauses every playing stream; with requests arriving all the time those pauses emptied the players' buffers
+    # (40 requests/s on one A10: a gap of more than 50 ms after speech began in half of the streams). While a playing
+    # stream has less than this much audio queued at its player, no new request is admitted (decode steps refill the
+    # buffers); a waiting stream (a head start's continuation, a preempted sequence) with even less is admitted.
+    # 150 ms (turbo_config), Poisson arrivals at 30-60 requests/s: no gap above 50 ms (without: 0.5-93 % of the
+    # streams), TTFA p95 63-191 -> 85-142 ms, first word p99 548-843 -> 543-624 ms.
+    stream_guard_ms: int = 0
 
 
 class VoxCPM2Config(BaseModel):

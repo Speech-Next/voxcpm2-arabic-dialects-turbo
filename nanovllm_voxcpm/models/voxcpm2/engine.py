@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from itertools import compress, count, islice
@@ -55,6 +56,9 @@ class VoxCPM2SeqPayload:
     chain: dict | None = None
     chained: bool = False  # the continuation was queued: this sequence's end is not the end of the stream
     patch_silent: list | None = None  # per generated patch: its audio below -50 dBFS (head start)
+    lead_silent: int = 0  # silent patches at the stream's start so far (-1: its sound has begun)
+    muted: bool = False  # this step's patch is leading silence past TurboConfig.lead_silence_patches: not streamed
+    play_end: float | None = None  # perf_counter when a player started at the first streamed patch runs out of audio
 
 
 def _rows_from(arrays: list[np.ndarray], start: int) -> np.ndarray:
@@ -97,6 +101,7 @@ class VoxCPM2Engine(LLMEngineBase):
     ref_prefix_cache_enabled = False
     locenc_cache_enabled = False
     head_tokens, head_patches, head_min_rest = 0, 3, 8  # head start off
+    lead_silence_patches = -1  # leading silence as generated
     _pretok_cache: dict | None = None
     _tag_remap: dict = {}  # (instances built without __init__, e.g. in tests: no tagged adapters)
     tag_rows = _tag_rows_used = 0
@@ -126,6 +131,11 @@ class VoxCPM2Engine(LLMEngineBase):
         self.ref_prefix_blocks: OrderedDict[int, tuple[int, list, PreparedAudio | None]] = OrderedDict()
         self.voices: dict[str, RegisteredVoice] = {}
         self.head_tokens, self.head_patches, self.head_min_rest = turbo.head_tokens, turbo.head_patches, turbo.head_min_rest
+        self.lead_silence_patches = turbo.lead_silence_patches
+        vae = config.model_config.audio_vae_config
+        rates = vae.decoder_rates if vae is not None else [8, 6, 5, 2, 2, 2]
+        out_rate = vae.out_sample_rate if vae is not None else 48000
+        self.patch_seconds = self.patch_size * int(np.prod(rates)) / out_rate  # 0.16 s
         super().__init__(VoxCPM2Runner, config, config.tensor_parallel_size)
 
     def register_lora(self, name: str, path: str) -> int:
@@ -142,6 +152,14 @@ class VoxCPM2Engine(LLMEngineBase):
                 self.tokenizer = tokenizer
                 self._pretok_cache = self._pretok_pending = None
         return adapter_id
+
+    patch_seconds = 0.16
+
+    def stream_buffer(self, seq: Sequence[VoxCPM2SeqPayload]) -> float | None:
+        """Seconds of audio still queued at the stream's player (started at its first patch, waiting when empty);
+        negative: the player has been waiting that long. None: nothing streamed yet."""
+        end = seq.custom_payload.play_end
+        return None if end is None else end - time.perf_counter()
 
     def unregister_lora(self, name: str) -> None:
         super().unregister_lora(name)
@@ -329,11 +347,22 @@ class VoxCPM2Engine(LLMEngineBase):
         if seq.custom_payload.seed is not None and seq.custom_payload.seed >= 0:
             seq.custom_payload.seed_step += 1
         seq.custom_payload.generated_waveforms.append(waveforms)
-        if seq.custom_payload.chain is not None:  # a head-start head: its patches' silence decides the prompt
+        payload = seq.custom_payload
+        if payload.chain is not None or (self.lead_silence_patches >= 0 and payload.lead_silent >= 0):
             silent = outputs.get("patch_silent")
-            if seq.custom_payload.patch_silent is None:
-                seq.custom_payload.patch_silent = []
-            seq.custom_payload.patch_silent.append(_is_silent(waveforms) if silent is None else bool(silent))
+            silent = _is_silent(waveforms) if silent is None else bool(silent)
+            if payload.chain is not None:  # a head-start head: its patches' silence decides the prompt
+                if payload.patch_silent is None:
+                    payload.patch_silent = []
+                payload.patch_silent.append(silent)
+            if self.lead_silence_patches >= 0 and payload.lead_silent >= 0:
+                payload.lead_silent = payload.lead_silent + 1 if silent else -1
+                payload.muted = payload.lead_silent > self.lead_silence_patches
+        else:
+            payload.muted = False
+        if not payload.muted:  # the player's clock: it waits while it has nothing, then plays this patch
+            now = time.perf_counter()
+            payload.play_end = max(payload.play_end or now, now) + self.patch_seconds
 
         latents = latents.reshape(-1, self.feat_dim)
         if seq.custom_payload.decode_pad is not None:
@@ -679,6 +708,8 @@ class VoxCPM2Engine(LLMEngineBase):
         kw["text_tokens"] = kw.pop("text_ids")
         new = self.add_request(seq.seq_id, head_start=False, resume=True, **kw)
         new.custom_payload.seed_step = payload.seed_step
+        new.custom_payload.lead_silent = payload.lead_silent  # the stream's leading silence goes on counting
+        new.custom_payload.play_end = payload.play_end  # and its player keeps playing the head's audio
         return True
 
     def step(self):
