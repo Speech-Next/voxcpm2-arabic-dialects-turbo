@@ -165,6 +165,19 @@ class TurboConfig(BaseModel):
     head_tokens: int = 0
     head_patches: int = 3
     head_min_rest: int = 8
+    # Head start under load (0 = every head head_patches long): a head gets up to this many patches, the fewest whose
+    # audio lasts, with head_margin_ms to spare, until its continuation is prefilled after those queued ahead of it
+    # (the heads in their head phase), from the predicted step times (engine/step_cost.py). A burst's heads all end
+    # together and their continuations' prefill (~86 tokens a stream in #28's WebSocket benchmark: ~0.35 s for 100,
+    # ~0.5 s for 150 streams on one A10) outlasted the 480 ms of a 3-patch head: the players ran dry. Heads that
+    # start with fewer streams ahead of them stay head_patches long; time to first audio does not change.
+    head_patches_max: int = 0
+    head_margin_ms: int = 150
+    # With head_patches_max: a new request with a head start waits while even head_patches_max patches would not last
+    # until its continuation is prefilled, or while a burst's continuations are still being prefilled (False = never
+    # waits). No underruns in bursts beyond what the A10 can cover (#28's WebSocket benchmark: about 110 at once and
+    # up), at the cost of time to first audio there (p95 at 150 / 200 at once: ~0.15 -> 0.8 / 1.7 s).
+    head_hold: bool = False
     # A stream's leading silence (-1 = as generated): after this many silent patches (below -50 dBFS) at its start,
     # further silent patches are generated but not streamed, until the first patch with sound. With head start, a
     # head of nothing but silence (3 patches) was followed by a continuation that again began with a pause: 0.77 s
@@ -178,6 +191,24 @@ class TurboConfig(BaseModel):
     # 150 ms (turbo_config), Poisson arrivals at 30-60 requests/s: no gap above 50 ms (without: 0.5-93 % of the
     # streams), TTFA p95 63-191 -> 85-142 ms, first word p99 548-843 -> 543-624 ms.
     stream_guard_ms: int = 0
+    # Mixed steps (False = a step is prefill or decode, the original): a prefill step that resumes streams (a burst's
+    # continuations: long steps) also decodes the running streams that would run out of audio during it (their next
+    # patch, through the prefill path with everything before it cached); steps of new requests only stay plain, so
+    # first audio is as fast as before. Needs the first patch's LocDiT settings to be the others' (no
+    # dit_first_t_span, first_steps or first_cfg_steps of their own).
+    mix_decode: bool = False
+    # Head start for at most this many streams at once (0 = no limit): a request arriving while this many streams are
+    # in their head phase (a head generating, or its continuation waiting for its prefill) is prefilled whole. Each
+    # continuation is a prefill that comes due when its head ends; a burst's continuations come due together and the
+    # step that prefills them pauses every stream (#28's WebSocket benchmark: one stall per request at 40-200
+    # requests at once). With the limit, a burst's first requests start fast and the rest whole.
+    head_start_limit: int = 0
+    # While streams play, a prefill (or mixed) step is filled only while its predicted time stays under this (0 = no
+    # cap; the first sequence also when the least playing buffer covers it): it bounds the wait between two chunks.
+    step_cap_ms: int = 0
+    # A new request waits while a decode step of every stream would take longer than a patch's audio (160 ms) minus
+    # this margin (-1 = off): the streams would fall behind real time. Predicted step times: engine/step_cost.py.
+    realtime_margin_ms: int = -1
 
 
 class VoxCPM2Config(BaseModel):
