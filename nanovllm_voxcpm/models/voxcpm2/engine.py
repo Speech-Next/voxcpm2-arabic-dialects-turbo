@@ -125,6 +125,7 @@ class VoxCPM2Engine(LLMEngineBase):
     head_start_limit = 0  # head start for every request long enough
     head_patches_max, head_margin, step_cap, head_hold = 0, 0.15, 0.0, False  # every head head_patches long
     mid_stages, mid_patches_max, stage_kv_reuse = (), 10, False  # no intermediate stage, every stage prefilled whole
+    mid_stagger = 0
     client_chunk = 0.0  # seconds; 0: the player gets every patch whole
     client_pace, client_pace_last, client_pace_reserve = 0.0, 0.95, 1.0  # unpaced
     _paced = False  # a request with a paced front was added
@@ -170,7 +171,7 @@ class VoxCPM2Engine(LLMEngineBase):
         self.step_cap, self.head_hold = turbo.step_cap_ms / 1000, turbo.head_hold
         mid = turbo.mid_tokens if isinstance(turbo.mid_tokens, (list, tuple)) else [turbo.mid_tokens]
         self.mid_stages = tuple(sorted({int(m) for m in mid if int(m) > self.head_tokens}))
-        self.mid_patches_max = turbo.mid_patches_max
+        self.mid_patches_max, self.mid_stagger = turbo.mid_patches_max, turbo.mid_stagger
         self.client_chunk = turbo.client_chunk_ms / 1000
         self.client_pace, self.client_pace_last = turbo.client_pace, turbo.client_pace_last
         self.client_pace_reserve = turbo.client_pace_reserve_ms / 1000
@@ -1009,10 +1010,13 @@ class VoxCPM2Engine(LLMEngineBase):
         steps = math.ceil((queued + own) / max(self.step_cap - step, 0.02)) if self.step_cap > 0 else 2
         return buf - self.head_margin >= queued + own + steps * step
 
-    def _mid_patches(self, chain: dict, mid_len: int, done: int, rest: int) -> int:
+    def _mid_patches(self, chain: dict, mid_len: int, done: int, rest: int, seq_id: str = "") -> int:
         """An intermediate stage's patches: as many as its text has speech for, its last head_min_rest tokens
-        aside (about _PATCHES_PER_TOKEN a token, less the patches spoken already), at most mid_patches_max."""
+        aside (about _PATCHES_PER_TOKEN a token, less the patches spoken already), at most mid_patches_max; with
+        mid_stagger up to mid_stagger - 1 fewer, by the stream's id (the streams of a burst reach the seam apart)."""
         speech = int(_PATCHES_PER_TOKEN * (mid_len - chain.get("prompt_ids", 0) - self.head_min_rest))
+        if self.mid_stagger > 1:
+            speech -= xxhash.xxh32_intdigest(seq_id.encode()) % self.mid_stagger
         return max(1, min(speech - done, self.mid_patches_max, rest - 1))
 
     def _continue_head(self, seq: Sequence[VoxCPM2SeqPayload]) -> bool:
@@ -1070,7 +1074,7 @@ class VoxCPM2Engine(LLMEngineBase):
         kw["text_tokens"] = kw.pop("text_ids")
         if mid is not None:  # the intermediate stage: the text's first mid_tokens tokens, for a few patches
             kw["text_tokens"] = mid
-            kw["max_generate_length"] = self._mid_patches(chain, len(mid), done, rest)
+            kw["max_generate_length"] = self._mid_patches(chain, len(mid), done, rest, seq.seq_id)
         new = self.add_request(seq.seq_id, head_start=False, resume=True, **kw)
         new.custom_payload.seed_step = payload.seed_step
         new.custom_payload.lead_silent = payload.lead_silent  # the stream's leading silence goes on counting

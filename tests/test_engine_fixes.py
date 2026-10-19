@@ -906,6 +906,16 @@ def test_stages_go_on_until_the_whole_continuation_is_in_time():
     assert len(bm.free_block_ids) == free and not eng._stream_prefix and not eng._head_phase
 
 
+def test_mid_stagger_ends_the_streams_stages_apart():
+    eng = _staged(0.032, mid_tokens=(16, 32))
+    eng.mid_patches_max = 16
+    ends = {eng._mid_patches({}, 32, 3, 60, f"r{i}") for i in range(32)}
+    assert ends == {12}  # 0.5 a token of 32 ids, 2 kept back, less the 3 spoken: every stream alike
+    eng.mid_stagger = 4
+    ends = {eng._mid_patches({}, 32, 3, 60, f"r{i}") for i in range(32)}
+    assert ends == {9, 10, 11, 12}
+
+
 def test_a_stage_in_time_is_preferred_to_shorter_ones():
     eng = _staged(0.01, mid_tokens=(16, 32))  # 10 ms a token: the 32-id stage is in time from the head already
     eng.add_request("r", _words(40), max_generate_length=60)

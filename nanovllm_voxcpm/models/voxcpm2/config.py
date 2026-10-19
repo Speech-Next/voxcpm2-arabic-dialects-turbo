@@ -186,6 +186,9 @@ class TurboConfig(BaseModel):
     # time, else to the longest further stage that does (the shortest if none). Streams in time skip the stages.
     mid_tokens: int | list[int] = 0
     mid_patches_max: int = 10
+    # Each stream's stages end up to mid_stagger - 1 patches earlier (by its id): the stages end at a fixed patch
+    # (0.5 a token of the stage's text), so a burst's streams reached each seam in the same step (#31). 0: off.
+    mid_stagger: int = 0
     # The front sends a stream's audio in chunks of this many ms (e.g. 128: 4096 bytes of 16 kHz PCM16) and holds
     # the rest back: the engine's estimate of a player's queued audio (stream_buffer: the scheduler's deadlines,
     # mixed steps' riders, mid_tokens) leaves out the held-back part (the audio streamed so far modulo a chunk).
