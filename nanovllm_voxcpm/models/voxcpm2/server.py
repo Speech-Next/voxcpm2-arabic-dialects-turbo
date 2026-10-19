@@ -768,6 +768,7 @@ class AsyncVoxCPM2Server:
     _ring = None
     _tokenizer = None  # the engine's tokenizer (init_ok), NANOVLLM_CLIENT_TOKENIZE
     _first_flush = True  # the next flush is a burst's first (NANOVLLM_SUBMIT_FLUSH_FIRST)
+    _more_sent = False  # this event-loop turn sent commands marked "more": its end must reach the engine
     _spin_task = None
     _wake = None
 
@@ -957,11 +958,15 @@ class AsyncVoxCPM2Server:
         h0 = _host_sample() if _profile.StepProfile.enabled else None
         if len(cmds) == 1 and not more:
             self.queue_in.put_nowait(cmds[0])
-        elif cmds:
+        elif cmds or (self._more_sent and not more):
+            # (no commands: the turn's last early flush took them all; the empty batch ends the engine's admission
+            # window, which otherwise waits NANOVLLM_QUEUE_MORE_MS for the rest of a turn that has ended)
             if self._tokenizer is not None:  # (a single command registers at once: the engine tokenizes it)
                 self._tokenize(cmds)
             t_tok = time.perf_counter()
             self.queue_in.put_nowait({"type": "batch", "cmds": cmds, **({"more": True} if more else {})})
+        if cmds or not more:
+            self._more_sent = more
         if cmds and _profile.StepProfile.enabled:
             _profile.log(kind="client_flush", t=t, n=len(cmds), put_ms=(time.perf_counter() - t) * 1000,
                          tok_ms=(t_tok - t) * 1000 if len(cmds) > 1 or more else 0.0,

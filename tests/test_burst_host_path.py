@@ -823,7 +823,8 @@ def test_the_models_tokenizer_round_trips_to_the_client():
 
 def test_a_bursts_first_flush_is_small():
     """NANOVLLM_SUBMIT_FLUSH_FIRST: a burst's commands reach the engine in batches of 16, then 48 (the engine starts
-    registering while the client builds the rest), and the next burst starts with 16 again."""
+    registering while the client builds the rest), the last one not marked "more", and the next burst starts with 16
+    again."""
     import asyncio
 
     from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
@@ -832,9 +833,9 @@ def test_a_bursts_first_flush_is_small():
         sent = []
         client = object.__new__(AsyncVoxCPM2Server)
         client._engine_error, client._spin_task, client.op_table, client._pending_cmds = None, None, {}, []
-        client._first_flush, client._tokenizer = True, None
-        client.queue_in = SimpleNamespace(put_nowait=lambda m: sent.append(len(m["cmds"]) if "cmds" in m else 1))
-        for burst in (70, 20):
+        client.queue_in = SimpleNamespace(put_nowait=lambda m: sent.append(
+            (len(m["cmds"]), bool(m.get("more"))) if "cmds" in m else (1, False)))
+        for burst in (70, 20, 64, 1):
             tasks = [asyncio.ensure_future(client.submit("health")) for _ in range(burst)]
             for _ in range(3):
                 await asyncio.sleep(0)
@@ -842,7 +843,10 @@ def test_a_bursts_first_flush_is_small():
                 t.cancel()
         return sent
 
-    assert asyncio.run(run()) == [16, 48, 6, 16, 4]
+    # a turn whose commands all left in early flushes (64 = 16 + 48) still ends with an (empty) batch: the engine's
+    # admission window ends with the client's turn instead of waiting for more
+    assert asyncio.run(run()) == [(16, True), (48, True), (6, False), (16, True), (4, False),
+                                  (16, True), (48, True), (0, False), (1, False)]
 
 
 def test_a_prefill_steps_first_audio_reaches_the_client_as_its_chunks():
