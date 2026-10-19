@@ -36,7 +36,7 @@ import math
 import time
 from collections.abc import AsyncIterator, Callable
 
-__all__ = ["ChunkPacer", "paced"]
+__all__ = ["ChunkPacer", "ChunkStream", "paced"]
 
 
 class ChunkPacer:
@@ -46,8 +46,8 @@ class ChunkPacer:
     def __init__(self, chunk_bytes: int = 4096, bytes_per_s: float = 32000.0, alpha: float = 0.95,
                  reserve_ms: float | None = 1000.0, expect_s: float | None = None, margin_ms: float = 4.0,
                  unit_bytes: int = 1, alpha_last: float | None = None):
-        if chunk_bytes <= 0 or bytes_per_s <= 0 or not 0 < alpha <= 1:
-            raise ValueError("chunk_bytes and bytes_per_s must be positive, 0 < alpha <= 1")
+        if chunk_bytes <= 0 or bytes_per_s <= 0 or not 0 <= alpha <= 1:
+            raise ValueError("chunk_bytes and bytes_per_s must be positive, 0 <= alpha <= 1 (0: no pace)")
         self.chunk_bytes = chunk_bytes
         self.bytes_per_s = float(bytes_per_s)
         cap = 1.0 if expect_s is None else self.ratio_for(expect_s, chunk_bytes, bytes_per_s, margin_ms, unit_bytes)
@@ -141,57 +141,75 @@ class ChunkPacer:
         return self._grid + self.alpha * (self._last_s + waiting * self.chunk_bytes / self.bytes_per_s)
 
 
+class ChunkStream:
+    """One stream's chunks at its pacer's times (alpha 0: each one the moment it is complete). The audio is pushed in
+    from any callback or task of the event loop (push, finish, fail); ``async for`` takes the chunks out. The taking
+    side wakes only when a chunk is due (a timer) or new audio makes one due sooner: at 200 streams the event loop
+    gets a patch of every stream at once after each engine step, and each wake-up then delays the sends due."""
+
+    def __init__(self, pacer: ChunkPacer, clock: Callable[[], float] = time.perf_counter):
+        self.pacer, self.clock = pacer, clock
+        self._wake = asyncio.Event()
+        self._target = math.inf  # when the taking side wakes up anyway
+        self._failed: BaseException | None = None
+
+    def push(self, data: bytes, t: float | None = None) -> None:
+        self.pacer.push(data, self.clock() if t is None else t)
+        due = self.pacer.due()
+        if due is not None and due < self._target:
+            self._wake.set()
+
+    def finish(self) -> None:
+        self.pacer.finish(self.clock())
+        self._wake.set()
+
+    def fail(self, e: BaseException) -> None:
+        self._failed = e
+        self._wake.set()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        loop = asyncio.get_running_loop()
+        pacer = self.pacer
+        while True:
+            if self._failed is not None:
+                raise self._failed
+            self._wake.clear()
+            due = pacer.due()
+            if due is None:
+                if pacer.done:
+                    return
+                self._target = math.inf
+                await self._wake.wait()
+                continue
+            wait = due - self.clock()
+            if wait > 0:  # (new audio may make the chunk due sooner: more than the reserve waiting)
+                self._target = due
+                timer = loop.call_later(wait, self._wake.set)
+                await self._wake.wait()
+                timer.cancel()
+                continue
+            self._target = -math.inf
+            yield pacer.pop()
+
+
 async def paced(source: AsyncIterator[bytes], pacer: ChunkPacer,
                 clock: Callable[[], float] = time.perf_counter) -> AsyncIterator[bytes]:
-    """``source``'s bytes in chunks at ``pacer``'s times: a task reads the source while the chunks wait. The waiting
-    side is woken only when a chunk is due (a timer) or new audio makes one due sooner: at 200 streams the event
-    loop runs a patch of every stream at once after each engine step, and every extra wake-up delays the sends due
-    meanwhile."""
-    loop = asyncio.get_running_loop()
-    wake = asyncio.Event()
-    failed: list[BaseException] = []
-    target = [math.inf]  # when the waiting side wakes up anyway
-
-    def maybe_wake():
-        due = pacer.due()
-        if pacer.done or (due is not None and due < target[0]):
-            wake.set()
+    """``source``'s bytes in chunks at ``pacer``'s times (a ChunkStream that a task fills from the source)."""
+    stream = ChunkStream(pacer, clock)
 
     async def read():
         try:
             async for data in source:
-                pacer.push(data, clock())
-                maybe_wake()
-        except BaseException as e:  # noqa: BLE001 - re-raised on the waiting side
-            failed.append(e)
-        finally:
-            pacer.finish(clock())
-            wake.set()
+                stream.push(data)
+        except BaseException as e:  # noqa: BLE001 - re-raised on the taking side
+            stream.fail(e)
+        else:
+            stream.finish()
 
     reader = asyncio.create_task(read())
     try:
-        while True:
-            if failed:
-                raise failed[0]
-            wake.clear()
-            due = pacer.due()
-            if due is None:
-                if pacer.done:
-                    break
-                target[0] = math.inf
-                await wake.wait()
-                continue
-            wait = due - clock()
-            if wait > 0:  # (new audio may make the chunk due sooner: more than the reserve waiting)
-                target[0] = due
-                timer = loop.call_later(wait, wake.set)
-                await wake.wait()
-                timer.cancel()
-                continue
-            target[0] = -math.inf
-            yield pacer.pop()
-        if failed:
-            raise failed[0]
+        async for chunk in stream:
+            yield chunk
     finally:  # the client gone (or done): stop reading, and close the source (its engine request)
         if not reader.done():
             reader.cancel()

@@ -39,7 +39,7 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
-from nanovllm_voxcpm.streaming import ChunkPacer, paced
+from nanovllm_voxcpm.streaming import ChunkPacer, ChunkStream
 
 PATH = "/api/tts/stream"
 FRAME_S = 0.04  # the AudioVAE's frame: a stream's audio is a whole number of them
@@ -49,19 +49,6 @@ def pcm16(y: np.ndarray) -> bytes:
     if y.dtype == np.int16:
         return y.tobytes()
     return (np.clip(y, -1.0, 1.0) * 32767.0).round().astype("<i2").tobytes()
-
-
-async def rechunk(source: AsyncIterator[bytes], n: int) -> AsyncIterator[bytes]:
-    """Unpaced: each chunk of n bytes the moment it is complete, the rest at the end."""
-    buf = bytearray()
-    async for data in source:
-        buf += data
-        while len(buf) >= n:
-            yield bytes(buf[:n])
-            del buf[:n]
-    while buf:
-        yield bytes(buf[:n])
-        del buf[:n]
 
 
 async def speak(tts, req: dict, yields: list | None = None) -> AsyncIterator[bytes]:
@@ -93,23 +80,49 @@ async def speak(tts, req: dict, yields: list | None = None) -> AsyncIterator[byt
         yield out
 
 
-class Server:
-    """The connections. voices: the registered voice names; source(req, yields): an utterance's PCM16 bytes."""
+Feed = Callable[[dict, list, ChunkStream], Callable[[], None]]
 
-    def __init__(self, voices, source: Callable[[dict, list], AsyncIterator[bytes]], args):
-        self.voices, self.source, self.args = voices, source, args
+
+def local_feed(tts) -> Feed:
+    """An utterance's audio from the engine's client in this process: a task fills the stream (speak); the
+    returned callable stops it (the client gone: its engine request ends)."""
+
+    def feed(req: dict, yields: list, stream: ChunkStream) -> Callable[[], None]:
+        async def read():
+            gen = speak(tts, req, yields)
+            try:
+                async for data in gen:
+                    stream.push(data)
+                stream.finish()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - the client hears why
+                stream.fail(e)
+            finally:
+                await gen.aclose()
+
+        return asyncio.create_task(read()).cancel
+
+    return feed
+
+
+class Server:
+    """The connections. voices: the registered voice names; feed(req, yields, stream): fills an utterance's
+    ChunkStream with its PCM16 and returns what stops it."""
+
+    def __init__(self, voices, feed: Feed, args):
+        self.voices, self.feed, self.args = voices, feed, args
         self.log = open(args.log, "a") if args.log else None
         self.conn = 0
 
-    def chunker(self, source: AsyncIterator[bytes], n: int, rate: int, chars: int) -> AsyncIterator[bytes]:
+    def pacer(self, n: int, rate: int, chars: int) -> ChunkPacer:
         a = self.args
-        if not a.pace:
-            return rechunk(source, n)
+        if not a.pace:  # each chunk the moment it is complete
+            return ChunkPacer(n, 2 * rate, alpha=0.0, reserve_ms=None)
         expect = a.expect_per_char * chars if a.expect_per_char > 0 else None
         unit = max(2, round(FRAME_S * rate) * 2)  # the engine's audio comes in 40 ms frames
-        return paced(source, ChunkPacer(n, 2 * rate, a.pace_alpha, a.pace_reserve_ms if a.pace_reserve_ms >= 0
-                                        else None, expect_s=expect, margin_ms=a.pace_margin_ms, unit_bytes=unit,
-                                        alpha_last=a.pace_alpha_last))
+        return ChunkPacer(n, 2 * rate, a.pace_alpha, a.pace_reserve_ms if a.pace_reserve_ms >= 0 else None,
+                          expect_s=expect, margin_ms=a.pace_margin_ms, unit_bytes=unit, alpha_last=a.pace_alpha_last)
 
     async def handler(self, ws):
         u = urlparse(ws.request.path)
@@ -174,10 +187,15 @@ class Server:
         req = dict(text=text, dialect=cfg["dialect"], voice=cfg["voice"], cfg_value=cfg["cfg_value"], rate=rate,
                    chunk_ms=n / (2 * rate) * 1000, segmenting=cfg["segmenting"])
         yields, sends = [], []
-        async for b in self.chunker(self.source(req, yields), n, rate, len(text)):
-            await (ws.send(json.dumps({"type": "audio_chunk", "chunk_data": base64.b64encode(b).decode()}))
-                   if b64 else ws.send(b))
-            sends.append([time.perf_counter(), len(b)])
+        stream = ChunkStream(self.pacer(n, rate, len(text)))
+        stop = self.feed(req, yields, stream)
+        try:
+            async for b in stream:
+                await (ws.send(json.dumps({"type": "audio_chunk", "chunk_data": base64.b64encode(b).decode()}))
+                       if b64 else ws.send(b))
+                sends.append([time.perf_counter(), len(b)])
+        finally:
+            stop()
         await ws.send(json.dumps({"type": "end_of_audio"}))
         if self.log is not None:  # perf_counter (CLOCK_MONOTONIC) times: comparable with the engine's profiles
             # yields: [t, samples from the engine, ms resampling, bytes out] (two processes: [t received, 0, 0,
@@ -233,54 +251,74 @@ async def serve_engine(tts, reader: asyncio.StreamReader, writer: asyncio.Stream
             job.cancel()
 
 
-class EngineLink:
-    """The connections' side: an utterance's PCM16 from the engine's process (stream), one frame per engine chunk."""
+class EngineLink(asyncio.Protocol):
+    """The connections' side of the two processes' link: each frame's audio goes straight into its utterance's
+    ChunkStream as the bytes arrive (no task or queue per frame: after each engine step a patch of every stream
+    arrives at once). start(req, yields, stream) is a Feed."""
 
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        self.reader, self.writer = reader, writer
-        self.queues: dict[int, asyncio.Queue] = {}
+    def __init__(self):
+        loop = asyncio.get_running_loop()
+        self.ready, self.closed = loop.create_future(), loop.create_future()
+        self.buf = bytearray()
+        self.sinks: dict[int, tuple[ChunkStream, list | None]] = {}
         self.next_utt = 0
-        self.closed = asyncio.get_running_loop().create_future()
-        self.task = asyncio.create_task(self._read())
+        self.transport = None
 
-    async def _read(self):
-        try:
-            while True:
-                kind, utt, payload = await read_frame(self.reader)
-                q = self.queues.get(utt)
-                if q is not None:
-                    q.put_nowait((kind, payload, time.perf_counter()))
-        except (asyncio.IncompleteReadError, ConnectionError):
-            pass
-        finally:
-            for q in self.queues.values():
-                q.put_nowait((ERROR, b"the engine's process is gone", time.perf_counter()))
-            if not self.closed.done():
-                self.closed.set_result(None)
+    def connection_made(self, transport):
+        self.transport = transport
 
-    async def stream(self, req: dict, yields: list | None = None) -> AsyncIterator[bytes]:
-        self.next_utt += 1
-        utt, q = self.next_utt, asyncio.Queue()
-        self.queues[utt] = q
-        self.writer.write(frame(START, utt, json.dumps(req).encode()))
-        done = False
-        try:
-            while True:
-                kind, payload, t = await q.get()
-                if kind == DATA:
-                    if yields is not None:
-                        yields.append([t, 0, 0.0, len(payload)])
-                    yield payload
-                elif kind == END:
-                    done = True
-                    return
+    def data_received(self, data: bytes) -> None:
+        self.buf += data
+        t, off, buf, size = time.perf_counter(), 0, self.buf, _HDR.size
+        while len(buf) - off >= size:
+            kind, utt, n = _HDR.unpack_from(buf, off)
+            if len(buf) - off - size < n:
+                break
+            payload = bytes(buf[off + size:off + size + n])
+            off += size + n
+            if kind == READY:
+                if not self.ready.done():
+                    self.ready.set_result(json.loads(payload))
+                continue
+            sink = self.sinks.get(utt)
+            if sink is None:
+                continue
+            stream, yields = sink
+            if kind == DATA:
+                if yields is not None:
+                    yields.append([t, 0, 0.0, len(payload)])
+                stream.push(payload, t)
+            else:
+                del self.sinks[utt]
+                if kind == END:
+                    stream.finish()
                 else:
-                    done = True
-                    raise RuntimeError(payload.decode(errors="replace"))
-        finally:
-            del self.queues[utt]
-            if not done and not self.writer.is_closing():  # the client gone: the engine request ends
-                self.writer.write(frame(CANCEL, utt))
+                    stream.fail(RuntimeError(payload.decode(errors="replace")))
+        del buf[:off]
+
+    def connection_lost(self, exc) -> None:
+        for stream, _ in self.sinks.values():
+            stream.fail(RuntimeError("the engine's process is gone"))
+        self.sinks.clear()
+        for f in (self.ready, self.closed):
+            if not f.done():
+                f.set_result(None)
+
+    def send(self, kind: int, utt: int = 0, payload: bytes = b"") -> None:
+        if not self.transport.is_closing():
+            self.transport.write(frame(kind, utt, payload))
+
+    def start(self, req: dict, yields: list, stream: ChunkStream) -> Callable[[], None]:
+        self.next_utt += 1
+        utt = self.next_utt
+        self.sinks[utt] = (stream, yields)
+        self.send(START, utt, json.dumps(req).encode())
+
+        def stop():
+            if self.sinks.pop(utt, None) is not None:  # not ended: the client gone, the engine request ends
+                self.send(CANCEL, utt)
+
+        return stop
 
 
 async def lag_monitor(path: str, every: float = 0.002):
@@ -351,7 +389,7 @@ async def main_one(args):
     """--procs 1: the connections on the engine client's event loop."""
     tts = await load_tts(args)
     async with tts:
-        server = Server(set(tts.voices), lambda req, yields: speak(tts, req, yields), args)
+        server = Server(set(tts.voices), local_feed(tts), args)
         await serve_ws(server, args, stop_signal(), lambda: announce(args))
 
 
@@ -383,15 +421,14 @@ async def main_engine(args, sock, front_pid: int):
 
 async def main_front(args, sock):
     """--procs 2, the connections' process."""
-    reader, writer = await asyncio.open_connection(sock=sock)
-    kind, _, payload = await read_frame(reader)  # READY once the engine is up
-    if kind != READY:
+    _, link = await asyncio.get_running_loop().create_connection(EngineLink, sock=sock)
+    info = await link.ready  # once the engine is up
+    if info is None:
         return
-    link = EngineLink(reader, writer)
-    server = Server(set(json.loads(payload)["voices"]), link.stream, args)
+    server = Server(set(info["voices"]), link.start, args)
     stop = stop_signal()
     until = asyncio.ensure_future(asyncio.wait([stop, link.closed], return_when=asyncio.FIRST_COMPLETED))
-    await serve_ws(server, args, until, lambda: writer.write(frame(LISTENING, 0)))
+    await serve_ws(server, args, until, lambda: link.send(LISTENING))
 
 
 def cli():

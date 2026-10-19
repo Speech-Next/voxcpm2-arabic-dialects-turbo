@@ -13,7 +13,7 @@ import pytest
 websockets = pytest.importorskip("websockets")
 pytest.importorskip("soxr")
 
-from nanovllm_voxcpm.entrypoints.ws_server import EngineLink, Server, serve_engine, speak  # noqa: E402
+from nanovllm_voxcpm.entrypoints.ws_server import EngineLink, Server, local_feed, serve_engine  # noqa: E402
 
 PATCH = 7680  # 160 ms at 48 kHz
 
@@ -46,7 +46,7 @@ async def session(tts, a, query="audio_format=pcm_16000&chunk_size=4096&segmenti
     from websockets.asyncio.client import connect
     from websockets.asyncio.server import serve
 
-    srv = Server(set(tts.voices), lambda req, y: speak(tts, req, y), a)
+    srv = Server(set(tts.voices), local_feed(tts), a)
     async with serve(srv.handler, "127.0.0.1", 0) as s:
         port = s.sockets[0].getsockname()[1]
         msgs = []
@@ -107,7 +107,7 @@ def test_bad_format_is_an_error():
         from websockets.asyncio.server import serve
 
         tts = FakeTTS()
-        async with serve(Server(set(tts.voices), lambda req, y: speak(tts, req, y), args()).handler, "127.0.0.1",
+        async with serve(Server(set(tts.voices), local_feed(tts), args()).handler, "127.0.0.1",
                          0) as s:
             port = s.sockets[0].getsockname()[1]
             async with connect(f"ws://127.0.0.1:{port}/api/tts/stream?audio_format=mp3") as ws:
@@ -126,7 +126,7 @@ def test_paced_gaps_stay_under_a_chunk_through_the_engine_pause():
         from websockets.asyncio.server import serve
 
         tts = FakeTTS(patches=6, burst=3, pause=0.3)
-        async with serve(Server(set(tts.voices), lambda req, y: speak(tts, req, y), a).handler, "127.0.0.1", 0) as s:
+        async with serve(Server(set(tts.voices), local_feed(tts), a).handler, "127.0.0.1", 0) as s:
             port = s.sockets[0].getsockname()[1]
             ts = []
             async with connect(f"ws://127.0.0.1:{port}/api/tts/stream?audio_format=pcm_16000&chunk_size=4096") as ws:
@@ -171,10 +171,9 @@ def test_through_the_two_processes_link():
 
         sa, sb = socket.socketpair()
         ra, wa = await asyncio.open_connection(sock=sa)
-        rb, wb = await asyncio.open_connection(sock=sb)
         engine = asyncio.create_task(serve_engine(tts, ra, wa))
-        link = EngineLink(rb, wb)
-        async with serve(Server({"default"}, link.stream, args()).handler, "127.0.0.1", 0) as s:
+        tb, link = await asyncio.get_running_loop().create_connection(EngineLink, sock=sb)
+        async with serve(Server({"default"}, link.start, args()).handler, "127.0.0.1", 0) as s:
             port = s.sockets[0].getsockname()[1]
             url = f"ws://127.0.0.1:{port}/api/tts/stream?chunk_size=4096"
             async with connect(url) as ws:
@@ -191,7 +190,7 @@ def test_through_the_two_processes_link():
                 if cancelled:
                     break
                 await asyncio.sleep(0.01)
-        wb.close()
+        tb.close()
         await asyncio.wait_for(engine, 2)
         return msgs
 

@@ -201,3 +201,22 @@ def test_alpha_last_slows_the_chunk_that_empties_the_server():
     assert s[1][0] == pytest.approx(0.97 * CS)
     s = run(ChunkPacer(C, 32000, alpha=0.85, reserve_ms=None, alpha_last=0.97), [(0.0, 3 * C)], end=5.0)
     assert [x[0] for x in s] == pytest.approx([0, 0.85 * CS, 0.85 * CS + 0.97 * CS])
+
+
+def test_alpha_zero_is_unpaced():
+    s = run(ChunkPacer(C, 32000, alpha=0.0, reserve_ms=None), [(0.0, 3 * C), (0.5, C + 10)], end=0.6)
+    assert s == [(0.0, C), (0.0, C), (0.0, C), (0.5, C), (0.6, 10)]
+
+
+def test_chunk_stream_pushed_from_callbacks():
+    from nanovllm_voxcpm.streaming import ChunkStream
+
+    async def main():
+        stream = ChunkStream(ChunkPacer(chunk_bytes=320, bytes_per_s=32000, alpha=0.9, reserve_ms=None))
+        loop = asyncio.get_running_loop()
+        for k in range(6):  # 6 chunks of 10 ms: two bursts from plain callbacks, then the end
+            loop.call_later(0.0 if k < 3 else 0.02, stream.push, bytes([k]) * 320)
+        loop.call_later(0.2, stream.finish)
+        return [c async for c in stream]
+
+    assert asyncio.run(main()) == [bytes([k]) * 320 for k in range(6)]
