@@ -46,7 +46,8 @@ class ChunkPacer:
 
     def __init__(self, chunk_bytes: int = 4096, bytes_per_s: float = 32000.0, alpha: float = 0.95,
                  reserve_ms: float | None = 1000.0, expect_s: float | None = None, margin_ms: float = 4.0,
-                 unit_bytes: int = 1, alpha_last: float | None = None, phase_ms: float = 0.0):
+                 unit_bytes: int = 1, alpha_last: float | None = None, phase_ms: float = 0.0,
+                 min_gap_ms: float = 0.0):
         if chunk_bytes <= 0 or bytes_per_s <= 0 or not 0 <= alpha <= 1:
             raise ValueError("chunk_bytes and bytes_per_s must be positive, 0 <= alpha <= 1 (0: no pace)")
         self.chunk_bytes = chunk_bytes
@@ -68,6 +69,10 @@ class ChunkPacer:
         # event loop timestamps the last of a burst several ms late); costs the server that much lead each time
         self.phase = phase_ms / 1000
         self._shift = 0.0
+        # chunks sent ahead of the grid (above the reserve, or what is left at the end) go out at least this far
+        # apart: at 200 streams, ends flushed at once (up to a second's chunks of each of a dozen streams) held the
+        # connections' event loop and the client's for 6-7 ms, and other streams' paced chunks came late
+        self.min_gap = min_gap_ms / 1000
 
     @staticmethod
     def ratio_for(expect_s: float, chunk_bytes: int = 4096, bytes_per_s: float = 32000.0, margin_ms: float = 4.0,
@@ -120,7 +125,7 @@ class ChunkPacer:
             t = min(t, self._ended)
         if self.reserve is not None and n > self.chunk_bytes + self.reserve:  # more than the reserve behind it
             t = min(t, self._arrival(self._base + self.chunk_bytes + self.reserve + 1))
-        return max(ready, t)
+        return max(ready, t, self._grid + self.min_gap)
 
     def pop(self) -> bytes:
         """Take the next chunk (call once ``due`` has passed); the grid moves to when it was due."""

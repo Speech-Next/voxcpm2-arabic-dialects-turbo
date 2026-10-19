@@ -17,7 +17,8 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
   same audio).
 - Pacing (default; --no-pace sends each chunk the moment it is complete): streaming.ChunkPacer per utterance, the
   first chunk at once, the next ones on a grid of --pace-alpha (0.9) x a chunk's audio (--pace-alpha-last, 0.92,
-  for the last chunk queued), more than --pace-reserve-ms queued at once, the rest at the end at once; the chunk
+  for the last chunk queued), more than --pace-reserve-ms queued and the rest at the end sooner (at least
+  --pace-min-gap-ms, 8, apart: an end flushed at once held both event loops for 6-7 ms at 200 streams); the chunk
   after the first (or a late one) up to --pace-spread-ms sooner, a different amount per utterance. One task sends
   every connection's due chunks as whole frames (StreamSender). A gap stays 10-13 ms under the shortest average
   chunk (124.4 ms with 4096-byte chunks of 16 kHz): the event loops of both sides (the client's too) delayed
@@ -143,7 +144,7 @@ class Server:
         phase = getattr(a, "pace_spread_ms", 0.0) * ((self.utterances * 0.6180339887) % 1.0)
         return ChunkPacer(n, 2 * rate, a.pace_alpha, a.pace_reserve_ms if a.pace_reserve_ms >= 0 else None,
                           expect_s=expect, margin_ms=a.pace_margin_ms, unit_bytes=unit, alpha_last=a.pace_alpha_last,
-                          phase_ms=phase)
+                          phase_ms=phase, min_gap_ms=getattr(a, "pace_min_gap_ms", 0.0))
 
     async def handler(self, ws):
         u = urlparse(ws.request.path)
@@ -520,6 +521,8 @@ def cli():
     ap.add_argument("--pace-spread-ms", type=float, default=10.0,
                     help="the chunk after the first (or a late one) goes out up to this much sooner, a different "
                          "amount per utterance: streams that start together do not send on the same instants")
+    ap.add_argument("--pace-min-gap-ms", type=float, default=8.0,
+                    help="chunks sent ahead of the pace (above the reserve, the rest at the end) at least this far apart")
     ap.add_argument("--per-stream-sends", dest="batch_sends", action="store_false",
                     help="each connection sends its own paced chunks (default: one task sends every due chunk)")
     ap.add_argument("--procs", type=int, choices=(1, 2), default=2,
