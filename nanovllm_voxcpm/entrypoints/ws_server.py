@@ -225,7 +225,7 @@ async def read_frame(reader: asyncio.StreamReader) -> tuple[int, int, bytes]:
 async def serve_engine(tts, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, log=None) -> None:
     """The engine's side: START (an utterance's request, JSON) -> DATA frames, then END (or ERROR); CANCEL stops
     one. Returns when the connections' side closes. log: a file, one jsonl line per utterance (perf_counter times:
-    the START frame read, the task started, the first yields [t, samples, ms resampling, bytes])."""
+    the START frame read, the task started, the yields [t, samples, ms resampling, bytes])."""
     jobs: dict[int, asyncio.Task] = {}
 
     async def run(utt: int, req: dict, t_start: float):
@@ -236,7 +236,7 @@ async def serve_engine(tts, reader: asyncio.StreamReader, writer: asyncio.Stream
             writer.write(frame(END, utt))
             if log is not None:
                 log.write(json.dumps({"utt": utt, "crc": zlib.crc32(req["text"].encode()), "t_start": t_start,
-                                      "t_task": t_task, "yields": yields[:6], "t_end": time.perf_counter()}) + "\n")
+                                      "t_task": t_task, "yields": yields, "t_end": time.perf_counter()}) + "\n")
         except asyncio.CancelledError:
             pass
         except Exception as e:  # noqa: BLE001 - the client hears why
