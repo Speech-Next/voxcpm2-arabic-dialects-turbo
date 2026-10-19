@@ -26,8 +26,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# the OpenAI-compatible HTTP server (nanovllm_voxcpm.entrypoints.openai_server)
-server = ["fastapi", "uvicorn", "python-multipart"]
+# the OpenAI-compatible HTTP server (nanovllm_voxcpm.entrypoints.openai_server) and the WebSocket one (ws_server)
+server = ["fastapi", "uvicorn", "python-multipart", "websockets>=13", "soxr"]
 # the tests: python -m pytest tests
 dev = ["pytest"]
 
