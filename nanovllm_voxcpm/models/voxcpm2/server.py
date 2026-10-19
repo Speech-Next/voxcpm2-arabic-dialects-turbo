@@ -65,6 +65,38 @@ def _block_item(ring, seq_ids, waves) -> dict | None:
             "dtype": block.dtype.str, "shape": block.shape}
 
 
+class _TokenizerSync:
+    """The engine's tokenizer as its client has it (NANOVLLM_CLIENT_TOKENIZE). The tokenizer can change after start
+    (registering a tagged adapter installs one that reads its dialect tags as single tokens): the client then gets
+    the new one (message "tokenizer", with a new version), and ids tokenized with another version are not used."""
+
+    def __init__(self, llm) -> None:
+        self.llm, self.version = llm, 0
+        self.backend = self._current() if _CLIENT_TOKENIZE and hasattr(llm, "pretokenize") else None
+
+    def _current(self):
+        return getattr(getattr(getattr(self.llm, "tokenizer", None), "tokenizer", None), "_tokenizer", None)
+
+    def init_fields(self) -> dict:
+        return {"tokenizer": self.backend.to_str() if self.backend is not None else None, "tokenizer_version": 0}
+
+    def changed(self) -> dict | None:
+        """The message for the client when the engine's tokenizer was replaced since the last call, else None."""
+        if self.backend is None:  # (no client tokenizing: off, or no fast tokenizer at start)
+            return None
+        b = self._current()
+        if b is self.backend:
+            return None
+        self.backend, self.version = b, self.version + 1
+        return {"type": "tokenizer", "tokenizer": b.to_str() if b is not None else None, "version": self.version}
+
+    def accept(self, tok) -> tuple | None:
+        """(ids, offsets) of a command's client tokenization if it used the engine's current tokenizer, else None."""
+        if tok is None or self.backend is None or tok[0] != self.version:
+            return None
+        return tok[1], tok[2]
+
+
 def _request_text(cmd: dict) -> str | None:
     """The text the engine tokenizes for an add_request command (prompt_text + target_text), else None."""
     if cmd.get("type") != "add_request":
@@ -352,13 +384,9 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
                 atexit.register(ring.close)
             except Exception:  # no shared memory: chunks travel pickled
                 ring = None
-        tok_json = None
-        if _CLIENT_TOKENIZE and hasattr(getattr(srv, "llm", None), "pretokenize"):
-            backend = getattr(getattr(getattr(srv.llm, "tokenizer", None), "tokenizer", None), "_tokenizer", None)
-            if backend is not None:
-                tok_json = backend.to_str()
+        tok_sync = _TokenizerSync(getattr(srv, "llm", None))
         queue_out.put({"type": "init_ok", "shm": ring.shm.name if ring is not None else None,
-                       "tokenizer": tok_json})
+                       **tok_sync.init_fields()})
         if os.environ.get("NANOVLLM_GC_FREEZE", "1") != "0":
             # the model's objects live in a frozen generation and generation 0 collects less often: full
             # collections over them otherwise land inside steps (tens of ms in a burst)
@@ -416,7 +444,7 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
                 text = _request_text(cmd)
                 if text is not None:
                     texts.append(text)
-                    tok = cmd.pop("tok", None)  # tokenized by the client (NANOVLLM_CLIENT_TOKENIZE)
+                    tok = tok_sync.accept(cmd.pop("tok", None))  # tokenized by the client (NANOVLLM_CLIENT_TOKENIZE)
                     if tok is not None:
                         done[text] = tok
             if texts:
@@ -426,6 +454,7 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
             items.append(method_call(deferred.popleft()))
         t2 = time.perf_counter()
         if items:
+            put(tok_sync.changed())  # (ahead of the responses: the client tokenizes its next requests with it)
             queue_out.put({"type": "batch", "items": items})
         reg_parts[:] = [(t1 - t0) * 1000, (t2 - t1) * 1000, (time.perf_counter() - t2) * 1000]
 
@@ -474,7 +503,9 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
                              pretok_ms=reg_parts[0], add_ms=reg_parts[1], resp_ms=reg_parts[2],
                              **_host_fields(h0, time.perf_counter() - t_recv))
             return None
-        return method_call(cmd)
+        res = method_call(cmd)
+        put(tok_sync.changed())  # (e.g. a tagged adapter's registration replaced it; ahead of the response)
+        return res
 
     def overlap_hook():
         # register (during this step's GPU work) only what the next prefill step can take: registering a whole
@@ -766,7 +797,8 @@ class AsyncVoxCPM2Server:
 
     _reader = None
     _ring = None
-    _tokenizer = None  # the engine's tokenizer (init_ok), NANOVLLM_CLIENT_TOKENIZE
+    _tokenizer = None  # the engine's tokenizer (init_ok, "tokenizer" messages), NANOVLLM_CLIENT_TOKENIZE
+    _tok_version = 0  # its version: the engine uses only ids tokenized with its current one
     _first_flush = True  # the next flush is a burst's first (NANOVLLM_SUBMIT_FLUSH_FIRST)
     _more_sent = False  # this event-loop turn sent commands marked "more": its end must reach the engine
     _spin_task = None
@@ -890,18 +922,12 @@ class AsyncVoxCPM2Server:
         if self._spin_task is not None:
             self._touch()
         if res.get("type") == "init_ok":
-            if res.get("tokenizer") and _CLIENT_TOKENIZE:
-                try:
-                    from tokenizers import Tokenizer
-
-                    tok = Tokenizer.from_str(res["tokenizer"])
-                    tok.no_truncation()
-                    tok.no_padding()
-                    self._tokenizer = tok
-                except Exception:  # (the engine tokenizes, as without it)
-                    self._tokenizer = None
+            self._set_tokenizer(res.get("tokenizer"), res.get("tokenizer_version", 0))
             if not self._init_fut.done():
                 self._init_fut.set_result(None)
+            return
+        if res.get("type") == "tokenizer":  # the engine's tokenizer was replaced (e.g. a tagged adapter's)
+            self._set_tokenizer(res.get("tokenizer"), res["version"])
             return
         if res.get("type") == "init_error":
             if not self._init_fut.done():
@@ -935,9 +961,24 @@ class AsyncVoxCPM2Server:
                     fut.set_exception(RuntimeError(res["error"]))
             # else: future was cancelled (wait_for timeout etc) — skip set_result silently
 
+    def _set_tokenizer(self, spec: str | None, version: int) -> None:
+        """The engine's tokenizer (its JSON) for NANOVLLM_CLIENT_TOKENIZE; None: the engine tokenizes."""
+        self._tokenizer, self._tok_version = None, version
+        if spec and _CLIENT_TOKENIZE:
+            try:
+                from tokenizers import Tokenizer
+
+                tok = Tokenizer.from_str(spec)
+                tok.no_truncation()
+                tok.no_padding()
+                self._tokenizer = tok
+            except Exception:  # (the engine tokenizes, as without it)
+                pass
+
     def _tokenize(self, cmds: list[dict[str, Any]]) -> None:
-        """The add_request commands' ids and character offsets ("tok"), in one batched call (NANOVLLM_CLIENT_TOKENIZE);
-        texts with CJK characters are left to the engine (its wrapper splits multi-character Chinese tokens)."""
+        """The add_request commands' tokenizer version, ids and character offsets ("tok"), in one batched call
+        (NANOVLLM_CLIENT_TOKENIZE); texts with CJK characters are left to the engine (its wrapper splits
+        multi-character Chinese tokens)."""
         from nanovllm_voxcpm.models.voxcpm2.engine import _CJK
 
         todo = [(c, t) for c in cmds for t in (_request_text(c),) if t is not None and not _CJK.search(t)]
@@ -948,7 +989,7 @@ class AsyncVoxCPM2Server:
         except Exception:  # (the engine tokenizes them)
             return
         for (c, _), e in zip(todo, encs):
-            c["tok"] = (e.ids, e.offsets)
+            c["tok"] = (self._tok_version, e.ids, e.offsets)
 
     def _flush_submits(self, more: bool = False) -> None:
         """Send the pending commands; ``more``: more commands of this event-loop turn follow (an early flush)."""

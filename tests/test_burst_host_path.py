@@ -784,7 +784,7 @@ def test_the_client_tokenizes_a_batch_with_the_engines_tokenizer():
     client._tokenize(cmds)
     for c in cmds[:2]:
         e = backend.encode(_request_text(c), add_special_tokens=False)
-        assert c["tok"] == (e.ids, e.offsets)
+        assert c["tok"] == (0, e.ids, e.offsets)  # (the tokenizer's version: init_ok's)
     assert "tok" not in cmds[2] and "tok" not in cmds[3] and _request_text(cmds[3]) is None
 
     batches = []
@@ -792,9 +792,39 @@ def test_the_client_tokenizes_a_batch_with_the_engines_tokenizer():
     eng.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(_tokenizer=SimpleNamespace(
         encode_batch=lambda texts, add_special_tokens: batches.append(list(texts)) or backend.encode_batch(texts))))
     texts = [_request_text(c) for c in cmds[:3]]
-    eng.pretokenize(texts, {_request_text(c): c["tok"] for c in cmds[:2]})
+    eng.pretokenize(texts, {_request_text(c): c["tok"][1:] for c in cmds[:2]})
     assert batches == []  # the client's two; the CJK one is the per-text path's (not cached)
-    assert eng._text_ids("", "abc ab") == cmds[0]["tok"][0] and eng._text_ids("bc ", "h é") == cmds[1]["tok"][0]
+    assert eng._text_ids("", "abc ab") == cmds[0]["tok"][1] and eng._text_ids("bc ", "h é") == cmds[1]["tok"][1]
+
+
+def test_the_client_follows_the_engines_tokenizer_when_it_changes():
+    """A tagged adapter registered after start replaces the engine's tokenizer (its dialect tags as single tokens):
+    the client gets the new one with a new version, and ids from the old one are not used (the engine tokenizes)."""
+    from tokenizers import AddedToken
+
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, _TokenizerSync
+
+    base, tagged = _tiny_tokenizer(), _tiny_tokenizer()
+    tagged.add_special_tokens([AddedToken("<eg>", normalized=False)])
+    llm = SimpleNamespace(pretokenize=None, tokenizer=SimpleNamespace(tokenizer=SimpleNamespace(_tokenizer=base)))
+    sync = _TokenizerSync(llm)
+    client = object.__new__(AsyncVoxCPM2Server)
+    client._init_fut = SimpleNamespace(done=lambda: True)
+    client._handle({"type": "init_ok", **sync.init_fields()})
+    old = [_add_cmd("r0", "<eg>abc")]
+    client._tokenize(old)
+    assert sync.changed() is None and sync.accept(old[0]["tok"]) == old[0]["tok"][1:]
+
+    llm.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(_tokenizer=tagged))  # register_lora's swap
+    msg = sync.changed()
+    assert msg["type"] == "tokenizer" and msg["version"] == 1 and sync.changed() is None
+    assert sync.accept(old[0]["tok"]) is None  # tokenized with the old one: not used
+    client._handle(msg)
+    new = [_add_cmd("r1", "<eg>abc")]
+    client._tokenize(new)
+    e = tagged.encode("<eg>abc", add_special_tokens=False)
+    assert new[0]["tok"] == (1, e.ids, e.offsets) and sync.accept(new[0]["tok"]) == (e.ids, e.offsets)
+    assert new[0]["tok"][1] != old[0]["tok"][1]  # the tag is one token now
 
 
 def test_the_models_tokenizer_round_trips_to_the_client():
