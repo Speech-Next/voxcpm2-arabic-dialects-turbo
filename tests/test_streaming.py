@@ -220,3 +220,29 @@ def test_chunk_stream_pushed_from_callbacks():
         return [c async for c in stream]
 
     assert asyncio.run(main()) == [bytes([k]) * 320 for k in range(6)]
+
+
+def test_stream_sender_batches_streams_in_order_and_finishes_them():
+    from nanovllm_voxcpm.streaming import ChunkStream, StreamSender
+
+    async def main():
+        sender = StreamSender(window_s=0.005)
+        sent = []
+        streams = [ChunkStream(ChunkPacer(chunk_bytes=320, bytes_per_s=32000, alpha=0.9, reserve_ms=None))
+                   for _ in range(3)]
+        futs = [sender.add(s, lambda b, i=i: sent.append((i, b[0], time.perf_counter()))) for i, s in enumerate(streams)]
+        for i, s in enumerate(streams):  # 3 chunks each, all at once
+            s.push(bytes([i * 10 + k for k in range(3) for _ in range(320)]))
+            s.finish()
+        failing = ChunkStream(ChunkPacer(chunk_bytes=320, bytes_per_s=32000, alpha=0.9, reserve_ms=None))
+        f_fail = sender.add(failing, lambda b: (_ for _ in ()).throw(ConnectionError("gone")))
+        failing.push(b"\0" * 320)
+        await asyncio.gather(*futs)
+        with pytest.raises(ConnectionError):
+            await f_fail
+        return sent
+
+    sent = asyncio.run(main())
+    assert [(i, b) for i, b, _ in sent if b % 10 == 0] == [(0, 0), (1, 10), (2, 20)]  # first chunks, in order
+    for i in range(3):
+        assert [b for j, b, _ in sent if j == i] == [i * 10, i * 10 + 1, i * 10 + 2]

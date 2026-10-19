@@ -39,10 +39,20 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
-from nanovllm_voxcpm.streaming import ChunkPacer, ChunkStream
+from nanovllm_voxcpm.streaming import ChunkPacer, ChunkStream, StreamSender
 
 PATH = "/api/tts/stream"
 FRAME_S = 0.04  # the AudioVAE's frame: a stream's audio is a whole number of them
+
+
+def ws_frame(opcode: int, payload: bytes) -> bytes:
+    """A whole, unmasked WebSocket frame (server to client; no extensions): opcode 1 text, 2 binary."""
+    n = len(payload)
+    if n < 126:
+        return bytes((0x80 | opcode, n)) + payload
+    if n < 65536:
+        return struct.pack("!BBH", 0x80 | opcode, 126, n) + payload
+    return struct.pack("!BBQ", 0x80 | opcode, 127, n) + payload
 
 
 def pcm16(y: np.ndarray) -> bytes:
@@ -114,6 +124,8 @@ class Server:
         self.voices, self.feed, self.args = voices, feed, args
         self.log = open(args.log, "a") if args.log else None
         self.conn = 0
+        # paced chunks of every connection from one task (StreamSender), written to the transports as whole frames
+        self.sender = StreamSender() if args.pace and getattr(args, "batch_sends", True) else None
 
     def pacer(self, n: int, rate: int, chars: int) -> ChunkPacer:
         a = self.args
@@ -190,11 +202,29 @@ class Server:
         stream = ChunkStream(self.pacer(n, rate, len(text)))
         stop = self.feed(req, yields, stream)
         try:
-            async for b in stream:
-                t = time.perf_counter()
-                await (ws.send(json.dumps({"type": "audio_chunk", "chunk_data": base64.b64encode(b).decode()}))
-                       if b64 else ws.send(b))
-                sends.append([time.perf_counter(), len(b), stream.last_due, t])
+            if self.sender is not None and not ws.protocol.extensions:
+                from websockets.protocol import State
+
+                transport = ws.transport
+
+                def write(b: bytes) -> None:  # (in the sender's pass: no await, the frame written whole)
+                    if ws.state is not State.OPEN:
+                        raise ConnectionError("the client is gone")
+                    t = time.perf_counter()
+                    transport.write(ws_frame(1, json.dumps({"type": "audio_chunk", "chunk_data": base64.b64encode(
+                        b).decode()}).encode()) if b64 else ws_frame(2, b))
+                    sends.append([time.perf_counter(), len(b), stream.last_due, t])
+
+                try:
+                    await self.sender.add(stream, write)
+                finally:
+                    self.sender.remove(stream)
+            else:
+                async for b in stream:
+                    t = time.perf_counter()
+                    await (ws.send(json.dumps({"type": "audio_chunk", "chunk_data": base64.b64encode(b).decode()}))
+                           if b64 else ws.send(b))
+                    sends.append([time.perf_counter(), len(b), stream.last_due, t])
         finally:
             stop()
         await ws.send(json.dumps({"type": "end_of_audio"}))
@@ -464,6 +494,8 @@ def cli():
     ap.add_argument("--expect-per-char", type=float, default=0.0,
                     help="> 0: an utterance lasts at least this x its characters (s): a slower pace's ratio for "
                          "short ones keeps their gaps under their shorter average chunk (ChunkPacer.ratio_for)")
+    ap.add_argument("--per-stream-sends", dest="batch_sends", action="store_false",
+                    help="each connection sends its own paced chunks (default: one task sends every due chunk)")
     ap.add_argument("--procs", type=int, choices=(1, 2), default=2,
                     help="2: the connections in a process of their own (default), 1: on the engine client's loop")
     ap.add_argument("--no-uvloop", dest="uvloop", action="store_false", help="asyncio's own event loop even when "

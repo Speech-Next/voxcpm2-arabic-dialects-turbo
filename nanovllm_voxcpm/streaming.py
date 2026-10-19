@@ -32,11 +32,12 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import heapq
 import math
 import time
 from collections.abc import AsyncIterator, Callable
 
-__all__ = ["ChunkPacer", "ChunkStream", "paced"]
+__all__ = ["ChunkPacer", "ChunkStream", "StreamSender", "paced"]
 
 
 class ChunkPacer:
@@ -153,19 +154,27 @@ class ChunkStream:
         self._target = math.inf  # when the taking side wakes up anyway
         self._failed: BaseException | None = None
         self.last_due: float | None = None  # when the chunk last taken out was due
+        self._sender: "tuple[StreamSender, int] | None" = None  # sent by a StreamSender instead of async for
 
     def push(self, data: bytes, t: float | None = None) -> None:
         self.pacer.push(data, self.clock() if t is None else t)
+        if self._sender is not None:
+            self._sender[0]._update(self._sender[1])
+            return
         due = self.pacer.due()
         if due is not None and due < self._target:
             self._wake.set()
 
     def finish(self) -> None:
         self.pacer.finish(self.clock())
+        if self._sender is not None:
+            self._sender[0]._update(self._sender[1])
         self._wake.set()
 
     def fail(self, e: BaseException) -> None:
         self._failed = e
+        if self._sender is not None:
+            self._sender[0]._update(self._sender[1])
         self._wake.set()
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
@@ -192,6 +201,98 @@ class ChunkStream:
             self._target = -math.inf
             self.last_due = due
             yield pacer.pop()
+
+
+class StreamSender:
+    """Sends the due chunks of many ChunkStreams from one task, a batch at a time: every chunk due within ``window_s``
+    goes out in one pass, in the order the streams were added. One wake-up per batch instead of one per stream and
+    chunk, and a stream's place in the batch stays the same from chunk to chunk: at 200 streams, waking each stream's
+    own task cost 7-15 ms of jitter between a stream's chunks, against margins of 3-9 ms under the average chunk.
+    ``send`` must not block (e.g. a transport's write)."""
+
+    def __init__(self, window_s: float = 0.002, clock: Callable[[], float] = time.perf_counter):
+        self.window, self.clock = window_s, clock
+        self._streams: dict[int, tuple[ChunkStream, Callable[[bytes], None], asyncio.Future]] = {}
+        self._queued: dict[int, float] = {}  # the due time each stream is queued with
+        self._heap: list[tuple[float, int]] = []
+        self._next = 0
+        self._wake = asyncio.Event()
+        self._sleep_until = math.inf
+        self._task: asyncio.Task | None = None
+
+    def add(self, stream: ChunkStream, send: Callable[[bytes], None]) -> asyncio.Future:
+        """Send ``stream``'s chunks with ``send``; the future is done once the stream is (or failed)."""
+        if self._task is None or self._task.done():
+            self._task = asyncio.get_running_loop().create_task(self._run())
+        sid, self._next = self._next, self._next + 1
+        fut = asyncio.get_running_loop().create_future()
+        self._streams[sid] = (stream, send, fut)
+        stream._sender = (self, sid)
+        self._update(sid)
+        return fut
+
+    def remove(self, stream: ChunkStream) -> None:
+        if stream._sender is not None and stream._sender[0] is self:
+            self._streams.pop(stream._sender[1], None)
+            self._queued.pop(stream._sender[1], None)
+            stream._sender = None
+
+    def _update(self, sid: int) -> None:
+        item = self._streams.get(sid)
+        if item is None:
+            return
+        stream, _, fut = item
+        if stream._failed is not None or stream.pacer.done:
+            self._wake.set()  # (finished in _run)
+            return
+        due = stream.pacer.due()
+        if due is None or self._queued.get(sid) == due:
+            return
+        self._queued[sid] = due
+        heapq.heappush(self._heap, (due, sid))
+        if due < self._sleep_until:
+            self._wake.set()
+
+    def _finish_done(self) -> None:
+        for sid, (stream, _, fut) in list(self._streams.items()):
+            if stream._failed is not None or stream.pacer.done:
+                del self._streams[sid]
+                self._queued.pop(sid, None)
+                stream._sender = None
+                if not fut.done():
+                    if stream._failed is not None:
+                        fut.set_exception(stream._failed)
+                    else:
+                        fut.set_result(None)
+
+    async def _run(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            self._wake.clear()
+            self._finish_done()
+            now = self.clock()
+            batch = set()
+            while self._heap and self._heap[0][0] <= now + self.window:
+                due, sid = heapq.heappop(self._heap)
+                if self._queued.get(sid) == due:  # (else stale: the stream's due time changed since)
+                    del self._queued[sid]
+                    batch.add(sid)
+            if batch:
+                for sid in sorted(batch):
+                    stream, send, fut = self._streams[sid]
+                    stream.last_due = stream.pacer.due()
+                    try:
+                        send(stream.pacer.pop())
+                    except Exception as e:  # noqa: BLE001 - the stream's owner hears it
+                        stream._failed = e
+                    self._update(sid)
+                continue
+            self._sleep_until = self._heap[0][0] if self._heap else math.inf
+            timer = loop.call_later(self._sleep_until - now, self._wake.set) if self._heap else None
+            await self._wake.wait()
+            self._sleep_until = -math.inf
+            if timer is not None:
+                timer.cancel()
 
 
 async def paced(source: AsyncIterator[bytes], pacer: ChunkPacer,
