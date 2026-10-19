@@ -36,6 +36,7 @@ _PATCHES_PER_TOKEN = 0.5
 
 _PCM_RATE = 32000  # a paced front's bytes per second (16 kHz PCM16: the pacer counts audio, any format the same)
 _PATCH_PCM = bytes(5120)  # one 160 ms patch at that rate
+_FIRST_FRAME_PCM = bytes(1280)  # its first latent frame (40 ms): what a muted patch of a prefill step sends
 
 
 def _is_silent(wave) -> bool:
@@ -206,14 +207,14 @@ class VoxCPM2Engine(LLMEngineBase):
         chunks (add_request's client_chunk_ms, else TurboConfig.client_chunk_ms): less what the front holds back
         (what it has streamed beyond its last whole chunk)."""
         p = seq.custom_payload
-        if p.play_end is None:
-            return None
         if p.pacer is not None:  # a paced front: until it needs a chunk not produced yet (pace_sync keeps it)
             return None if p.pace_dry is None else p.pace_dry - time.perf_counter()
+        if p.play_end is None:
+            return None
         held = math.fmod(p.streamed + 1e-9, p.client_chunk) - 1e-9 if p.client_chunk > 0 else 0.0
         return p.play_end - max(held, 0.0) - time.perf_counter()
 
-    def _pace(self, p: VoxCPM2SeqPayload, now: float) -> None:
+    def _pace(self, p: VoxCPM2SeqPayload, now: float, pcm: bytes = None) -> None:
         """A patch reaches the paced front (TurboConfig.client_pace): its 160 ms into the stream's ChunkPacer (16 kHz
         PCM16, as ws_server; the pacer counts audio, not samples), then the chunks due sent."""
         if p.pacer is None:
@@ -221,7 +222,7 @@ class VoxCPM2Engine(LLMEngineBase):
 
             p.pacer = ChunkPacer(int(round(p.client_chunk * _PCM_RATE)), _PCM_RATE, alpha=p.pace,
                                  reserve_ms=self.client_pace_reserve * 1000, alpha_last=self.client_pace_last)
-        p.pacer.push(_PATCH_PCM, now)
+        p.pacer.push(_PATCH_PCM if pcm is None else pcm, now)
         p.pace_due = p.pacer.due()
         self._pace_sync(p, now)
 
@@ -495,6 +496,9 @@ class VoxCPM2Engine(LLMEngineBase):
             payload.streamed += self.patch_seconds
             if payload.pace > 0 and payload.client_chunk > 0:
                 self._pace(payload, now)
+        elif payload.pace > 0 and payload.client_chunk > 0 and self.scheduler.last_step[0]:
+            # a muted patch of a prefill step still left its early first frame (#23, 40 ms): the paced front has it
+            self._pace(payload, time.perf_counter(), _FIRST_FRAME_PCM)
 
         latents = latents.reshape(-1, self.feat_dim)
         if seq.custom_payload.decode_pad is not None:
