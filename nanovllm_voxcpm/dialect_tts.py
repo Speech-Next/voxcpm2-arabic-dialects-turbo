@@ -60,6 +60,9 @@ def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | 
     requests that start together (#28): heads of up to 5 patches, enough audio for their continuations' prefill,
     prefill steps of at most 160 ms while streams play, the continuations' steps decoding the streams short of audio,
     and new heads held while even 5 patches would not last (no dropouts; first audio waits instead in large bursts).
+    With a distilled LocDiT, a prefill step of new streams solves their first patch in its grid's first step and one
+    jump to 0, t = [1.0, 0.7071, 0.0]: the 2-step student's grid (the 3-step one was trained from it and shares its
+    first step); 200 requests at once: TTFB -12 ms (#31).
     dit_cache: with the original LocDiT (``dit`` None), reuse its middle layers on some solver steps ("light",
     "medium" or a plan, see models/voxcpm2/dit_cache.py).
     w8a8=False: bf16 layers (quality measurements of a model whose SmoothQuant statistics were not calibrated)."""
@@ -71,6 +74,7 @@ def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | 
         raise ValueError("dit_cache is for the original LocDiT (dit=None): the distilled one has no step to spare")
     if dit:
         cfg["dit_checkpoint"] = resolve(dit)
+        cfg["dit_first_t_span"] = [1.0, 0.7071, 0.0]
     if dit_cache:
         from nanovllm_voxcpm.models.voxcpm2.dit_cache import plan
 
