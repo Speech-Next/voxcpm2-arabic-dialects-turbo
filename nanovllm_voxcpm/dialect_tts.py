@@ -57,12 +57,14 @@ def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | 
     """The measured low-latency configuration: distilled 2-step LocDiT (``dit``), int8 layers, head start of
     ``head_tokens`` tokens (0 = off), int16 audio chunks, a stream's leading silence capped at 2 patches (320 ms),
     no new request admitted while a playing stream has less than 100 ms of audio queued at its player, and for
-    requests that start together (#28): heads of up to 5 patches, enough audio for their continuations' prefill,
-    prefill steps of at most 160 ms while streams play, the continuations' steps decoding the streams short of audio.
+    requests that start together (#28): heads of up to 7 patches, enough audio for their continuations' prefill,
+    prefill steps of at most 130 ms while streams play, every prefill step then also decoding the streams short of
+    audio (the continuations' and, #31, the heads' of a burst's late arrivals).
     New heads are not held (#31: first audio stays at ~0.1 s at 200 at once): a head whose whole continuation would
     come too late speaks the first 24, then 48 text tokens first (intermediate stages, each reusing the KV of the one
     before; up to 16 patches each). A front that sends the audio on in chunks passes their length (stream's
-    chunk_ms), so that the deadlines allow for what it holds back.
+    chunk_ms), so that the deadlines allow for what it holds back, and a paced front its pace (stream's pace, e.g.
+    0.9: one chunk per 0.9 x its audio at most), so that they follow its send clock.
     With a distilled LocDiT, a prefill step of new streams solves their first patch in its grid's first step and one
     jump to 0, t = [1.0, 0.7071, 0.0]: the 2-step student's grid (the 3-step one was trained from it and shares its
     first step); 200 requests at once: TTFB -12 ms (#31).
@@ -70,7 +72,8 @@ def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | 
     "medium" or a plan, see models/voxcpm2/dit_cache.py).
     w8a8=False: bf16 layers (quality measurements of a model whose SmoothQuant statistics were not calibrated)."""
     cfg = {"pcm16_output": True, "head_tokens": head_tokens, "head_patches": 3, "lead_silence_patches": 2,
-           "stream_guard_ms": 100, "head_patches_max": 5, "mix_decode": True, "step_cap_ms": 160, "head_hold": False,
+           "stream_guard_ms": 100, "head_patches_max": 7, "mix_decode": True, "mix_heads": True, "step_cap_ms": 130,
+           "head_hold": False,
            "mid_tokens": [24, 48], "mid_patches_max": 16, "stage_kv_reuse": True}
     if w8a8:
         cfg.update(w8a8=True, w8a8_targets=["base_lm", "residual_lm", "feat_encoder", "feat_decoder"])
