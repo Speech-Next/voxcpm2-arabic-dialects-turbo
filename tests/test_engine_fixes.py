@@ -1239,3 +1239,105 @@ def test_turbo_config_rejects_unknown_keys_and_accepts_the_repos_own():
     for cfg in (turbo_config(None, 8), turbo_config(None, 0, "light"), turbo_config(None, 8, None, w8a8=False),
                 {**turbo_config(None, 8), "pcm16_output": True}):
         TurboConfig.model_validate(cfg)
+
+
+# --- 6. head and stage splits: one scan of the text (#31) -------------------------------------------------------
+
+
+def _split_head_reference(self, prompt_text, target_text, voice, clone_mode, limit=None):
+    """VoxCPM2Engine._split_head as it was before the shared scan (perf/ttfb-200 6eedc9b), for the test below."""
+    import re
+
+    limit = limit or self.head_tokens
+    if voice is not None:
+        entry = self.voices.get(voice)
+        if entry is not None and (clone_mode or ("prompt_ref" if entry.text else "ref")) != "ref":
+            prompt_text = entry.text or ""
+    text = prompt_text + target_text
+    ids, offs = self._tokens(text)
+    if offs is None:
+        return None
+    start = len(prompt_text)
+    tag = re.compile(r"<reserved_\d+>").match(text, start)
+    if tag is not None:
+        start = tag.end()
+    first = next((k for k, o in enumerate(offs) if o[1] > start), len(ids))
+    if len(ids) - first <= limit + self.head_min_rest:
+        return None
+    best = clause = None
+    for k in range(first + 1, min(first + limit, len(ids) - 1) + 1):
+        o = offs[k][0]
+        if o > start and o < len(text) and text[o] == " " and offs[k - 1][1] <= o:
+            best = k
+            if text[o - 1] in ",،;؛:":
+                clause = k
+    if best is None:
+        best = next((k for k in range(first + 1, min(first + 2 * limit, len(ids) - 1) + 1)
+                     if text[offs[k][0]:offs[k][0] + 1] == " " and offs[k - 1][1] <= offs[k][0]), None)
+        if best is None:
+            return None
+    cut = clause if clause is not None and (clause - first) * 2 >= best - first else best
+    return ids[:cut], ids
+
+
+def test_head_and_stage_splits_are_unchanged_by_the_shared_scan():
+    """_split_head reads one scan of the request's text for the head and its intermediate stages: the same cuts as
+    the per-call scan before it, for heads and stages (mid_tokens) in any order, prompt_ref voices, dialect tags,
+    clause marks, first words longer than the head, short texts and byte-fallback characters."""
+    import glob
+    import os
+    import random
+
+    from tokenizers import Tokenizer, models, normalizers
+
+    from nanovllm_voxcpm.models.voxcpm2.config import TurboConfig
+    from nanovllm_voxcpm.models.voxcpm2.engine import RegisteredVoice, VoxCPM2Engine
+
+    tokenizers = []
+    snaps = glob.glob(os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
+                                   "hub/models--VoxCPM-Kernel--VoxCPM2-Arabic-Dialects/snapshots/*/tokenizer.json"))
+    if snaps:
+        tokenizers.append(Tokenizer.from_file(snaps[0]))
+    chars = list("abcdefgh ,،:") + ["▁", "<unk>"] + [f"<0x{i:02X}>" for i in range(256)]
+    vocab = {c: i for i, c in enumerate(chars)}
+    merges = [("▁", "a"), ("b", "c"), ("▁a", "bc"), ("d", "e"), ("de", "f")]
+    for x, y in merges:
+        vocab.setdefault(x + y, len(vocab))
+    tiny = Tokenizer(models.BPE(vocab, merges, unk_token="<unk>", byte_fallback=True))
+    tiny.normalizer = normalizers.Sequence([normalizers.Prepend("▁"), normalizers.Replace(" ", "▁")])
+    tokenizers.append(tiny)
+
+    here = os.path.join(os.path.dirname(__file__), "..", "examples")
+    texts = [s.strip() for f in ("ar_dialects.txt", "hi_sentences.txt")
+             for s in open(os.path.join(here, f), encoding="utf-8") if s.strip()]
+    rng = random.Random(5)
+    alphabet = list("abcdefgh") + [" "] * 3 + list(",،:é") + ["defdef", "abc"]
+    texts += ["".join(rng.choice(alphabet) for _ in range(rng.randint(1, 90))) for _ in range(400)]
+    texts += ["<reserved_101>" + t for t in texts[:200]] + ["abcdefabcdefabcdef gh", "a", " ", "ab, cd: ef، gh ab"]
+
+    turbo = TurboConfig()
+    for tok in tokenizers:
+        eng = object.__new__(VoxCPM2Engine)
+        eng.head_tokens, eng.head_min_rest, eng.mid_stages = 8, turbo.head_min_rest, (24, 48)
+        eng.voices = {"v": RegisteredVoice(None, "gh, ab "), "r": RegisteredVoice(None, None)}
+        cache = {}
+
+        def tokens(text, tok=tok, cache=cache):
+            if text not in cache:
+                e = tok.encode(text, add_special_tokens=False)
+                cache[text] = (e.ids, e.offsets)
+            return cache[text]
+
+        eng._tokens = tokens
+        n = 0
+        for t in texts:
+            for prompt, voice, mode in (("", None, None), ("bc ", None, None), ("", "v", None), ("", "r", None),
+                                        ("", "v", "ref")):
+                limits = [None, 24, 48, 5, 100]
+                rng.shuffle(limits)
+                for limit in [None, 24, 48] + limits:  # a request's order, then any other
+                    got = eng._split_head(prompt, t, voice, mode, limit=limit)
+                    want = _split_head_reference(eng, prompt, t, voice, mode, limit=limit)
+                    assert got == want, (t, prompt, voice, mode, limit)
+                    n += want is not None
+        assert n > 1000  # (most of them split)

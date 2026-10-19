@@ -1,4 +1,5 @@
 import json
+import bisect
 import math
 import os
 import re
@@ -851,27 +852,53 @@ class VoxCPM2Engine(LLMEngineBase):
         ids, offs = self._tokens(text)
         if offs is None:
             return None
-        start = len(prompt_text)
-        tag = _LEADING_TAG.match(text, start)
-        if tag is not None:  # the head counts text, not the dialect tag in front of it
-            start = tag.end()
-        first = next((k for k, o in enumerate(offs) if o[1] > start), len(ids))  # first token of the target
+        scan = self._head_scan(text, len(prompt_text), ids, offs, 2 * limit)
+        first, words, clauses, fallback = scan[4], scan[5], scan[6], scan[7]
         if len(ids) - first <= limit + self.head_min_rest:
             return None
-        best = clause = None
-        for k in range(first + 1, min(first + limit, len(ids) - 1) + 1):
-            o = offs[k][0]
-            if o > start and o < len(text) and text[o] == " " and offs[k - 1][1] <= o:  # a word starts at token k
-                best = k
-                if text[o - 1] in ",،;؛:":
-                    clause = k
+        # the last word start (and clause start) up to first + limit, else the first one up to first + 2 * limit
+        hi = min(first + limit, len(ids) - 1)
+        i = bisect.bisect_right(words, hi)
+        best = words[i - 1] if i else None
+        i = bisect.bisect_right(clauses, hi)
+        clause = clauses[i - 1] if i else None
         if best is None:  # the first word alone is longer than head_tokens: it is the head (up to twice that)
-            best = next((k for k in range(first + 1, min(first + 2 * limit, len(ids) - 1) + 1)
-                         if text[offs[k][0]:offs[k][0] + 1] == " " and offs[k - 1][1] <= offs[k][0]), None)
+            best = fallback[0] if fallback and fallback[0] <= min(first + 2 * limit, len(ids) - 1) else None
             if best is None:
                 return None
         cut = clause if clause is not None and (clause - first) * 2 >= best - first else best
         return ids[:cut], ids
+
+    _scan = None  # _head_scan's last result: a request's head and its stages split the same text
+
+    def _head_scan(self, text: str, prompt_len: int, ids: list, offs: list, reach: int) -> tuple:
+        """(text, prompt length, ids, reach, first, words, clauses, fallback) for _split_head: the target's first
+        token, then in order the tokens after it (up to first + reach, at least as far as any head or stage looks:
+        first + 2 x its tokens) that start a word, those of them after a clause mark, and the first one the
+        first-word fallback takes. The head and every intermediate stage (mid_tokens) of a request read one scan."""
+        scan = self._scan
+        if (scan is not None and scan[2] is ids and scan[1] == prompt_len and scan[3] >= reach
+                and scan[0] == text):
+            return scan
+        reach = max(reach, 2 * max(self.head_tokens, *(getattr(self, "mid_stages", None) or (0,))))
+        start = prompt_len
+        tag = _LEADING_TAG.match(text, start)
+        if tag is not None:  # the head counts text, not the dialect tag in front of it
+            start = tag.end()
+        first = next((k for k, o in enumerate(offs) if o[1] > start), len(ids))  # first token of the target
+        words, clauses, fallback = [], [], []
+        n = len(text)
+        for k in range(first + 1, min(first + reach, len(ids) - 1) + 1):
+            o = offs[k][0]
+            space = o < n and text[o] == " " and offs[k - 1][1] <= o
+            if space and o > start:  # a word starts at token k
+                words.append(k)
+                if text[o - 1] in ",،;؛:":
+                    clauses.append(k)
+            if space and not fallback:  # (the fallback's test: no "after the start" condition)
+                fallback.append(k)
+        self._scan = scan = (text, prompt_len, ids, reach, first, words, clauses, fallback)
+        return scan
 
     def _continuation_tokens(self, full_ids, prompt_text, prompt_latents, ref_audio_latents, entry, clone_mode) -> int:
         """The tokens a head start's continuation will compute in its prefill, its head's patches aside: its prompt
