@@ -35,6 +35,30 @@ _LEADING_TAG = re.compile(r"<reserved_\d+>")  # a tagged model's dialect tag in 
 _PATCHES_PER_TOKEN = 0.5
 
 
+class _ByteCount:
+    """A ChunkPacer's buffer that only counts its bytes (the engine's pacer needs its times, not the audio): the
+    same len, +=, slicing and deletion, without copying 5 KB in and 4 KB out per stream and patch (#31)."""
+
+    __slots__ = ("n",)
+
+    def __init__(self) -> None:
+        self.n = 0
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __iadd__(self, data):
+        self.n += len(data)
+        return self
+
+    def __getitem__(self, key) -> bytes:
+        return b""
+
+    def __delitem__(self, key) -> None:
+        start, stop, _ = key.indices(self.n)
+        self.n -= max(stop - start, 0)
+
+
 _PCM_RATE = 32000  # a paced front's bytes per second (16 kHz PCM16: the pacer counts audio, any format the same)
 _PATCH_PCM = bytes(5120)  # one 160 ms patch at that rate
 _FIRST_FRAME_PCM = bytes(1280)  # its first latent frame (40 ms): what a muted patch of a prefill step sends
@@ -227,6 +251,7 @@ class VoxCPM2Engine(LLMEngineBase):
             kw = p.pace_kw or {"alpha": p.pace, "reserve_ms": self.client_pace_reserve * 1000,
                                "alpha_last": self.client_pace_last}
             p.pacer = ChunkPacer(int(round(p.client_chunk * _PCM_RATE)), _PCM_RATE, **kw)
+            p.pacer._buf = _ByteCount()  # (its times only)
         p.pacer.push(_PATCH_PCM if pcm is None else pcm, now)
         p.pace_due = p.pacer.due()
         self._pace_sync(p, now)
