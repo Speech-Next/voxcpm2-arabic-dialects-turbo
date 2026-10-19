@@ -169,10 +169,12 @@ def test_through_the_two_processes_link():
         from websockets.asyncio.client import connect
         from websockets.asyncio.server import serve
 
-        sa, sb = socket.socketpair()
-        ra, wa = await asyncio.open_connection(sock=sa)
-        engine = asyncio.create_task(serve_engine(tts, ra, wa))
-        tb, link = await asyncio.get_running_loop().create_connection(EngineLink, sock=sb)
+        pairs = [socket.socketpair() for _ in range(3)]  # utterances striped over 3 sockets
+        conns = [await asyncio.open_connection(sock=a) for a, _ in pairs]
+        engine = asyncio.create_task(serve_engine(tts, conns[0][0], [w for _, w in conns]))
+        loop = asyncio.get_running_loop()
+        tb, link = await loop.create_connection(EngineLink, sock=pairs[0][1])
+        others = [(await loop.create_connection(lambda: EngineLink(link), sock=b))[0] for _, b in pairs[1:]]
         async with serve(Server({"default"}, link.start, args()).handler, "127.0.0.1", 0) as s:
             port = s.sockets[0].getsockname()[1]
             url = f"ws://127.0.0.1:{port}/api/tts/stream?chunk_size=4096"
@@ -191,6 +193,8 @@ def test_through_the_two_processes_link():
                     break
                 await asyncio.sleep(0.01)
         tb.close()
+        for t in others:
+            t.close()
         await asyncio.wait_for(engine, 2)
         return msgs
 

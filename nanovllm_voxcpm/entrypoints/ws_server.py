@@ -257,14 +257,17 @@ async def read_frame(reader: asyncio.StreamReader) -> tuple[int, int, bytes]:
     return kind, utt, await reader.readexactly(n) if n else b""
 
 
-async def serve_engine(tts, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, log=None) -> None:
+async def serve_engine(tts, reader: asyncio.StreamReader, writers, log=None) -> None:
     """The engine's side: START (an utterance's request, JSON) -> DATA frames, then END (or ERROR); CANCEL stops
-    one. Returns when the connections' side closes. log: a file, one jsonl line per utterance (perf_counter times:
+    one. Returns when the connections' side closes. writers: the link's sockets (a StreamWriter or a list): an
+    utterance's frames all go to writers[utt % len]. log: a file, one jsonl line per utterance (perf_counter times:
     the START frame read, the task started, the yields [t, samples, ms resampling, bytes])."""
     jobs: dict[int, asyncio.Task] = {}
+    writers = writers if isinstance(writers, list) else [writers]
 
     async def run(utt: int, req: dict, t_start: float):
         t_task, yields = time.perf_counter(), []
+        writer = writers[utt % len(writers)]
         try:
             async for out in speak(tts, req, yields if log is not None else None):
                 writer.write(frame(DATA, utt, out))
@@ -296,15 +299,21 @@ async def serve_engine(tts, reader: asyncio.StreamReader, writer: asyncio.Stream
 class EngineLink(asyncio.Protocol):
     """The connections' side of the two processes' link: each frame's audio goes straight into its utterance's
     ChunkStream as the bytes arrive (no task or queue per frame: after each engine step a patch of every stream
-    arrives at once). start(req, yields, stream) is a Feed."""
+    arrives at once). start(req, yields, stream) is a Feed. More sockets (``primary``: the first one's link, whose
+    utterances they share) carry more of a step's audio at once: a socket pair holds ~340 KB, a step of 200
+    streams ~1 MB, and the rest waited in the engine client until its event loop got round to the socket again
+    (the process hop's delay p99 7-9 ms at 200 at once)."""
 
-    def __init__(self):
+    def __init__(self, primary: "EngineLink | None" = None):
         loop = asyncio.get_running_loop()
-        self.ready, self.closed = loop.create_future(), loop.create_future()
         self.buf = bytearray()
-        self.sinks: dict[int, tuple[ChunkStream, list | None]] = {}
-        self.next_utt = 0
         self.transport = None
+        if primary is None:
+            self.ready, self.closed = loop.create_future(), loop.create_future()
+            self.sinks: dict[int, tuple[ChunkStream, list | None]] = {}
+            self.next_utt = 0
+        else:
+            self.ready, self.closed, self.sinks = primary.ready, primary.closed, primary.sinks
 
     def connection_made(self, transport):
         self.transport = transport
@@ -435,9 +444,10 @@ async def main_one(args):
         await serve_ws(server, args, stop_signal(), lambda: announce(args))
 
 
-async def main_engine(args, sock, front_pid: int):
+async def main_engine(args, socks, front_pid: int):
     """--procs 2, this process: the engine's client, serving the connections' process."""
-    reader, writer = await asyncio.open_connection(sock=sock)
+    conns = [await asyncio.open_connection(sock=s) for s in socks]
+    reader, writer = conns[0]
     stop = stop_signal()
     try:
         tts = await load_tts(args)
@@ -449,7 +459,7 @@ async def main_engine(args, sock, front_pid: int):
             announce(args)
             lag = asyncio.create_task(lag_monitor(args.lag_log + ".engine")) if args.lag_log else None
             log = open(args.log + ".engine", "a", buffering=1) if args.log else None
-            engine = asyncio.create_task(serve_engine(tts, reader, writer, log))
+            engine = asyncio.create_task(serve_engine(tts, reader, [w for _, w in conns], log))
             await asyncio.wait([stop, engine], return_when=asyncio.FIRST_COMPLETED)
             engine.cancel()
             if lag is not None:
@@ -462,9 +472,12 @@ async def main_engine(args, sock, front_pid: int):
         await asyncio.to_thread(os.waitpid, front_pid, 0)
 
 
-async def main_front(args, sock):
+async def main_front(args, socks):
     """--procs 2, the connections' process."""
-    _, link = await asyncio.get_running_loop().create_connection(EngineLink, sock=sock)
+    loop = asyncio.get_running_loop()
+    _, link = await loop.create_connection(EngineLink, sock=socks[0])
+    for s in socks[1:]:
+        await loop.create_connection(lambda: EngineLink(link), sock=s)
     info = await link.ready  # once the engine is up
     if info is None:
         return
@@ -507,6 +520,8 @@ def cli():
                     help="each connection sends its own paced chunks (default: one task sends every due chunk)")
     ap.add_argument("--procs", type=int, choices=(1, 2), default=2,
                     help="2: the connections in a process of their own (default), 1: on the engine client's loop")
+    ap.add_argument("--link-sockets", type=int, default=8, help="--procs 2: socket pairs between the two processes (an "
+                                                                    "engine step of 200 streams is ~1 MB of audio)")
     ap.add_argument("--no-uvloop", dest="uvloop", action="store_false", help="asyncio's own event loop even when "
                                                                               "uvloop is installed")
     ap.add_argument("--log", default=None, help="jsonl, one line per utterance: the engine's yields and the sends")
@@ -528,10 +543,11 @@ def cli():
         return
     import socket
 
-    a, b = socket.socketpair()
+    pairs = [socket.socketpair() for _ in range(args.link_sockets)]
     pid = os.fork()  # before the engine (CUDA, threads) starts: the connections' process
     if pid == 0:
-        a.close()
+        for a, _ in pairs:
+            a.close()
         import gc
 
         # what this process inherited (imports) out of the collector's reach: a full collection over it paused the
@@ -539,11 +555,12 @@ def cli():
         gc.collect()
         gc.freeze()
         try:
-            asyncio.run(main_front(args, b), loop_factory=factory)
+            asyncio.run(main_front(args, [b for _, b in pairs]), loop_factory=factory)
         finally:
             os._exit(0)
-    b.close()
-    asyncio.run(main_engine(args, a, pid), loop_factory=factory)
+    for _, b in pairs:
+        b.close()
+    asyncio.run(main_engine(args, [a for a, _ in pairs], pid), loop_factory=factory)
 
 
 if __name__ == "__main__":
