@@ -34,8 +34,8 @@ class FakeTTS:
 
 
 def args(**kw):
-    a = dict(pace=True, pace_alpha=0.95, pace_reserve_ms=1000.0, pace_margin_ms=4.0, expect_per_char=0.0,
-             dialect="egyptian", default_voice="default", log=None)
+    a = dict(pace=True, pace_alpha=0.95, pace_alpha_last=None, pace_reserve_ms=1000.0, pace_margin_ms=4.0,
+             expect_per_char=0.0, dialect="egyptian", default_voice="default", log=None)
     a.update(kw)
     return argparse.Namespace(**a)
 

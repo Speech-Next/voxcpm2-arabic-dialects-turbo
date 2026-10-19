@@ -193,3 +193,11 @@ def test_paced_closes_its_source_when_the_consumer_stops():
 
     asyncio.run(main())
     assert closed == [True]
+
+
+def test_alpha_last_slows_the_chunk_that_empties_the_server():
+    # 2 chunks at once: chunk 1 is the last one queued -> alpha_last; with a third queued it goes at alpha
+    s = run(ChunkPacer(C, 32000, alpha=0.85, reserve_ms=None, alpha_last=0.97), [(0.0, 2 * C)], end=5.0)
+    assert s[1][0] == pytest.approx(0.97 * CS)
+    s = run(ChunkPacer(C, 32000, alpha=0.85, reserve_ms=None, alpha_last=0.97), [(0.0, 3 * C)], end=5.0)
+    assert [x[0] for x in s] == pytest.approx([0, 0.85 * CS, 0.85 * CS + 0.97 * CS])
