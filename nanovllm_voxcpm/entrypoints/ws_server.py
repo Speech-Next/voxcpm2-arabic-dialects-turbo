@@ -532,6 +532,12 @@ def cli():
     pid = os.fork()  # before the engine (CUDA, threads) starts: the connections' process
     if pid == 0:
         a.close()
+        import gc
+
+        # what this process inherited (imports) out of the collector's reach: a full collection over it paused the
+        # connections' event loop for 29 ms at 150 at once, and paced chunks due meanwhile went out late
+        gc.collect()
+        gc.freeze()
         try:
             asyncio.run(main_front(args, b), loop_factory=factory)
         finally:
