@@ -151,8 +151,10 @@ class VoxCPM2ServerImpl:
         voice: str | None = None,
         clone_mode: str | None = None,
         client_chunk_ms: float | None = None,
+        client_pace: float | None = None,
     ) -> None:
-        extra = {} if client_chunk_ms is None else {"client_chunk_ms": client_chunk_ms}  # (None: the engine's default)
+        extra = {k: v for k, v in (("client_chunk_ms", client_chunk_ms), ("client_pace", client_pace))
+                 if v is not None}  # (None: the engine's default)
         if voice is not None:
             self.llm.add_request(
                 seq_id=seq_id,
@@ -970,6 +972,7 @@ class AsyncVoxCPM2Server:
         voice: str | None = None,
         clone_mode: str | None = None,
         client_chunk_ms: float | None = None,
+        client_pace: float | None = None,
     ) -> AsyncGenerator[Waveform, None]:
         seq_id = gen_uuid()
         self.stream_table[seq_id] = asyncio.Queue()
@@ -989,6 +992,7 @@ class AsyncVoxCPM2Server:
                 seed,
                 *((voice, clone_mode) if voice is not None else ()),
                 **({"client_chunk_ms": client_chunk_ms} if client_chunk_ms is not None else {}),
+                **({"client_pace": client_pace} if client_pace is not None else {}),
             )
             while True:
                 data = await self.stream_table[seq_id].get()
@@ -1123,6 +1127,7 @@ class AsyncVoxCPM2ServerPool:
         voice: str | None = None,
         clone_mode: str | None = None,
         client_chunk_ms: float | None = None,
+        client_pace: float | None = None,
     ):
         if prompt_id is not None:
             if prompt_id not in self._prompt_pool:
@@ -1154,6 +1159,7 @@ class AsyncVoxCPM2ServerPool:
                 seed,
                 **({"voice": voice, "clone_mode": clone_mode} if voice is not None else {}),
                 **({"client_chunk_ms": client_chunk_ms} if client_chunk_ms is not None else {}),
+                **({"client_pace": client_pace} if client_pace is not None else {}),
             ):
                 yield data
         finally:

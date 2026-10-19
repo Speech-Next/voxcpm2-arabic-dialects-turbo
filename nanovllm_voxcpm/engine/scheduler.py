@@ -103,6 +103,7 @@ class Scheduler:
         # _admit_loop
         self.step_cap = (getattr(turbo, "step_cap_ms", 0) or 0) / 1000
         self.mix_decode = bool(getattr(turbo, "mix_decode", False))
+        self.mix_heads = self.mix_decode and bool(getattr(turbo, "mix_heads", False))  # (TurboConfig.mix_heads)
         margin = getattr(turbo, "realtime_margin_ms", -1)
         self.realtime_margin = margin / 1000 if isinstance(margin, (int, float)) and margin >= 0 else None
         # the last step: (is_prefill, rows, tokens computed), for the callbacks' step time model; mixed: the running
@@ -258,7 +259,7 @@ class Scheduler:
             if not waiting or budget[0] >= max_seqs:
                 break
             seq = waiting.popleft()
-            mixed = mixable and (self._resumes or seq.has_stream)  # the step decodes the short streams too
+            mixed = mixable and (self._resumes or seq.has_stream or self.mix_heads)  # the short streams ride too
             if slack is not None and not (mixed and seq.has_stream):
                 b = buffer_of(seq) if seq.has_stream else None
                 if b is None or b > slack:  # a new request, or a stream with more audio left than a running one
@@ -317,7 +318,7 @@ class Scheduler:
         self.mixed = []
         if self._admitted:
             scheduled_seqs, self._admitted, (_, tokens), self._budget = self._admitted, [], self._budget, [0, 0]
-            if self.mix_decode and self._playing and self._resumes:
+            if self.mix_decode and self._playing and (self._resumes or self.mix_heads):
                 self._ride(scheduled_seqs, tokens)
             self.resuming, self._resumes = self._resumes, False
             self.last_step = (True, len(scheduled_seqs) + len(self.mixed), tokens + len(self.mixed))

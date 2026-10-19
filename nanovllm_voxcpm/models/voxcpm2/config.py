@@ -191,6 +191,16 @@ class TurboConfig(BaseModel):
     # mixed steps' riders, mid_tokens) leaves out the held-back part (the audio streamed so far modulo a chunk).
     # 0: every patch reaches the client whole (with a chunk size set such a client only looks a little more urgent).
     client_chunk_ms: int = 0
+    # With chunks: the front paces its sends (#31, a jitter buffer): the first chunk as soon as it is full, then at
+    # most one per client_pace x a chunk's audio while it holds at most client_pace_hold chunks (any more at once).
+    # The engine's deadlines follow that send clock (stream_buffer: the time until it needs a chunk the engine has
+    # not produced yet). 0: the client plays the chunks as they come, in real time from the first.
+    client_pace: float = 0.0
+    client_pace_hold: int = 3
+    # With mix_decode: a prefill step of new requests (heads) also decodes the playing streams that would run out of
+    # audio during it, as a resuming step does (a burst whose requests arrive over tens of ms: the late ones' heads
+    # no longer pause the first ones). Their heads then solve the first patch with the usual grid.
+    mix_heads: bool = False
     # A head start's continuation (or intermediate stage) takes the KV of the prefix it shares with the stage
     # before it (the voice and that stage's text) from that stage's first block instead of computing it again.
     stage_kv_reuse: bool = False

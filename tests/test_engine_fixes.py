@@ -929,6 +929,32 @@ def test_the_buffer_leaves_out_what_the_front_holds_back():
     assert eng.stream_buffer(seq) == pytest.approx(1.0, abs=0.01)
 
 
+def test_a_paced_front_s_send_clock_is_the_deadline():
+    eng = _voxcpm2_engine()
+    eng.client_pace_hold = 3
+    seq = eng.add_request("r", _words(2), max_generate_length=12, head_start=False, client_chunk_ms=128,
+                          client_pace=0.9)
+    p, interval = seq.custom_payload, 0.9 * 0.128
+    eng.step()  # one patch, 1.25 chunks: chunk 0 is sent now, chunk 1 is due one interval later
+    assert p.pace_sent == 1 and eng.stream_buffer(seq) == pytest.approx(interval, abs=0.01)
+    eng.step()  # 2.5 chunks: chunk 1 one interval after chunk 0
+    assert p.pace_sent == 2 and eng.stream_buffer(seq) == pytest.approx(2 * interval, abs=0.01)
+    for _ in range(6):  # far ahead: the front holds at most 3 chunks, the rest goes at once
+        eng.step()
+    assert p.pace_sent == 10 and eng.stream_buffer(seq) == pytest.approx(4 * interval, abs=0.01)
+    unpaced = eng.add_request("q", _words(2), max_generate_length=4, head_start=False, client_chunk_ms=128)
+    eng.step()
+    assert unpaced.custom_payload.pace_last is None  # (pace 0: the real-time player from the first chunk)
+
+
+def test_mix_heads_decodes_the_short_streams_in_a_step_of_new_requests():
+    buf = {"a": 0.05, "c": 0.5}
+    sch = _timed(buf, mix_decode=True, mix_heads=True)  # 10 ms a token
+    _playing(sch, a := _seq("a", [1]), c := _seq("c", [3]))
+    sch.add(b := _seq("b", [2]))
+    assert sch.schedule() == ([b, a], True) and sch.mixed == [a]  # a would run out during b's step: it rides
+
+
 def test_a_requests_chunk_size_goes_with_every_stage():
     eng = _staged(0.032, mid_tokens=(16, 32))
     eng.head_patches_max = 3

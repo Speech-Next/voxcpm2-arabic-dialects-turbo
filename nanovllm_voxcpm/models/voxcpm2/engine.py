@@ -69,6 +69,9 @@ class VoxCPM2SeqPayload:
     play_end: float | None = None  # perf_counter when a player started at the first streamed patch runs out of audio
     streamed: float = 0.0  # seconds of audio the stream has given its player so far (client_chunk)
     client_chunk: float = 0.0  # seconds: its client gets the audio in chunks of this length (add_request)
+    pace: float = 0.0  # its front sends a chunk per pace x client_chunk at most (client_pace)
+    pace_sent: int = 0  # chunks the paced front has been given
+    pace_last: float | None = None  # perf_counter when the paced front sends the last of them
 
 
 def _rows_from(arrays: list[np.ndarray], start: int) -> np.ndarray:
@@ -116,6 +119,7 @@ class VoxCPM2Engine(LLMEngineBase):
     head_patches_max, head_margin, step_cap, head_hold = 0, 0.15, 0.0, False  # every head head_patches long
     mid_stages, mid_patches_max, stage_kv_reuse = (), 10, False  # no intermediate stage, every stage prefilled whole
     client_chunk = 0.0  # seconds; 0: the player gets every patch whole
+    client_pace, client_pace_hold = 0.0, 3  # unpaced
     # stream id -> (KV block kept from its finished stage, the token ids it holds KV for, their PreparedAudio)
     _stream_prefix = MappingProxyType({})
     _head_phase = MappingProxyType({})  # (instances built without __init__: read-only, never added to)
@@ -160,6 +164,7 @@ class VoxCPM2Engine(LLMEngineBase):
         self.mid_stages = tuple(sorted({int(m) for m in mid if int(m) > self.head_tokens}))
         self.mid_patches_max = turbo.mid_patches_max
         self.client_chunk = turbo.client_chunk_ms / 1000
+        self.client_pace, self.client_pace_hold = turbo.client_pace, turbo.client_pace_hold
         self.stage_kv_reuse = turbo.stage_kv_reuse
         self._stream_prefix: dict[str, tuple[int, list, PreparedAudio | None]] = {}
         self._head_phase: dict[str, int] = {}
@@ -196,8 +201,23 @@ class VoxCPM2Engine(LLMEngineBase):
         p = seq.custom_payload
         if p.play_end is None:
             return None
+        if p.pace > 0 and p.client_chunk > 0:  # a paced front: until its send clock needs a chunk not produced yet
+            return None if p.pace_last is None else p.pace_last + p.pace * p.client_chunk - time.perf_counter()
         held = math.fmod(p.streamed + 1e-9, p.client_chunk) - 1e-9 if p.client_chunk > 0 else 0.0
         return p.play_end - max(held, 0.0) - time.perf_counter()
+
+    def _pace(self, p: VoxCPM2SeqPayload, now: float) -> None:
+        """The paced front's send clock (TurboConfig.client_pace) after a patch: each chunk the patch completes is sent
+        one pace interval after the one before, or now if that has passed, and at most client_pace_hold intervals
+        ahead (the front sends what it holds beyond that at once)."""
+        interval = p.pace * p.client_chunk
+        hold = self.client_pace_hold * interval
+        n = int((p.streamed + 1e-9) // p.client_chunk)
+        while p.pace_sent < n:
+            t = now if p.pace_last is None else max(p.pace_last + interval, now)
+            if hold > 0 and t - now > hold:
+                t = now + hold
+            p.pace_last, p.pace_sent = t, p.pace_sent + 1
 
     def step_seconds(self, rows: int, tokens: int, prefill: bool) -> float:
         """Predicted seconds of a step of ``rows`` sequences computing ``tokens`` tokens (the scheduler's time
@@ -458,6 +478,8 @@ class VoxCPM2Engine(LLMEngineBase):
             now = time.perf_counter()
             payload.play_end = max(payload.play_end or now, now) + self.patch_seconds
             payload.streamed += self.patch_seconds
+            if payload.pace > 0 and payload.client_chunk > 0:
+                self._pace(payload, now)
 
         latents = latents.reshape(-1, self.feat_dim)
         if seq.custom_payload.decode_pad is not None:
@@ -514,6 +536,7 @@ class VoxCPM2Engine(LLMEngineBase):
         text_tokens: list[int] | None = None,
         resume: bool = False,
         client_chunk_ms: float | None = None,
+        client_pace: float | None = None,
     ) -> Sequence[VoxCPM2SeqPayload]:
         """voice / clone_mode: a registered voice in "prompt_ref" (reference + continuation, the default with a
         transcript), "ref" (the default without one) or "prompt" mode, in place of latents and prompt_text.
@@ -522,7 +545,8 @@ class VoxCPM2Engine(LLMEngineBase):
         resume: a head start's continuation (internal): it keeps the head's stream and is queued first.
         client_chunk_ms: the request's client gets its audio in chunks of this many ms, the rest held back until the
         next chunk (e.g. 128: 4096 bytes of 16 kHz PCM16); the engine's deadlines allow for it. None:
-        TurboConfig.client_chunk_ms; 0: every patch reaches the client whole.
+        TurboConfig.client_chunk_ms; 0: every patch reaches the client whole. client_pace: its front paces the chunks
+        (TurboConfig.client_pace, the default); 0: not paced.
         Returns the queued sequence (the head, with head start)."""
         if max_generate_length < 1:
             raise ValueError(f"max_generate_length must be >= 1, got {max_generate_length}")
@@ -547,7 +571,7 @@ class VoxCPM2Engine(LLMEngineBase):
                              ref_audio_latents=ref_audio_latents, max_generate_length=max_generate_length,
                              temperature=temperature, cfg_value=cfg_value, lora_name=lora_name, seed=seed,
                              voice=voice, voice_entry=entry, clone_mode=clone_mode, text_ids=full_ids,
-                             client_chunk_ms=client_chunk_ms)
+                             client_chunk_ms=client_chunk_ms, client_pace=client_pace)
                 patches, cont = self.head_patches, 0
                 stages, last = [], len(head_ids)
                 for limit in self.mid_stages:  # #31: intermediate stages, for a head whose whole continuation
@@ -571,10 +595,13 @@ class VoxCPM2Engine(LLMEngineBase):
                                                             len(head_ids)))
                 chain["stage_len"] = len(head_ids)  # the text the head holds (its continuation may reuse its KV)
                 if self.head_patches_max > self.head_patches and self.step_cost is not None:
-                    patches = min(self._plan_head(cont), max_generate_length - 1)
+                    pace = self.client_pace if client_pace is None else client_pace
+                    chunked = (self.client_chunk if client_chunk_ms is None else client_chunk_ms) > 0
+                    patches = min(self._plan_head(cont, pace if chunked else 0.0), max_generate_length - 1)
                 head = self.add_request(seq_id, target_text, prompt_text, prompt_latents, ref_audio_latents,
                                         patches, temperature, cfg_value, lora_name, seed, voice, clone_mode,
-                                        head_start=False, text_tokens=head_ids, client_chunk_ms=client_chunk_ms)
+                                        head_start=False, text_tokens=head_ids, client_chunk_ms=client_chunk_ms,
+                                        client_pace=client_pace)
                 head.custom_payload.chain = chain
                 if cont:
                     self._phase_set(seq_id, cont + patches)
@@ -670,6 +697,7 @@ class VoxCPM2Engine(LLMEngineBase):
         )
         seq.custom_payload.client_chunk = (self.client_chunk if client_chunk_ms is None
                                            else max(float(client_chunk_ms), 0.0) / 1000)
+        seq.custom_payload.pace = self.client_pace if client_pace is None else max(float(client_pace), 0.0)
         seq.has_stream = resume  # a continuation carries on the head's stream (VAE state): ahead of new requests
         self.add_sequence(seq, front=resume)
         return seq
@@ -861,20 +889,23 @@ class VoxCPM2Engine(LLMEngineBase):
         step = a + (b + c) * rows  # a continuation step's own cost: its fixed part, the other streams riding along
         cap = self.step_cap
 
-        def plan(backlog: float, tokens: int) -> tuple[int, bool]:
+        def plan(backlog: float, tokens: int, pace: float = 0.0) -> tuple[int, bool]:
             own = b + c * tokens
             # the continuations in steps of at most step_cap (else about two steps)
             steps = math.ceil((backlog + own) / max(cap - step, 0.02)) if cap > 0 else 2
-            return head_patches_for(backlog, own, decode, self.patch_seconds, self.head_patches, self.head_patches_max,
+            # a paced front (client_pace) sends a patch's audio in pace x its length
+            patch = self.patch_seconds * (pace or 1.0)
+            return head_patches_for(backlog, own, decode, patch, self.head_patches, self.head_patches_max,
                                     self.head_margin, steps * step)
 
         return plan
 
-    def _plan_head(self, tokens: int) -> int:
+    def _plan_head(self, tokens: int, pace: float = 0.0) -> int:
         """A new head's patches: enough audio to last until its continuation (``tokens`` to prefill) is prefilled
-        after those of the streams in their head phase ahead of it."""
+        after those of the streams in their head phase ahead of it (pace: its front's, client_pace)."""
         _, b, c = self.step_cost.prefill.coef
-        return self._head_plan()(b * len(self._head_phase) + c * self._head_sum, tokens + self.head_patches)[0]
+        return self._head_plan()(b * len(self._head_phase) + c * self._head_sum, tokens + self.head_patches,
+                                 pace)[0]
 
     def _replan_heads(self) -> None:
         """Before a step: lengthen the heads still generating whose audio would no longer last until their
@@ -887,7 +918,7 @@ class VoxCPM2Engine(LLMEngineBase):
             seq = streams.get(sid)
             if seq is not None and seq.custom_payload.chain is not None and not seq.stoped:
                 p = seq.custom_payload
-                h = plan(backlog, tokens)[0]
+                h = plan(backlog, tokens, p.pace if p.client_chunk > 0 else 0.0)[0]
                 if p.lead_silent >= 0 and p.generated_waveforms:  # no sound yet: its patches give no audio to play
                     h = max(h, min(len(p.generated_waveforms) + 1, self.head_patches_max))
                 h = min(h, p.chain["max_generate_length"] - 1)
@@ -1018,6 +1049,7 @@ class VoxCPM2Engine(LLMEngineBase):
         new.custom_payload.lead_silent = payload.lead_silent  # the stream's leading silence goes on counting
         new.custom_payload.play_end = payload.play_end  # and its player keeps playing the head's audio
         new.custom_payload.streamed = payload.streamed
+        new.custom_payload.pace_sent, new.custom_payload.pace_last = payload.pace_sent, payload.pace_last
         if mid is not None:
             new.custom_payload.chain = dict(chain, stage=chain.get("stage", 0) + 1, stage_len=len(mid), prior=head,
                                             done=done)
