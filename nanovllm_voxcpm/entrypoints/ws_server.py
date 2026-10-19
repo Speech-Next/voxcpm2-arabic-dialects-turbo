@@ -324,33 +324,40 @@ class EngineLink(asyncio.Protocol):
         self.transport = transport
 
     def data_received(self, data: bytes) -> None:
-        self.buf += data
-        t, off, buf, size = time.perf_counter(), 0, self.buf, _HDR.size
-        while len(buf) - off >= size:
-            kind, utt, n = _HDR.unpack_from(buf, off)
-            if len(buf) - off - size < n:
-                break
-            payload = bytes(buf[off + size:off + size + n])
-            off += size + n
-            if kind == READY:
-                if not self.ready.done():
-                    self.ready.set_result(json.loads(payload))
-                continue
-            sink = self.sinks.get(utt)
-            if sink is None:
-                continue
-            stream, yields = sink
-            if kind == DATA:
-                if yields is not None:
-                    yields.append([t, 0, 0.0, len(payload)])
-                stream.push(payload, t)
-            else:
-                del self.sinks[utt]
-                if kind == END:
-                    stream.finish()
-                else:
-                    stream.fail(RuntimeError(payload.decode(errors="replace")))
-        del buf[:off]
+        """Frames parsed from views of the bytes as they came (no copy but the pacer's own): at 200 streams an
+        engine step's ~1 MB arrives at once, and every microsecond here delays the chunks waiting behind it."""
+        src = data
+        if self.buf:  # (the rest of a frame from the last read)
+            self.buf += data
+            src = self.buf
+        t, off, size, end = time.perf_counter(), 0, _HDR.size, len(src)
+        with memoryview(src) as mv:
+            while end - off >= size:
+                kind, utt, n = _HDR.unpack_from(src, off)
+                if end - off - size < n:
+                    break
+                payload = mv[off + size:off + size + n]
+                off += size + n
+                if kind == READY:
+                    if not self.ready.done():
+                        self.ready.set_result(json.loads(payload.tobytes()))
+                elif (sink := self.sinks.get(utt)) is not None:
+                    stream, yields = sink
+                    if kind == DATA:
+                        if yields is not None:
+                            yields.append([t, 0, 0.0, n])
+                        stream.push(payload, t)  # (the pacer copies it)
+                    else:
+                        del self.sinks[utt]
+                        if kind == END:
+                            stream.finish()
+                        else:
+                            stream.fail(RuntimeError(payload.tobytes().decode(errors="replace")))
+                payload.release()
+        if src is self.buf:
+            del self.buf[:off]
+        elif off < end:
+            self.buf += data[off:]
 
     def connection_lost(self, exc) -> None:
         for stream, _ in self.sinks.values():
