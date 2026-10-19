@@ -221,6 +221,7 @@ class StreamSender:
         self.window, self.clock = window_s, clock
         self._streams: dict[int, tuple[ChunkStream, Callable[[bytes], None], asyncio.Future]] = {}
         self._queued: dict[int, float] = {}  # the due time each stream is queued with
+        self._ending: set[int] = set()  # streams done or failed, to be finished
         self._heap: list[tuple[float, int]] = []
         self._next = 0
         self._wake = asyncio.Event()
@@ -250,6 +251,7 @@ class StreamSender:
             return
         stream, _, fut = item
         if stream._failed is not None or stream.pacer.done:
+            self._ending.add(sid)
             self._wake.set()  # (finished in _run)
             return
         due = stream.pacer.due()
@@ -261,7 +263,14 @@ class StreamSender:
             self._wake.set()
 
     def _finish_done(self) -> None:
-        for sid, (stream, _, fut) in list(self._streams.items()):
+        """Only the streams _update saw end: scanning every stream on every pass was a third of the connections'
+        process's busy time at 200 at once (cProfile)."""
+        while self._ending:
+            sid = self._ending.pop()
+            item = self._streams.get(sid)
+            if item is None:
+                continue
+            stream, _, fut = item
             if stream._failed is not None or stream.pacer.done:
                 del self._streams[sid]
                 self._queued.pop(sid, None)
