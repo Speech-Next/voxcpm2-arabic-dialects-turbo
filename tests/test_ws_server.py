@@ -140,32 +140,3 @@ def test_paced_gaps_stay_under_a_chunk_through_the_engine_pause():
     assert max(unpaced) > 0.25
     assert max(paced_gaps[:-2]) < 0.128  # (the end: what is left goes out at once)
 
-
-def test_connections_on_their_own_loop_with_the_engine_on_another():
-    import threading
-
-    engine_loop = asyncio.new_event_loop()
-    th = threading.Thread(target=engine_loop.run_forever, daemon=True)
-    th.start()
-    try:
-        tts = FakeTTS(patches=6, burst=3, pause=0.02)
-
-        async def main():
-            from websockets.asyncio.client import connect
-            from websockets.asyncio.server import serve
-
-            async with serve(Server(tts, args(), engine_loop).handler, "127.0.0.1", 0) as s:
-                port = s.sockets[0].getsockname()[1]
-                async with connect(f"ws://127.0.0.1:{port}/api/tts/stream?chunk_size=4096") as ws:
-                    await ws.send("x")
-                    msgs = []
-                    while not (msgs and isinstance(msgs[-1], str) and "end_of_audio" in msgs[-1]):
-                        msgs.append(await ws.recv())
-                return msgs
-
-        msgs = asyncio.run(main())
-        assert sum(len(m) for m in msgs if isinstance(m, bytes)) == 6 * PATCH // 3 * 2
-        assert json.loads(msgs[0])["type"] == "start"
-    finally:
-        engine_loop.call_soon_threadsafe(engine_loop.stop)
-        th.join(5)

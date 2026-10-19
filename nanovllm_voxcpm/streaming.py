@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import math
 import time
 from collections.abc import AsyncIterator, Callable
 
@@ -44,13 +45,14 @@ class ChunkPacer:
 
     def __init__(self, chunk_bytes: int = 4096, bytes_per_s: float = 32000.0, alpha: float = 0.95,
                  reserve_ms: float | None = 1000.0, expect_s: float | None = None, margin_ms: float = 4.0,
-                 unit_bytes: int = 1):
+                 unit_bytes: int = 1, alpha_last: float | None = None):
         if chunk_bytes <= 0 or bytes_per_s <= 0 or not 0 < alpha <= 1:
             raise ValueError("chunk_bytes and bytes_per_s must be positive, 0 < alpha <= 1")
         self.chunk_bytes = chunk_bytes
         self.bytes_per_s = float(bytes_per_s)
-        self.alpha = alpha if expect_s is None else min(alpha, self.ratio_for(expect_s, chunk_bytes, bytes_per_s,
-                                                                              margin_ms, unit_bytes))
+        cap = 1.0 if expect_s is None else self.ratio_for(expect_s, chunk_bytes, bytes_per_s, margin_ms, unit_bytes)
+        self.alpha = min(alpha, cap)
+        self.alpha_last = self.alpha if alpha_last is None else min(alpha_last, cap)
         self.reserve = None if reserve_ms is None else int(reserve_ms / 1000 * bytes_per_s)
         self._buf = bytearray()
         self._base = 0  # stream offset of _buf[0]
@@ -104,7 +106,10 @@ class ChunkPacer:
             return None
         if self._grid is None:
             return ready
-        t = self._grid + self.alpha * self._last_s
+        # the last complete chunk queued (the server is empty after it): as late as the pace allows (alpha_last),
+        # the engine's next audio has the most time to come
+        a = self.alpha_last if n < 2 * self.chunk_bytes and self._ended is None else self.alpha
+        t = self._grid + a * self._last_s
         if self._ended is not None:  # what is left goes out at once
             t = min(t, self._ended)
         if self.reserve is not None and n > self.chunk_bytes + self.reserve:  # more than the reserve behind it
@@ -138,40 +143,52 @@ class ChunkPacer:
 
 async def paced(source: AsyncIterator[bytes], pacer: ChunkPacer,
                 clock: Callable[[], float] = time.perf_counter) -> AsyncIterator[bytes]:
-    """``source``'s bytes in chunks at ``pacer``'s times: a task reads the source while the chunks wait."""
-    arrived = asyncio.Event()
+    """``source``'s bytes in chunks at ``pacer``'s times: a task reads the source while the chunks wait. The waiting
+    side is woken only when a chunk is due (a timer) or new audio makes one due sooner: at 200 streams the event
+    loop runs a patch of every stream at once after each engine step, and every extra wake-up delays the sends due
+    meanwhile."""
+    loop = asyncio.get_running_loop()
+    wake = asyncio.Event()
     failed: list[BaseException] = []
+    target = [math.inf]  # when the waiting side wakes up anyway
+
+    def maybe_wake():
+        due = pacer.due()
+        if pacer.done or (due is not None and due < target[0]):
+            wake.set()
 
     async def read():
         try:
             async for data in source:
                 pacer.push(data, clock())
-                arrived.set()
-        except BaseException as e:  # noqa: BLE001 - re-raised in the consumer
+                maybe_wake()
+        except BaseException as e:  # noqa: BLE001 - re-raised on the waiting side
             failed.append(e)
         finally:
             pacer.finish(clock())
-            arrived.set()
+            wake.set()
 
     reader = asyncio.create_task(read())
     try:
         while True:
             if failed:
                 raise failed[0]
-            arrived.clear()
+            wake.clear()
             due = pacer.due()
             if due is None:
                 if pacer.done:
                     break
-                await arrived.wait()
+                target[0] = math.inf
+                await wake.wait()
                 continue
             wait = due - clock()
-            if wait > 0:  # new audio may release the chunk before it is due (more than the reserve waiting)
-                try:
-                    await asyncio.wait_for(arrived.wait(), wait)
-                except (asyncio.TimeoutError, TimeoutError):
-                    pass
+            if wait > 0:  # (new audio may make the chunk due sooner: more than the reserve waiting)
+                target[0] = due
+                timer = loop.call_later(wait, wake.set)
+                await wake.wait()
+                timer.cancel()
                 continue
+            target[0] = -math.inf
             yield pacer.pop()
         if failed:
             raise failed[0]
