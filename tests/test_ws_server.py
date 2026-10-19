@@ -1,5 +1,6 @@
 """The WebSocket server (entrypoints/ws_server.py) on a fake engine over a real localhost connection: the protocol of
-#28's benchmark (start, chunks of chunk_size bytes, end_of_audio; control; json_base64), paced and unpaced."""
+#28's benchmark (start, chunks of chunk_size bytes, end_of_audio; control; json_base64), paced and unpaced, with
+the engine in the same event loop and across the two processes' link (a socket pair)."""
 
 import argparse
 import asyncio
@@ -12,7 +13,7 @@ import pytest
 websockets = pytest.importorskip("websockets")
 pytest.importorskip("soxr")
 
-from nanovllm_voxcpm.entrypoints.ws_server import Server  # noqa: E402
+from nanovllm_voxcpm.entrypoints.ws_server import EngineLink, Server, serve_engine, speak  # noqa: E402
 
 PATCH = 7680  # 160 ms at 48 kHz
 
@@ -45,7 +46,7 @@ async def session(tts, a, query="audio_format=pcm_16000&chunk_size=4096&segmenti
     from websockets.asyncio.client import connect
     from websockets.asyncio.server import serve
 
-    srv = Server(tts, a)
+    srv = Server(set(tts.voices), lambda req, y: speak(tts, req, y), a)
     async with serve(srv.handler, "127.0.0.1", 0) as s:
         port = s.sockets[0].getsockname()[1]
         msgs = []
@@ -105,7 +106,9 @@ def test_bad_format_is_an_error():
         from websockets.asyncio.client import connect
         from websockets.asyncio.server import serve
 
-        async with serve(Server(FakeTTS(), args()).handler, "127.0.0.1", 0) as s:
+        tts = FakeTTS()
+        async with serve(Server(set(tts.voices), lambda req, y: speak(tts, req, y), args()).handler, "127.0.0.1",
+                         0) as s:
             port = s.sockets[0].getsockname()[1]
             async with connect(f"ws://127.0.0.1:{port}/api/tts/stream?audio_format=mp3") as ws:
                 return json.loads(await ws.recv())
@@ -122,7 +125,8 @@ def test_paced_gaps_stay_under_a_chunk_through_the_engine_pause():
         from websockets.asyncio.client import connect
         from websockets.asyncio.server import serve
 
-        async with serve(Server(FakeTTS(patches=6, burst=3, pause=0.3), a).handler, "127.0.0.1", 0) as s:
+        tts = FakeTTS(patches=6, burst=3, pause=0.3)
+        async with serve(Server(set(tts.voices), lambda req, y: speak(tts, req, y), a).handler, "127.0.0.1", 0) as s:
             port = s.sockets[0].getsockname()[1]
             ts = []
             async with connect(f"ws://127.0.0.1:{port}/api/tts/stream?audio_format=pcm_16000&chunk_size=4096") as ws:
@@ -140,3 +144,57 @@ def test_paced_gaps_stay_under_a_chunk_through_the_engine_pause():
     assert max(unpaced) > 0.25
     assert max(paced_gaps[:-2]) < 0.128  # (the end: what is left goes out at once)
 
+
+
+def test_through_the_two_processes_link():
+    # serve_engine on one end of a socket pair, EngineLink on the other (in one loop here; two processes in the
+    # server): the same protocol, and a client that leaves cancels its engine request
+    import socket
+
+    tts = FakeTTS(patches=6, burst=3, pause=0.02)
+    cancelled = []
+    orig = tts.stream
+
+    async def stream(*a, **kw):
+        try:
+            async for c in orig(*a, **kw):
+                yield c
+        except BaseException:
+            cancelled.append(True)
+            raise
+
+    tts.stream = stream
+
+    async def main():
+        from websockets.asyncio.client import connect
+        from websockets.asyncio.server import serve
+
+        sa, sb = socket.socketpair()
+        ra, wa = await asyncio.open_connection(sock=sa)
+        rb, wb = await asyncio.open_connection(sock=sb)
+        engine = asyncio.create_task(serve_engine(tts, ra, wa))
+        link = EngineLink(rb, wb)
+        async with serve(Server({"default"}, link.stream, args()).handler, "127.0.0.1", 0) as s:
+            port = s.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/api/tts/stream?chunk_size=4096"
+            async with connect(url) as ws:
+                await ws.send("x")
+                msgs = []
+                while not (msgs and isinstance(msgs[-1], str) and "end_of_audio" in msgs[-1]):
+                    msgs.append(await ws.recv())
+            tts.patches = 1000  # a long one, left after its first chunk
+            async with connect(url) as ws:
+                await ws.send("y")
+                while not isinstance(await ws.recv(), bytes):
+                    pass
+            for _ in range(100):
+                if cancelled:
+                    break
+                await asyncio.sleep(0.01)
+        wb.close()
+        await asyncio.wait_for(engine, 2)
+        return msgs
+
+    msgs = asyncio.run(main())
+    assert sum(len(m) for m in msgs if isinstance(m, bytes)) == 6 * PATCH // 3 * 2
+    assert cancelled == [True]

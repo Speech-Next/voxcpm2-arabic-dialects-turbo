@@ -16,9 +16,13 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
 - dialect: a name RoutedDialectTTS routes (--dialect: the default). The seed is the text's CRC32 (the same text, the
   same audio).
 - Pacing (default; --no-pace sends each chunk the moment it is complete): streaming.ChunkPacer per utterance, the
-  first chunk at once, the next ones on a grid of --pace-alpha x a chunk's audio, more than --pace-reserve-ms queued
-  at once, the rest at the end at once. With 4096-byte chunks of 16 kHz the engine is told the chunk's length
-  (stream's chunk_ms) so that its deadlines allow for what the server holds back.
+  first chunk at once, the next ones on a grid of --pace-alpha x a chunk's audio (--pace-alpha-last for the last
+  chunk queued), more than --pace-reserve-ms queued at once, the rest at the end at once. The engine is told the
+  chunk's length (stream's chunk_ms) so that its deadlines allow for what the server holds back.
+- Two processes (default; --procs 1: one): the connections and their pacers run in a process of their own, the
+  engine's client (RoutedDialectTTS) in this one, the audio crossing over a socket pair. At 200 streams the client's
+  event loop is busy 10-20 ms after every engine step (a patch of every stream at once), and a paced chunk due
+  meanwhile went out that much late: a stall where the server had the audio.
 """
 
 import argparse
@@ -27,9 +31,10 @@ import base64
 import json
 import os
 import signal
+import struct
 import time
 import zlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
@@ -59,9 +64,40 @@ async def rechunk(source: AsyncIterator[bytes], n: int) -> AsyncIterator[bytes]:
         del buf[:n]
 
 
+async def speak(tts, req: dict, yields: list | None = None) -> AsyncIterator[bytes]:
+    """One utterance's PCM16 at req["rate"]: req = text, dialect, voice, cfg_value, rate, chunk_ms, segmenting.
+    yields: [time, samples from the engine, ms resampling, bytes out] per engine chunk."""
+    parts = [req["text"]]
+    if req["segmenting"]:
+        from nanovllm_voxcpm.entrypoints.openai_server import split_text
+
+        parts = split_text(req["text"]) or parts
+    rs = None
+    if req["rate"] != tts.sample_rate:
+        import soxr
+
+        rs = soxr.ResampleStream(tts.sample_rate, req["rate"], 1, dtype="float32")
+    for part in parts:
+        seed = zlib.crc32(part.encode()) & 0x7FFFFFFF
+        async for c in tts.stream(part, dialect=req["dialect"], voice=req["voice"], seed=seed,
+                                  cfg_value=req["cfg_value"], chunk_ms=req["chunk_ms"]):
+            t = time.perf_counter()
+            out = pcm16(rs.resample_chunk(c, last=False) if rs is not None else c)
+            if yields is not None:
+                yields.append([t, int(c.size), (time.perf_counter() - t) * 1000, len(out)])
+            yield out
+    if rs is not None:
+        out = pcm16(rs.resample_chunk(np.zeros(0, np.float32), last=True))
+        if yields is not None:
+            yields.append([time.perf_counter(), 0, 0.0, len(out)])
+        yield out
+
+
 class Server:
-    def __init__(self, tts, args):
-        self.tts, self.args = tts, args
+    """The connections. voices: the registered voice names; source(req, yields): an utterance's PCM16 bytes."""
+
+    def __init__(self, voices, source: Callable[[dict, list], AsyncIterator[bytes]], args):
+        self.voices, self.source, self.args = voices, source, args
         self.log = open(args.log, "a") if args.log else None
         self.conn = 0
 
@@ -108,7 +144,7 @@ class Server:
                     except json.JSONDecodeError:
                         obj = None
                     if isinstance(obj, dict) and obj.get("type") == "control":
-                        if obj.get("voice") is not None and obj["voice"] not in self.tts.voices:
+                        if obj.get("voice") is not None and obj["voice"] not in self.voices:
                             await ws.send(json.dumps({"type": "config_error", "message": f"voice {obj['voice']!r}"}))
                             continue
                         cfg["voice"] = obj.get("voice", cfg["voice"])
@@ -134,45 +170,117 @@ class Server:
 
     async def utterance(self, ws, conn, cfg, t_recv, text):
         n, rate, b64 = cfg["chunk_size"], cfg["rate"], cfg["transport"] == "json_base64"
-        parts = [text]
-        if cfg["segmenting"]:
-            from nanovllm_voxcpm.entrypoints.openai_server import split_text
-
-            parts = split_text(text) or [text]
         await ws.send(json.dumps({"type": "start", "sample_rate": rate}))
-        rs = None
-        if rate != self.tts.sample_rate:
-            import soxr
-
-            rs = soxr.ResampleStream(self.tts.sample_rate, rate, 1, dtype="float32")
+        req = dict(text=text, dialect=cfg["dialect"], voice=cfg["voice"], cfg_value=cfg["cfg_value"], rate=rate,
+                   chunk_ms=n / (2 * rate) * 1000, segmenting=cfg["segmenting"])
         yields, sends = [], []
-        chunk_ms = n / (2 * rate) * 1000
-
-        async def pcm():
-            for part in parts:
-                seed = zlib.crc32(part.encode()) & 0x7FFFFFFF
-                async for c in self.tts.stream(part, dialect=cfg["dialect"], voice=cfg["voice"], seed=seed,
-                                               cfg_value=cfg["cfg_value"], chunk_ms=chunk_ms):
-                    t = time.perf_counter()
-                    out = pcm16(rs.resample_chunk(c, last=False) if rs is not None else c)
-                    yields.append([t, int(c.size), (time.perf_counter() - t) * 1000, len(out)])
-                    yield out
-            if rs is not None:
-                out = pcm16(rs.resample_chunk(np.zeros(0, np.float32), last=True))
-                yields.append([time.perf_counter(), 0, 0.0, len(out)])
-                yield out
-
-        async for b in self.chunker(pcm(), n, rate, len(text)):
+        async for b in self.chunker(self.source(req, yields), n, rate, len(text)):
             await (ws.send(json.dumps({"type": "audio_chunk", "chunk_data": base64.b64encode(b).decode()}))
                    if b64 else ws.send(b))
             sends.append([time.perf_counter(), len(b)])
         await ws.send(json.dumps({"type": "end_of_audio"}))
         if self.log is not None:  # perf_counter (CLOCK_MONOTONIC) times: comparable with the engine's profiles
-            # yields: [t, samples from the engine, ms resampling, bytes out]; sends: [t after the send, bytes]
+            # yields: [t, samples from the engine, ms resampling, bytes out] (two processes: [t received, 0, 0,
+            # bytes]); sends: [t after the send, bytes]
             self.log.write(json.dumps({"conn": conn, "t_recv": t_recv, "t_end": time.perf_counter(),
                                        "chars": len(text), "dialect": cfg["dialect"], "chunk_size": n, "rate": rate,
                                        "paced": self.args.pace, "yields": yields, "sends": sends}) + "\n")
             self.log.flush()
+
+
+# --- two processes: the engine's client here, the connections there, length-prefixed frames over a socket pair ---
+_HDR = struct.Struct("<BII")  # type, utterance, payload bytes
+READY, LISTENING, START, CANCEL, DATA, END, ERROR = range(7)
+
+
+def frame(kind: int, utt: int, payload: bytes = b"") -> bytes:
+    return _HDR.pack(kind, utt, len(payload)) + payload
+
+
+async def read_frame(reader: asyncio.StreamReader) -> tuple[int, int, bytes]:
+    kind, utt, n = _HDR.unpack(await reader.readexactly(_HDR.size))
+    return kind, utt, await reader.readexactly(n) if n else b""
+
+
+async def serve_engine(tts, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """The engine's side: START (an utterance's request, JSON) -> DATA frames, then END (or ERROR); CANCEL stops
+    one. Returns when the connections' side closes."""
+    jobs: dict[int, asyncio.Task] = {}
+
+    async def run(utt: int, req: dict):
+        try:
+            async for out in speak(tts, req):
+                writer.write(frame(DATA, utt, out))
+            writer.write(frame(END, utt))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # noqa: BLE001 - the client hears why
+            writer.write(frame(ERROR, utt, repr(e).encode()))
+        finally:
+            jobs.pop(utt, None)
+
+    try:
+        while True:
+            kind, utt, payload = await read_frame(reader)
+            if kind == START:
+                jobs[utt] = asyncio.create_task(run(utt, json.loads(payload)))
+            elif kind == CANCEL and utt in jobs:
+                jobs.pop(utt).cancel()
+    except (asyncio.IncompleteReadError, ConnectionError):
+        pass
+    finally:
+        for job in list(jobs.values()):
+            job.cancel()
+
+
+class EngineLink:
+    """The connections' side: an utterance's PCM16 from the engine's process (stream), one frame per engine chunk."""
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.reader, self.writer = reader, writer
+        self.queues: dict[int, asyncio.Queue] = {}
+        self.next_utt = 0
+        self.closed = asyncio.get_running_loop().create_future()
+        self.task = asyncio.create_task(self._read())
+
+    async def _read(self):
+        try:
+            while True:
+                kind, utt, payload = await read_frame(self.reader)
+                q = self.queues.get(utt)
+                if q is not None:
+                    q.put_nowait((kind, payload, time.perf_counter()))
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            for q in self.queues.values():
+                q.put_nowait((ERROR, b"the engine's process is gone", time.perf_counter()))
+            if not self.closed.done():
+                self.closed.set_result(None)
+
+    async def stream(self, req: dict, yields: list | None = None) -> AsyncIterator[bytes]:
+        self.next_utt += 1
+        utt, q = self.next_utt, asyncio.Queue()
+        self.queues[utt] = q
+        self.writer.write(frame(START, utt, json.dumps(req).encode()))
+        done = False
+        try:
+            while True:
+                kind, payload, t = await q.get()
+                if kind == DATA:
+                    if yields is not None:
+                        yields.append([t, 0, 0.0, len(payload)])
+                    yield payload
+                elif kind == END:
+                    done = True
+                    return
+                else:
+                    done = True
+                    raise RuntimeError(payload.decode(errors="replace"))
+        finally:
+            del self.queues[utt]
+            if not done and not self.writer.is_closing():  # the client gone: the engine request ends
+                self.writer.write(frame(CANCEL, utt))
 
 
 async def lag_monitor(path: str, every: float = 0.002):
@@ -192,9 +300,7 @@ async def lag_monitor(path: str, every: float = 0.002):
                 lags, t_line = [], now
 
 
-async def main(args):
-    from websockets.asyncio.server import serve
-
+async def load_tts(args):
     from nanovllm_voxcpm import RoutedDialectTTS
 
     kw = {k: v for k, v in dict(model=args.model, tagged_model=args.tagged_model, head_tokens=args.head_tokens,
@@ -203,22 +309,24 @@ async def main(args):
     if args.dit is not None:
         kw["dit"] = args.dit or None
     tts = await RoutedDialectTTS.load(**kw)
-    async with tts:
-        for spec in args.voice:
-            name, _, path = spec.partition("=")
-            await tts.add_voice(name, path)
-        if args.default_voice is None and args.voice:
-            args.default_voice = args.voice[0].partition("=")[0]
-        await tts.synthesize("أهلاً بيك، إزيك النهارده؟", dialect=args.dialect, voice=args.default_voice)  # warm up
-        server = Server(tts, args)
-        lag = asyncio.create_task(lag_monitor(args.lag_log)) if args.lag_log else None
-        async with serve(server.handler, args.host, args.port, max_size=None, compression=None, ping_interval=None,
-                         max_queue=None) as ws_server:
-            announce(args)
-            await stopped()
-            ws_server.close()
-        if lag is not None:
-            lag.cancel()
+    for spec in args.voice:
+        name, _, path = spec.partition("=")
+        await tts.add_voice(name, path)
+    await tts.synthesize("أهلاً بيك، إزيك النهارده؟", dialect=args.dialect, voice=args.default_voice)  # warm up
+    return tts
+
+
+async def serve_ws(server: Server, args, until: asyncio.Future, on_listening: Callable[[], None]):
+    from websockets.asyncio.server import serve
+
+    lag = asyncio.create_task(lag_monitor(args.lag_log)) if args.lag_log else None
+    async with serve(server.handler, args.host, args.port, max_size=None, compression=None, ping_interval=None,
+                     max_queue=None) as ws_server:
+        on_listening()
+        await until
+        ws_server.close()
+    if lag is not None:
+        lag.cancel()
 
 
 def announce(args):
@@ -226,16 +334,64 @@ def announce(args):
         with open(args.ready, "w") as f:
             f.write(str(os.getpid()))
     print(f"[ws_server] ws://{args.host}:{args.port}{PATH} ready (pacing "
-          f"{'alpha %.2f, reserve %g ms' % (args.pace_alpha, args.pace_reserve_ms) if args.pace else 'off'}"
+          f"{'alpha %.2f, reserve %g ms' % (args.pace_alpha, args.pace_reserve_ms) if args.pace else 'off'}, "
+          f"{args.procs} process{'es' if args.procs > 1 else ''}"
           f"{', uvloop' if 'uvloop' in type(asyncio.get_running_loop()).__module__ else ''})", flush=True)
 
 
-async def stopped():
-    """Until SIGTERM / SIGINT (then the engine is closed: its process holds the GPU)."""
+def stop_signal() -> asyncio.Future:
+    """Set on SIGTERM / SIGINT (then the engine is closed: its process holds the GPU)."""
     stop = asyncio.get_running_loop().create_future()
     for sig in (signal.SIGTERM, signal.SIGINT):
         asyncio.get_running_loop().add_signal_handler(sig, lambda: stop.done() or stop.set_result(None))
-    await stop
+    return stop
+
+
+async def main_one(args):
+    """--procs 1: the connections on the engine client's event loop."""
+    tts = await load_tts(args)
+    async with tts:
+        server = Server(set(tts.voices), lambda req, yields: speak(tts, req, yields), args)
+        await serve_ws(server, args, stop_signal(), lambda: announce(args))
+
+
+async def main_engine(args, sock, front_pid: int):
+    """--procs 2, this process: the engine's client, serving the connections' process."""
+    reader, writer = await asyncio.open_connection(sock=sock)
+    stop = stop_signal()
+    try:
+        tts = await load_tts(args)
+        async with tts:
+            writer.write(frame(READY, 0, json.dumps({"voices": sorted(tts.voices)}).encode()))
+            kind, _, _ = await read_frame(reader)  # LISTENING
+            if kind != LISTENING:
+                raise RuntimeError("the connections' process did not start")
+            announce(args)
+            lag = asyncio.create_task(lag_monitor(args.lag_log + ".engine")) if args.lag_log else None
+            engine = asyncio.create_task(serve_engine(tts, reader, writer))
+            await asyncio.wait([stop, engine], return_when=asyncio.FIRST_COMPLETED)
+            engine.cancel()
+            if lag is not None:
+                lag.cancel()
+    finally:
+        try:
+            os.kill(front_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        await asyncio.to_thread(os.waitpid, front_pid, 0)
+
+
+async def main_front(args, sock):
+    """--procs 2, the connections' process."""
+    reader, writer = await asyncio.open_connection(sock=sock)
+    kind, _, payload = await read_frame(reader)  # READY once the engine is up
+    if kind != READY:
+        return
+    link = EngineLink(reader, writer)
+    server = Server(set(json.loads(payload)["voices"]), link.stream, args)
+    stop = stop_signal()
+    until = asyncio.ensure_future(asyncio.wait([stop, link.closed], return_when=asyncio.FIRST_COMPLETED))
+    await serve_ws(server, args, until, lambda: writer.write(frame(LISTENING, 0)))
 
 
 def cli():
@@ -262,12 +418,16 @@ def cli():
     ap.add_argument("--expect-per-char", type=float, default=0.0,
                     help="> 0: an utterance lasts at least this x its characters (s): a slower pace's ratio for "
                          "short ones keeps their gaps under their shorter average chunk (ChunkPacer.ratio_for)")
+    ap.add_argument("--procs", type=int, choices=(1, 2), default=2,
+                    help="2: the connections in a process of their own (default), 1: on the engine client's loop")
     ap.add_argument("--no-uvloop", dest="uvloop", action="store_false", help="asyncio's own event loop even when "
                                                                               "uvloop is installed")
     ap.add_argument("--log", default=None, help="jsonl, one line per utterance: the engine's yields and the sends")
     ap.add_argument("--lag-log", default=None, help="jsonl: the event loop's lag once a second")
     ap.add_argument("--ready", default=None, help="a file written once the server accepts connections")
     args = ap.parse_args()
+    if args.default_voice is None and args.voice:
+        args.default_voice = args.voice[0].partition("=")[0]
     factory = None
     if args.uvloop:
         try:  # a faster event loop: at 200 streams the loop's delays decide whether a paced chunk is late
@@ -276,7 +436,21 @@ def cli():
             factory = uvloop.new_event_loop
         except ImportError:
             pass
-    asyncio.run(main(args), loop_factory=factory)
+    if args.procs == 1:
+        asyncio.run(main_one(args), loop_factory=factory)
+        return
+    import socket
+
+    a, b = socket.socketpair()
+    pid = os.fork()  # before the engine (CUDA, threads) starts: the connections' process
+    if pid == 0:
+        a.close()
+        try:
+            asyncio.run(main_front(args, b), loop_factory=factory)
+        finally:
+            os._exit(0)
+    b.close()
+    asyncio.run(main_engine(args, a, pid), loop_factory=factory)
 
 
 if __name__ == "__main__":
