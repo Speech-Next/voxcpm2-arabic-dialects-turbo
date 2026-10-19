@@ -509,8 +509,8 @@ class VoxCPM2Engine(LLMEngineBase):
         seq.custom_payload.generated_waveforms.append(waveforms)
         payload = seq.custom_payload
         if payload.chain is not None or (self.lead_silence_patches >= 0 and payload.lead_silent >= 0):
-            silent = outputs.get("patch_silent")
-            silent = _is_silent(waveforms) if silent is None else bool(silent)
+            silent = outputs.get("patch_silent")  # (else the whole patch's audio, or the streamed one)
+            silent = _is_silent(outputs.get("patch_audio", waveforms)) if silent is None else bool(silent)
             if payload.chain is not None:  # a head-start head: its patches' silence decides the prompt
                 if payload.patch_silent is None:
                     payload.patch_silent = []
