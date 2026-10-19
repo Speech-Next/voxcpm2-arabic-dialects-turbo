@@ -37,6 +37,7 @@ _PATCHES_PER_TOKEN = 0.5
 _PCM_RATE = 32000  # a paced front's bytes per second (16 kHz PCM16: the pacer counts audio, any format the same)
 _PATCH_PCM = bytes(5120)  # one 160 ms patch at that rate
 _FIRST_FRAME_PCM = bytes(1280)  # its first latent frame (40 ms): what a muted patch of a prefill step sends
+_PACE_KEEP = 0.25  # s: leading silence past lead_silence_patches is dropped only while a paced front has this much
 
 
 def _is_silent(wave) -> bool:
@@ -488,6 +489,11 @@ class VoxCPM2Engine(LLMEngineBase):
             if self.lead_silence_patches >= 0 and payload.lead_silent >= 0:
                 payload.lead_silent = payload.lead_silent + 1 if silent else -1
                 payload.muted = payload.lead_silent > self.lead_silence_patches
+                if payload.muted and payload.pace_dry is not None and \
+                        payload.pace_dry - time.perf_counter() < _PACE_KEEP:
+                    # a paced front whose client plays already: the silence goes out after all when it would
+                    # otherwise run dry (a gap longer than a chunk, a stall), so that the stream goes on
+                    payload.muted = False
         else:
             payload.muted = False
         if not payload.muted:  # the player's clock: it waits while it has nothing, then plays this patch

@@ -946,6 +946,22 @@ def test_a_paced_front_s_send_clock_is_the_deadline():
     assert unpaced.custom_payload.pacer is None  # (pace 0: the real-time player from the first chunk)
 
 
+def test_a_paced_stream_s_leading_silence_goes_out_when_its_front_would_run_dry():
+    eng = _voxcpm2_engine()
+    eng.lead_silence_patches = 1  # the first silent patch is streamed, later ones are dropped
+    eng.model_runner.make_output = lambda t, p: {"latents": np.full((PATCH, FEAT), 0.5, np.float32), "stop_flag": 0,
+                                                 "waveforms": np.zeros(8, np.float32), "patch_silent": True}
+    seq = eng.add_request("r", _words(2), max_generate_length=12, head_start=False, client_chunk_ms=128,
+                          client_pace=0.93)
+    p = seq.custom_payload
+    eng.step()  # silent, streamed: the front sends chunk 0 and needs chunk 1 in 119 ms
+    eng.step()  # silent again, past the cap, but dropping it would leave the front without audio: streamed
+    assert not p.muted and p.streamed == pytest.approx(0.32)
+    p.pace_dry = time.perf_counter() + 1.0  # (the front holds plenty)
+    eng.step()  # now the silence is dropped
+    assert p.muted and p.streamed == pytest.approx(0.32)
+
+
 def test_mix_heads_decodes_the_short_streams_in_a_step_of_new_requests():
     buf = {"a": 0.05, "c": 0.5}
     sch = _timed(buf, mix_decode=True, mix_heads=True)  # 10 ms a token
