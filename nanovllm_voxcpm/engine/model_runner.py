@@ -211,6 +211,33 @@ _TORCH_DTYPES = {np.dtype(d): t for d, t in (
     (np.float16, torch.float16))}
 
 
+class PinnedStaging:
+    """One page-locked buffer that every prefill step's HostPack writes into (grown when a step needs more), in
+    place of a fresh page-locked allocation per step: the caching host allocator hands a block out again only once
+    nothing views it, and the streams' audio rows (views of their step's page-locked copies) keep blocks alive for
+    whole requests; a burst's head step's upload took 1.7 instead of 0.5 ms in some bursts at 200 at once. Before
+    the buffer is written again, the previous upload's copy out of it must be done (queued a step earlier: the wait
+    is a check)."""
+
+    def __init__(self) -> None:
+        self.buf: torch.Tensor | None = None
+        self.copied: torch.cuda.Event | None = None
+
+    def get(self, nbytes: int) -> torch.Tensor:
+        if self.copied is not None:
+            self.copied.synchronize()
+        if self.buf is None or self.buf.numel() < nbytes:
+            grow = 2 * self.buf.numel() if self.buf is not None else 0
+            self.buf = torch.empty(max(nbytes, grow), dtype=torch.uint8, device="cpu", pin_memory=True)
+        return self.buf[:nbytes]
+
+    def copied_out(self) -> None:
+        """The upload's copy is queued: the buffer is not written again before it is done."""
+        ev = torch.cuda.Event()
+        ev.record()
+        self.copied = ev
+
+
 class HostPack:
     """A step's host inputs staged in one page-locked buffer and copied to the GPU in one transfer. Every small H2D
     copy costs a pinned allocation, a device allocation and a cudaMemcpyAsync: a prefill step made ~17 of them
@@ -220,9 +247,10 @@ class HostPack:
 
     ALIGN = 256
 
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cuda", staging: PinnedStaging | None = None):
         self.device = torch.device(device)
         self.parts: list[tuple[tuple, np.dtype, object]] = []  # (shape, dtype, array or arrays to concatenate)
+        self.staging = staging  # (a step's page-locked buffer: PinnedStaging, else a fresh allocation)
 
     def add(self, array) -> int:
         a = np.asarray(array)  # (np.ascontiguousarray would make a 0-d array 1-d)
@@ -243,7 +271,9 @@ class HostPack:
             total += -(-n * dtype.itemsize // self.ALIGN) * self.ALIGN
         total = max(total, self.ALIGN)
         on_gpu = self.device.type == "cuda"
-        host = torch.empty(total, dtype=torch.uint8, device="cpu", pin_memory=on_gpu)
+        staged = on_gpu and self.staging is not None and not torch.cuda.is_current_stream_capturing()
+        host = self.staging.get(total) if staged else torch.empty(total, dtype=torch.uint8, device="cpu",
+                                                                  pin_memory=on_gpu)
         buf = host.numpy()
         typed_host: dict = {}  # the buffer viewed once per dtype (offsets are multiples of every item size)
         for (shape, dtype, src), off, n in zip(self.parts, offsets, counts):
@@ -258,6 +288,8 @@ class HostPack:
             else:
                 dst[...] = src
         dev = host.to(self.device, non_blocking=True) if on_gpu else host
+        if staged:
+            self.staging.copied_out()
         typed: dict = {}
         out = []
         for (shape, dtype, _), off, n in zip(self.parts, offsets, counts):

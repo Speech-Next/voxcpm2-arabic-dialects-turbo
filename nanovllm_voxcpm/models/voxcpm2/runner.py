@@ -11,7 +11,7 @@ import xxhash
 from torch.nn.utils import remove_weight_norm
 
 from nanovllm_voxcpm.config import Config
-from nanovllm_voxcpm.engine.model_runner import BaseModelRunner, HostPack, RunnerTask
+from nanovllm_voxcpm.engine.model_runner import BaseModelRunner, HostPack, PinnedStaging, RunnerTask
 from nanovllm_voxcpm.layers.audio_vae_v2 import AudioVAEV2
 from nanovllm_voxcpm.models.voxcpm2.config import VoxCPM2Config
 from nanovllm_voxcpm.models.voxcpm2.model import VoxCPM2Model
@@ -447,7 +447,9 @@ class VoxCPM2Runner(BaseModelRunner):
         if hits:  # cached reference prefixes -> this step's sequences, before they attend to them (unless the engine
             # copied them at admission already: VoxCPM2Engine.on_prefill_admitted)
             self.copy_kv_blocks([(src, dst) for src, dst, _ in hits], [n for _, _, n in hits])
-        pack = HostPack(getattr(self, "pack_device", "cuda"))
+        if getattr(self, "_pack_staging", None) is None:
+            self._pack_staging = PinnedStaging()
+        pack = HostPack(getattr(self, "pack_device", "cuda"), self._pack_staging)
         finish_ctx = self.stage_prefill_context(seqs, pack)
         prof.mark("ctx")
 

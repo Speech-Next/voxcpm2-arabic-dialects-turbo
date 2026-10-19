@@ -722,6 +722,24 @@ def test_prepared_prefill_runs_the_same_tasks_as_the_step():
     assert strip(runs[0][0]) == strip(runs[1][0]) and runs[0][1] == runs[1][1]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_steps_upload_through_one_page_locked_buffer():
+    """PinnedStaging: every upload through the one buffer reaches the GPU with its own values (the next one waits
+    for the copy before writing), the buffer grows when a step needs more, and the views keep their alignment."""
+    from nanovllm_voxcpm.engine.model_runner import PinnedStaging
+
+    staging, rng = PinnedStaging(), np.random.default_rng(0)
+    for n in (100, 3000, 50, 20000):
+        a = rng.integers(0, 1 << 30, n, dtype=np.int64)
+        b = rng.standard_normal((n, 3)).astype(np.float32)
+        pack = HostPack("cuda", staging)
+        ia, ib = pack.add(a), pack.add_concat([b[: n // 2], b[n // 2:]])
+        views = pack.upload()
+        assert staging.buf.is_pinned() and staging.buf.numel() >= n * 8
+        assert np.array_equal(views[ia].cpu().numpy(), a) and np.array_equal(views[ib].cpu().numpy(), b)
+        assert all(v.data_ptr() % HostPack.ALIGN == views[0].data_ptr() % HostPack.ALIGN for v in views)
+
+
 def test_a_text_twice_in_a_registration_batch_is_tokenized_once():
     from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
 
