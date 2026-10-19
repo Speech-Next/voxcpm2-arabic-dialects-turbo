@@ -46,7 +46,7 @@ class ChunkPacer:
 
     def __init__(self, chunk_bytes: int = 4096, bytes_per_s: float = 32000.0, alpha: float = 0.95,
                  reserve_ms: float | None = 1000.0, expect_s: float | None = None, margin_ms: float = 4.0,
-                 unit_bytes: int = 1, alpha_last: float | None = None):
+                 unit_bytes: int = 1, alpha_last: float | None = None, phase_ms: float = 0.0):
         if chunk_bytes <= 0 or bytes_per_s <= 0 or not 0 <= alpha <= 1:
             raise ValueError("chunk_bytes and bytes_per_s must be positive, 0 <= alpha <= 1 (0: no pace)")
         self.chunk_bytes = chunk_bytes
@@ -63,6 +63,11 @@ class ChunkPacer:
         self._grid: float | None = None  # when the last chunk was due (None: no chunk sent yet)
         self._last_s = 0.0  # its audio, seconds
         self.sent = 0  # chunks sent
+        # the chunk after one sent off the grid (the first, or a late one) goes out this much sooner: streams that
+        # start (or are late) together then do not send on the same instants (a client reading 200 streams in one
+        # event loop timestamps the last of a burst several ms late); costs the server that much lead each time
+        self.phase = phase_ms / 1000
+        self._shift = 0.0
 
     @staticmethod
     def ratio_for(expect_s: float, chunk_bytes: int = 4096, bytes_per_s: float = 32000.0, margin_ms: float = 4.0,
@@ -110,7 +115,7 @@ class ChunkPacer:
         # the last complete chunk queued (the server is empty after it): as late as the pace allows (alpha_last),
         # the engine's next audio has the most time to come
         a = self.alpha_last if n < 2 * self.chunk_bytes and self._ended is None else self.alpha
-        t = self._grid + a * self._last_s
+        t = self._grid + a * self._last_s - self._shift
         if self._ended is not None:  # what is left goes out at once
             t = min(t, self._ended)
         if self.reserve is not None and n > self.chunk_bytes + self.reserve:  # more than the reserve behind it
@@ -122,6 +127,8 @@ class ChunkPacer:
         t = self.due()
         if t is None:
             raise RuntimeError("no chunk is due")
+        on_grid = self._grid is not None and t <= self._grid + self.alpha_last * self._last_s - self._shift + 1e-9
+        self._shift = 0.0 if on_grid else self.phase
         k = min(self.chunk_bytes, len(self._buf))
         out = bytes(self._buf[:k])
         del self._buf[:k]

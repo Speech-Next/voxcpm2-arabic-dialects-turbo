@@ -125,7 +125,9 @@ class Server:
         self.log = open(args.log, "a") if args.log else None
         self.conn = 0
         # paced chunks of every connection from one task (StreamSender), written to the transports as whole frames
-        self.sender = StreamSender() if args.pace and getattr(args, "batch_sends", True) else None
+        self.sender = (StreamSender(getattr(args, "send_window_ms", 2.0) / 1000)
+                       if args.pace and getattr(args, "batch_sends", True) else None)
+        self.utterances = 0
 
     def pacer(self, n: int, rate: int, chars: int) -> ChunkPacer:
         a = self.args
@@ -133,8 +135,11 @@ class Server:
             return ChunkPacer(n, 2 * rate, alpha=0.0, reserve_ms=None)
         expect = a.expect_per_char * chars if a.expect_per_char > 0 else None
         unit = max(2, round(FRAME_S * rate) * 2)  # the engine's audio comes in 40 ms frames
+        self.utterances += 1  # each its own phase in [0, --pace-spread-ms) (golden-ratio sequence)
+        phase = getattr(a, "pace_spread_ms", 0.0) * ((self.utterances * 0.6180339887) % 1.0)
         return ChunkPacer(n, 2 * rate, a.pace_alpha, a.pace_reserve_ms if a.pace_reserve_ms >= 0 else None,
-                          expect_s=expect, margin_ms=a.pace_margin_ms, unit_bytes=unit, alpha_last=a.pace_alpha_last)
+                          expect_s=expect, margin_ms=a.pace_margin_ms, unit_bytes=unit, alpha_last=a.pace_alpha_last,
+                          phase_ms=phase)
 
     async def handler(self, ws):
         u = urlparse(ws.request.path)
@@ -494,6 +499,10 @@ def cli():
     ap.add_argument("--expect-per-char", type=float, default=0.0,
                     help="> 0: an utterance lasts at least this x its characters (s): a slower pace's ratio for "
                          "short ones keeps their gaps under their shorter average chunk (ChunkPacer.ratio_for)")
+    ap.add_argument("--send-window-ms", type=float, default=2.0, help="paced chunks due within this go out together")
+    ap.add_argument("--pace-spread-ms", type=float, default=0.0,
+                    help="the chunk after the first (or a late one) goes out up to this much sooner, a different "
+                         "amount per utterance: streams that start together do not send on the same instants")
     ap.add_argument("--per-stream-sends", dest="batch_sends", action="store_false",
                     help="each connection sends its own paced chunks (default: one task sends every due chunk)")
     ap.add_argument("--procs", type=int, choices=(1, 2), default=2,
