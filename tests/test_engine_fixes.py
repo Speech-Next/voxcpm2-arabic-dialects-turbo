@@ -931,20 +931,19 @@ def test_the_buffer_leaves_out_what_the_front_holds_back():
 
 def test_a_paced_front_s_send_clock_is_the_deadline():
     eng = _voxcpm2_engine()
-    eng.client_pace_hold = 3
     seq = eng.add_request("r", _words(2), max_generate_length=12, head_start=False, client_chunk_ms=128,
-                          client_pace=0.9)
-    p, interval = seq.custom_payload, 0.9 * 0.128
-    eng.step()  # one patch, 1.25 chunks: chunk 0 is sent now, chunk 1 is due one interval later
-    assert p.pace_sent == 1 and eng.stream_buffer(seq) == pytest.approx(interval, abs=0.01)
-    eng.step()  # 2.5 chunks: chunk 1 one interval after chunk 0
-    assert p.pace_sent == 2 and eng.stream_buffer(seq) == pytest.approx(2 * interval, abs=0.01)
-    for _ in range(6):  # far ahead: the front holds at most 3 chunks, the rest goes at once
+                          client_pace=0.93)
+    p, interval = seq.custom_payload, 0.93 * 0.128
+    eng.step()  # one patch, 1.25 chunks: chunk 0 goes out at once, chunk 1 is due one interval later
+    assert p.pacer.sent == 1 and eng.stream_buffer(seq) == pytest.approx(interval, abs=0.01)
+    eng.step()  # 2.5 chunks: chunk 1 waits for its time; the next one is needed an interval after it
+    assert p.pacer.sent == 1 and eng.stream_buffer(seq) == pytest.approx(2 * interval, abs=0.01)
+    for _ in range(8):  # far ahead: what is queued beyond the 1 s reserve goes out at once
         eng.step()
-    assert p.pace_sent == 10 and eng.stream_buffer(seq) == pytest.approx(4 * interval, abs=0.01)
+    assert 0.9 < eng.stream_buffer(seq) < 1.25 and p.pacer.sent > 2
     unpaced = eng.add_request("q", _words(2), max_generate_length=4, head_start=False, client_chunk_ms=128)
     eng.step()
-    assert unpaced.custom_payload.pace_last is None  # (pace 0: the real-time player from the first chunk)
+    assert unpaced.custom_payload.pacer is None  # (pace 0: the real-time player from the first chunk)
 
 
 def test_mix_heads_decodes_the_short_streams_in_a_step_of_new_requests():

@@ -79,6 +79,7 @@ def test_protocol_chunks_and_end(pace):
     assert sum(map(len, chunks)) == total
     assert all(len(c) == 4096 for c in chunks[:-1]) and 0 < len(chunks[-1]) <= 4096
     assert tts.calls[0][1:3] == ("egyptian", "default") and tts.calls[0][3]["chunk_ms"] == 128.0
+    assert tts.calls[0][3]["pace"] == (0.95 if pace else 0.0)  # the engine runs the same pacer
 
 
 def test_control_dialect_and_json_base64():

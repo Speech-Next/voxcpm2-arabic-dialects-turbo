@@ -62,7 +62,7 @@ def pcm16(y: np.ndarray) -> bytes:
 
 
 async def speak(tts, req: dict, yields: list | None = None) -> AsyncIterator[bytes]:
-    """One utterance's PCM16 at req["rate"]: req = text, dialect, voice, cfg_value, rate, chunk_ms, segmenting.
+    """One utterance's PCM16 at req["rate"]: req = text, dialect, voice, cfg_value, rate, chunk_ms, pace, segmenting.
     yields: [time, samples from the engine, ms resampling, bytes out] per engine chunk."""
     parts = [req["text"]]
     if req["segmenting"]:
@@ -77,7 +77,7 @@ async def speak(tts, req: dict, yields: list | None = None) -> AsyncIterator[byt
     for part in parts:
         seed = zlib.crc32(part.encode()) & 0x7FFFFFFF
         async for c in tts.stream(part, dialect=req["dialect"], voice=req["voice"], seed=seed,
-                                  cfg_value=req["cfg_value"], chunk_ms=req["chunk_ms"]):
+                                  cfg_value=req["cfg_value"], chunk_ms=req["chunk_ms"], pace=req.get("pace")):
             t = time.perf_counter()
             out = pcm16(rs.resample_chunk(c, last=False) if rs is not None else c)
             if yields is not None:
@@ -196,10 +196,12 @@ class Server:
     async def utterance(self, ws, conn, cfg, t_recv, text):
         n, rate, b64 = cfg["chunk_size"], cfg["rate"], cfg["transport"] == "json_base64"
         await ws.send(json.dumps({"type": "start", "sample_rate": rate}))
+        pacer = self.pacer(n, rate, len(text))
+        # the engine runs the same pacer (chunk_ms, pace: its deadlines are the pacer's)
         req = dict(text=text, dialect=cfg["dialect"], voice=cfg["voice"], cfg_value=cfg["cfg_value"], rate=rate,
-                   chunk_ms=n / (2 * rate) * 1000, segmenting=cfg["segmenting"])
+                   chunk_ms=n / (2 * rate) * 1000, pace=pacer.alpha, segmenting=cfg["segmenting"])
         yields, sends = [], []
-        stream = ChunkStream(self.pacer(n, rate, len(text)))
+        stream = ChunkStream(pacer)
         stop = self.feed(req, yields, stream)
         try:
             if self.sender is not None and not ws.protocol.extensions:

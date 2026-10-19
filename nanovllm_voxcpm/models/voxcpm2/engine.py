@@ -34,6 +34,10 @@ _LEADING_TAG = re.compile(r"<reserved_\d+>")  # a tagged model's dialect tag in 
 _PATCHES_PER_TOKEN = 0.5
 
 
+_PCM_RATE = 32000  # a paced front's bytes per second (16 kHz PCM16: the pacer counts audio, any format the same)
+_PATCH_PCM = bytes(5120)  # one 160 ms patch at that rate
+
+
 def _is_silent(wave) -> bool:
     """A streamed chunk (float in [-1, 1] or int16 PCM) below -50 dBFS RMS."""
     x = np.asarray(wave)
@@ -70,8 +74,9 @@ class VoxCPM2SeqPayload:
     streamed: float = 0.0  # seconds of audio the stream has given its player so far (client_chunk)
     client_chunk: float = 0.0  # seconds: its client gets the audio in chunks of this length (add_request)
     pace: float = 0.0  # its front sends a chunk per pace x client_chunk at most (client_pace)
-    pace_sent: int = 0  # chunks the paced front has been given
-    pace_last: float | None = None  # perf_counter when the paced front sends the last of them
+    pacer: object | None = None  # streaming.ChunkPacer: the paced front's sends as the engine's audio reaches it
+    pace_due: float | None = None  # when its next chunk goes out (None: no complete chunk queued)
+    pace_dry: float | None = None  # when it needs a chunk not produced yet (dry_at)
 
 
 def _rows_from(arrays: list[np.ndarray], start: int) -> np.ndarray:
@@ -119,7 +124,8 @@ class VoxCPM2Engine(LLMEngineBase):
     head_patches_max, head_margin, step_cap, head_hold = 0, 0.15, 0.0, False  # every head head_patches long
     mid_stages, mid_patches_max, stage_kv_reuse = (), 10, False  # no intermediate stage, every stage prefilled whole
     client_chunk = 0.0  # seconds; 0: the player gets every patch whole
-    client_pace, client_pace_hold = 0.0, 3  # unpaced
+    client_pace, client_pace_last, client_pace_reserve = 0.0, 0.95, 1.0  # unpaced
+    _paced = False  # a request with a paced front was added
     # stream id -> (KV block kept from its finished stage, the token ids it holds KV for, their PreparedAudio)
     _stream_prefix = MappingProxyType({})
     _head_phase = MappingProxyType({})  # (instances built without __init__: read-only, never added to)
@@ -164,7 +170,8 @@ class VoxCPM2Engine(LLMEngineBase):
         self.mid_stages = tuple(sorted({int(m) for m in mid if int(m) > self.head_tokens}))
         self.mid_patches_max = turbo.mid_patches_max
         self.client_chunk = turbo.client_chunk_ms / 1000
-        self.client_pace, self.client_pace_hold = turbo.client_pace, turbo.client_pace_hold
+        self.client_pace, self.client_pace_last = turbo.client_pace, turbo.client_pace_last
+        self.client_pace_reserve = turbo.client_pace_reserve_ms / 1000
         self.stage_kv_reuse = turbo.stage_kv_reuse
         self._stream_prefix: dict[str, tuple[int, list, PreparedAudio | None]] = {}
         self._head_phase: dict[str, int] = {}
@@ -201,23 +208,31 @@ class VoxCPM2Engine(LLMEngineBase):
         p = seq.custom_payload
         if p.play_end is None:
             return None
-        if p.pace > 0 and p.client_chunk > 0:  # a paced front: until its send clock needs a chunk not produced yet
-            return None if p.pace_last is None else p.pace_last + p.pace * p.client_chunk - time.perf_counter()
+        if p.pacer is not None:  # a paced front: until it needs a chunk not produced yet (pace_sync keeps it)
+            return None if p.pace_dry is None else p.pace_dry - time.perf_counter()
         held = math.fmod(p.streamed + 1e-9, p.client_chunk) - 1e-9 if p.client_chunk > 0 else 0.0
         return p.play_end - max(held, 0.0) - time.perf_counter()
 
     def _pace(self, p: VoxCPM2SeqPayload, now: float) -> None:
-        """The paced front's send clock (TurboConfig.client_pace) after a patch: each chunk the patch completes is sent
-        one pace interval after the one before, or now if that has passed, and at most client_pace_hold intervals
-        ahead (the front sends what it holds beyond that at once)."""
-        interval = p.pace * p.client_chunk
-        hold = self.client_pace_hold * interval
-        n = int((p.streamed + 1e-9) // p.client_chunk)
-        while p.pace_sent < n:
-            t = now if p.pace_last is None else max(p.pace_last + interval, now)
-            if hold > 0 and t - now > hold:
-                t = now + hold
-            p.pace_last, p.pace_sent = t, p.pace_sent + 1
+        """A patch reaches the paced front (TurboConfig.client_pace): its 160 ms into the stream's ChunkPacer (16 kHz
+        PCM16, as ws_server; the pacer counts audio, not samples), then the chunks due sent."""
+        if p.pacer is None:
+            from nanovllm_voxcpm.streaming import ChunkPacer
+
+            p.pacer = ChunkPacer(int(round(p.client_chunk * _PCM_RATE)), _PCM_RATE, alpha=p.pace,
+                                 reserve_ms=self.client_pace_reserve * 1000, alpha_last=self.client_pace_last)
+        p.pacer.push(_PATCH_PCM, now)
+        p.pace_due = p.pacer.due()
+        self._pace_sync(p, now)
+
+    @staticmethod
+    def _pace_sync(p: VoxCPM2SeqPayload, now: float) -> None:
+        """The chunks the paced front has sent by ``now`` (its grid moves on), and its next deadline."""
+        pacer = p.pacer
+        while p.pace_due is not None and p.pace_due <= now:
+            pacer.pop()
+            p.pace_due = pacer.due()
+        p.pace_dry = pacer.dry_at()
 
     def step_seconds(self, rows: int, tokens: int, prefill: bool) -> float:
         """Predicted seconds of a step of ``rows`` sequences computing ``tokens`` tokens (the scheduler's time
@@ -698,6 +713,8 @@ class VoxCPM2Engine(LLMEngineBase):
         seq.custom_payload.client_chunk = (self.client_chunk if client_chunk_ms is None
                                            else max(float(client_chunk_ms), 0.0) / 1000)
         seq.custom_payload.pace = self.client_pace if client_pace is None else max(float(client_pace), 0.0)
+        if seq.custom_payload.pace > 0 and seq.custom_payload.client_chunk > 0:
+            self._paced = True  # (a paced stream: step() keeps the pacers' sends from now on)
         seq.has_stream = resume  # a continuation carries on the head's stream (VAE state): ahead of new requests
         self.add_sequence(seq, front=resume)
         return seq
@@ -1049,7 +1066,8 @@ class VoxCPM2Engine(LLMEngineBase):
         new.custom_payload.lead_silent = payload.lead_silent  # the stream's leading silence goes on counting
         new.custom_payload.play_end = payload.play_end  # and its player keeps playing the head's audio
         new.custom_payload.streamed = payload.streamed
-        new.custom_payload.pace_sent, new.custom_payload.pace_last = payload.pace_sent, payload.pace_last
+        new.custom_payload.pacer, new.custom_payload.pace_due = payload.pacer, payload.pace_due
+        new.custom_payload.pace_dry = payload.pace_dry
         if mid is not None:
             new.custom_payload.chain = dict(chain, stage=chain.get("stage", 0) + 1, stage_len=len(mid), prior=head,
                                             done=done)
@@ -1059,6 +1077,13 @@ class VoxCPM2Engine(LLMEngineBase):
 
     def step(self):
         with self.stepping():  # a cancel during the step runs after it: it also reaches a continuation queued here
+            if self.client_pace > 0 or self._paced:  # the paced fronts' sends up to now (their grids, deadlines)
+                now = time.perf_counter()
+                for q in (self.scheduler.running, self.scheduler.waiting):
+                    for seq in q:
+                        p = seq.custom_payload
+                        if p.pace_due is not None and p.pace_due <= now:
+                            self._pace_sync(p, now)
             if self.head_patches_max > self.head_patches and self._head_phase and self.step_cost is not None:
                 self._replan_heads()
             t0 = time.perf_counter()

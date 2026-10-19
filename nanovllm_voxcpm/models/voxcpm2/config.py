@@ -191,12 +191,14 @@ class TurboConfig(BaseModel):
     # mixed steps' riders, mid_tokens) leaves out the held-back part (the audio streamed so far modulo a chunk).
     # 0: every patch reaches the client whole (with a chunk size set such a client only looks a little more urgent).
     client_chunk_ms: int = 0
-    # With chunks: the front paces its sends (#31, a jitter buffer): the first chunk as soon as it is full, then at
-    # most one per client_pace x a chunk's audio while it holds at most client_pace_hold chunks (any more at once).
-    # The engine's deadlines follow that send clock (stream_buffer: the time until it needs a chunk the engine has
-    # not produced yet). 0: the client plays the chunks as they come, in real time from the first.
+    # With chunks: the front paces its sends (#31, a jitter buffer: streaming.ChunkPacer, as ws_server): the first
+    # chunk at once, the next ones on a grid of client_pace x a chunk's audio (client_pace_last for the last complete
+    # chunk queued), more than client_pace_reserve_ms queued at once. The engine runs the same pacer per stream; its
+    # deadlines are the pacer's (stream_buffer: when it needs a chunk the engine has not produced, dry_at). The
+    # request's pace (add_request's client_pace) defaults to client_pace; 0: the client plays the chunks as they come.
     client_pace: float = 0.0
-    client_pace_hold: int = 3
+    client_pace_last: float = 0.95
+    client_pace_reserve_ms: float = 1000.0
     # With mix_decode: a prefill step of new requests (heads) also decodes the playing streams that would run out of
     # audio during it, as a resuming step does (a burst whose requests arrive over tens of ms: the late ones' heads
     # no longer pause the first ones). Their heads then solve the first patch with the usual grid.
