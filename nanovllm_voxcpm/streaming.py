@@ -12,7 +12,8 @@ gap longer than a chunk only remains where the engine is late with the audio its
         await ws.send(chunk)
 
 Policy (times from the stream's own audio, so that the pace does not drift):
-- the first chunk goes out as soon as it is complete (time to first audio as without pacing);
+- the first chunk goes out as soon as it is complete (time to first audio as without pacing), or ``start_ms`` after
+  that (a jitter buffer's start: every later chunk, and the engine's deadlines, that much later);
 - chunk k is due ``alpha`` times chunk k-1's audio after chunk k-1 was due: a grid, so that a late send (the event
   loop busy) does not shift the chunks after it. A chunk complete before it is due waits; one completed after it is
   sent at once and the grid restarts there;
@@ -47,7 +48,7 @@ class ChunkPacer:
     def __init__(self, chunk_bytes: int = 4096, bytes_per_s: float = 32000.0, alpha: float = 0.95,
                  reserve_ms: float | None = 1000.0, expect_s: float | None = None, margin_ms: float = 4.0,
                  unit_bytes: int = 1, alpha_last: float | None = None, phase_ms: float = 0.0,
-                 min_gap_ms: float = 0.0):
+                 min_gap_ms: float = 0.0, start_ms: float = 0.0):
         if chunk_bytes <= 0 or bytes_per_s <= 0 or not 0 <= alpha <= 1:
             raise ValueError("chunk_bytes and bytes_per_s must be positive, 0 <= alpha <= 1 (0: no pace)")
         self.chunk_bytes = chunk_bytes
@@ -73,6 +74,7 @@ class ChunkPacer:
         # apart: at 200 streams, ends flushed at once (up to a second's chunks of each of a dozen streams) held the
         # connections' event loop and the client's for 6-7 ms, and other streams' paced chunks came late
         self.min_gap = min_gap_ms / 1000
+        self.start = start_ms / 1000  # the first chunk this long after it is complete
 
     @staticmethod
     def ratio_for(expect_s: float, chunk_bytes: int = 4096, bytes_per_s: float = 32000.0, margin_ms: float = 4.0,
@@ -116,7 +118,7 @@ class ChunkPacer:
         else:
             return None
         if self._grid is None:
-            return ready
+            return ready + self.start
         # the last complete chunk queued (the server is empty after it): as late as the pace allows (alpha_last),
         # the engine's next audio has the most time to come
         a = self.alpha_last if n < 2 * self.chunk_bytes and self._ended is None else self.alpha

@@ -254,3 +254,14 @@ def test_min_gap_spreads_the_end_flush_and_the_reserve_release():
     assert t[0] == 0.0 and t[1] == pytest.approx(0.1) and gaps(s)[1:] == pytest.approx([0.008] * 3)
     s = run(ChunkPacer(C, 32000, alpha=0.95, reserve_ms=256, min_gap_ms=8), [(0.0, 10 * C)], end=9.0)
     assert min(gaps(s)) == pytest.approx(0.008)
+
+
+def test_start_delays_the_first_chunk_and_the_grid_with_it():
+    s = run(ChunkPacer(C, 32000, alpha=0.95, reserve_ms=None, start_ms=100), [(0.1, 5 * C)], end=5.0)
+    assert s[0] == (pytest.approx(0.2), C)
+    assert gaps(s) == pytest.approx([0.95 * CS] * 4)
+    p = ChunkPacer(C, 32000, alpha=0.9, reserve_ms=None, start_ms=100)
+    p.push(b"\0" * 2 * C, 0.0)
+    assert p.due() == pytest.approx(0.1) and p.dry_at() is None
+    p.pop()
+    assert p.dry_at() == pytest.approx(0.1 + 0.9 * 2 * CS)  # the engine's deadline, 100 ms later as well
