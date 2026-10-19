@@ -621,13 +621,18 @@ class VoxCPM2Engine(LLMEngineBase):
 
     _pretok_pending: dict | None = None
 
-    def pretokenize(self, texts: list[str]) -> None:
+    def pretokenize(self, texts: list[str], done: dict | None = None) -> None:
         """Tokenize a burst's texts in one batched call (the fast tokenizer, with character offsets for head
         start); add_request then takes them from this cache. Texts with CJK characters keep the per-text path
-        (the multi-character Chinese token split)."""
+        (the multi-character Chinese token split). done: text -> (ids, offsets) the client tokenized already (the
+        server's NANOVLLM_CLIENT_TOKENIZE, with this tokenizer)."""
         cache, uses = self._pretok_map, self._pretok_uses
         for t in texts:
             uses[t] = uses.get(t, 0) + 1
+        if done:
+            for t, enc in done.items():
+                if t not in cache:
+                    cache[t] = enc
         texts = [t for t in dict.fromkeys(texts) if t not in cache and not _CJK.search(t)]
         backend = getattr(getattr(self.tokenizer, "tokenizer", None), "_tokenizer", None)  # tokenizers.Tokenizer
         if texts and backend is not None:  # (else: no fast tokenizer behind the wrapper)

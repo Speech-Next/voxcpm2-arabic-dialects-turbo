@@ -34,6 +34,46 @@ Waveform = NDArray[np.float32]
 # still building the rest: 200 requests took ~3 ms to submit and ~5 ms to register, one after the other.
 _FLUSH_EVERY = int(os.environ.get("NANOVLLM_SUBMIT_FLUSH_EVERY", "48") or 0)
 
+# NANOVLLM_CLIENT_TOKENIZE (default 1): the client tokenizes a batch of requests' texts (the engine's own tokenizer,
+# sent with init_ok) as it sends them, and the engine registers them with those ids. Registering a burst is serial
+# work in the engine process, which first audio waits for: tokenizing was ~21 of its ~58 us per request (200 at once:
+# ~4.5 of ~12 ms), while the client built 48 requests in ~1 ms and then waited. The two processes now share the work
+# (200 at once: registered ~1.5 ms sooner). Same ids and offsets: the same library and tokenizer; texts the engine
+# tokenizes differently (CJK: the wrapper's character split) and single requests are left to it.
+_CLIENT_TOKENIZE = os.environ.get("NANOVLLM_CLIENT_TOKENIZE", "1") != "0"
+# NANOVLLM_SUBMIT_FLUSH_FIRST=k (default 16): a burst's first flush comes after k commands (then every
+# NANOVLLM_SUBMIT_FLUSH_EVERY): the engine starts registering while the client builds and tokenizes the rest
+_FLUSH_FIRST = int(os.environ.get("NANOVLLM_SUBMIT_FLUSH_FIRST", "16") or 0)
+# NANOVLLM_EMIT_BLOCK (default 1): a prefill step's first audio (equal-length chunks, one per stream) goes through the
+# shared ring as one block and one message item; the client splits it into the streams' chunks. Per-chunk writes,
+# items and reads for 200 streams were ~0.8 ms in the engine and ~0.8 ms in the client, before the first audio's
+# dispatch; one block saves ~0.5 ms of it.
+_EMIT_BLOCK = os.environ.get("NANOVLLM_EMIT_BLOCK", "1") != "0"
+
+
+def _block_item(ring, seq_ids, waves) -> dict | None:
+    """Equal-length chunks of several streams written to the ring as one block: the message item (NANOVLLM_EMIT_BLOCK),
+    or None (no ring, one stream, or chunks that differ)."""
+    if ring is None or len(waves) < 2 or not isinstance(waves[0], np.ndarray) or not waves[0].size:
+        return None
+    shape, dtype = waves[0].shape, waves[0].dtype
+    if not all(isinstance(w, np.ndarray) and w.shape == shape and w.dtype == dtype for w in waves):
+        return None
+    block = np.stack(waves)
+    off, end = ring.write(block)
+    return {"type": "stream_block", "ids": list(seq_ids), "off": off, "nb": block.nbytes, "end": end,
+            "dtype": block.dtype.str, "shape": block.shape}
+
+
+def _request_text(cmd: dict) -> str | None:
+    """The text the engine tokenizes for an add_request command (prompt_text + target_text), else None."""
+    if cmd.get("type") != "add_request":
+        return None
+    a = cmd["args"]
+    if len(a) >= 4 and isinstance(a[1], str):
+        return (a[3] if isinstance(a[3], str) else "") + a[1]
+    return None
+
 class HealthResponse(TypedDict):
     status: Literal["ok"]
 
@@ -312,7 +352,13 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
                 atexit.register(ring.close)
             except Exception:  # no shared memory: chunks travel pickled
                 ring = None
-        queue_out.put({"type": "init_ok", "shm": ring.shm.name if ring is not None else None})
+        tok_json = None
+        if _CLIENT_TOKENIZE and hasattr(getattr(srv, "llm", None), "pretokenize"):
+            backend = getattr(getattr(getattr(srv.llm, "tokenizer", None), "tokenizer", None), "_tokenizer", None)
+            if backend is not None:
+                tok_json = backend.to_str()
+        queue_out.put({"type": "init_ok", "shm": ring.shm.name if ring is not None else None,
+                       "tokenizer": tok_json})
         if os.environ.get("NANOVLLM_GC_FREEZE", "1") != "0":
             # the model's objects live in a frozen generation and generation 0 collects less often: full
             # collections over them otherwise land inside steps (tens of ms in a burst)
@@ -364,14 +410,17 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
         t0 = time.perf_counter()
         if pretokenize is not None and deferred:  # one batched tokenizer call for the requests about to register
             n = len(deferred) if limit is None else min(limit, len(deferred))
-            texts = []
+            texts, done = [], {}
             for k in range(n):
                 cmd = deferred[k]
-                if cmd.get("type") == "add_request" and len(cmd["args"]) >= 4 and isinstance(cmd["args"][1], str):
-                    prompt_text = cmd["args"][3] if isinstance(cmd["args"][3], str) else ""
-                    texts.append(prompt_text + cmd["args"][1])
+                text = _request_text(cmd)
+                if text is not None:
+                    texts.append(text)
+                    tok = cmd.pop("tok", None)  # tokenized by the client (NANOVLLM_CLIENT_TOKENIZE)
+                    if tok is not None:
+                        done[text] = tok
             if texts:
-                pretokenize(texts)
+                pretokenize(texts, done)
         t1 = time.perf_counter()
         while deferred and (limit is None or len(items) < limit):
             items.append(method_call(deferred.popleft()))
@@ -452,7 +501,9 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
     def emit_hook(seq_ids, waves) -> None:
         """Audio that leaves before its step ends (the first half of a prefill step's patch)."""
         t_in = time.perf_counter()
-        queue_out.put({"type": "batch", "items": [stream_item(i, w) for i, w in zip(seq_ids, waves)]})
+        block = _block_item(ring, seq_ids, waves) if _EMIT_BLOCK else None
+        items = [block] if block is not None else [stream_item(i, w) for i, w in zip(seq_ids, waves)]
+        queue_out.put({"type": "batch", "items": items})
         if _profile.StepProfile.enabled:
             _profile.log(kind="emit", t=time.perf_counter(), t_in=t_in, n=len(seq_ids))
 
@@ -715,6 +766,8 @@ class AsyncVoxCPM2Server:
 
     _reader = None
     _ring = None
+    _tokenizer = None  # the engine's tokenizer (init_ok), NANOVLLM_CLIENT_TOKENIZE
+    _first_flush = True  # the next flush is a burst's first (NANOVLLM_SUBMIT_FLUSH_FIRST)
     _spin_task = None
     _wake = None
 
@@ -775,6 +828,7 @@ class AsyncVoxCPM2Server:
             self._ring = _AudioRing(name=res["shm"])
         elif self._ring is not None:
             items = res["items"] if res.get("type") == "batch" else [res]
+            blocks = False
             for k, item in enumerate(items):
                 if item.get("type") == "stream_shm":
                     try:
@@ -782,6 +836,22 @@ class AsyncVoxCPM2Server:
                     except RuntimeError as e:  # overwritten: the stream fails (and is cancelled), no wrong audio
                         data = e
                     items[k] = {"type": "stream", "id": item["id"], "data": data}
+                elif item.get("type") == "stream_block":  # (NANOVLLM_EMIT_BLOCK) one chunk per stream, one row each
+                    blocks = True
+            if blocks:
+                out = []
+                for item in items:
+                    if item.get("type") != "stream_block":
+                        out.append(item)
+                        continue
+                    shape = tuple(item["shape"])
+                    try:
+                        block = self._ring.read(item["off"], item["nb"], item["end"], item["dtype"],
+                                                int(np.prod(shape))).reshape(shape)
+                        out.extend({"type": "stream", "id": i, "data": block[r]} for r, i in enumerate(item["ids"]))
+                    except RuntimeError as e:
+                        out.extend({"type": "stream", "id": i, "data": e} for i in item["ids"])
+                res["items"] = out
             if res.get("type") == "stream_shm":
                 res = items[0]
         return res
@@ -819,6 +889,16 @@ class AsyncVoxCPM2Server:
         if self._spin_task is not None:
             self._touch()
         if res.get("type") == "init_ok":
+            if res.get("tokenizer") and _CLIENT_TOKENIZE:
+                try:
+                    from tokenizers import Tokenizer
+
+                    tok = Tokenizer.from_str(res["tokenizer"])
+                    tok.no_truncation()
+                    tok.no_padding()
+                    self._tokenizer = tok
+                except Exception:  # (the engine tokenizes, as without it)
+                    self._tokenizer = None
             if not self._init_fut.done():
                 self._init_fut.set_result(None)
             return
@@ -854,17 +934,37 @@ class AsyncVoxCPM2Server:
                     fut.set_exception(RuntimeError(res["error"]))
             # else: future was cancelled (wait_for timeout etc) — skip set_result silently
 
+    def _tokenize(self, cmds: list[dict[str, Any]]) -> None:
+        """The add_request commands' ids and character offsets ("tok"), in one batched call (NANOVLLM_CLIENT_TOKENIZE);
+        texts with CJK characters are left to the engine (its wrapper splits multi-character Chinese tokens)."""
+        from nanovllm_voxcpm.models.voxcpm2.engine import _CJK
+
+        todo = [(c, t) for c in cmds for t in (_request_text(c),) if t is not None and not _CJK.search(t)]
+        if not todo:
+            return
+        try:
+            encs = self._tokenizer.encode_batch([t for _, t in todo], add_special_tokens=False)
+        except Exception:  # (the engine tokenizes them)
+            return
+        for (c, _), e in zip(todo, encs):
+            c["tok"] = (e.ids, e.offsets)
+
     def _flush_submits(self, more: bool = False) -> None:
         """Send the pending commands; ``more``: more commands of this event-loop turn follow (an early flush)."""
         cmds, self._pending_cmds = self._pending_cmds, []
+        self._first_flush = not more  # (the next turn's commands start a new burst)
         t = time.perf_counter()
         h0 = _host_sample() if _profile.StepProfile.enabled else None
         if len(cmds) == 1 and not more:
             self.queue_in.put_nowait(cmds[0])
         elif cmds:
+            if self._tokenizer is not None:  # (a single command registers at once: the engine tokenizes it)
+                self._tokenize(cmds)
+            t_tok = time.perf_counter()
             self.queue_in.put_nowait({"type": "batch", "cmds": cmds, **({"more": True} if more else {})})
         if cmds and _profile.StepProfile.enabled:
             _profile.log(kind="client_flush", t=t, n=len(cmds), put_ms=(time.perf_counter() - t) * 1000,
+                         tok_ms=(t_tok - t) * 1000 if len(cmds) > 1 or more else 0.0,
                          **_host_fields(h0, time.perf_counter() - t))
 
     _engine_error: BaseException | None = None  # set when the engine process died
@@ -885,7 +985,8 @@ class AsyncVoxCPM2Server:
         if not self._pending_cmds:
             loop.call_soon(self._flush_submits)
         self._pending_cmds.append({"id": op_id, "type": cmd, "args": args, "kwargs": kwargs})
-        if _FLUSH_EVERY and len(self._pending_cmds) >= _FLUSH_EVERY:
+        if _FLUSH_EVERY and len(self._pending_cmds) >= (_FLUSH_FIRST if self._first_flush and _FLUSH_FIRST
+                                                        else _FLUSH_EVERY):
             # the engine registers these while the rest of the turn's requests are built; requests that trickle in
             # (an HTTP front-end parses them one by one) reach it as a steady stream instead of a few large clumps
             self._flush_submits(more=True)
