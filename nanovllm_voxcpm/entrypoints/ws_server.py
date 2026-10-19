@@ -446,9 +446,10 @@ def cli():
     ap.add_argument("--default-voice", default=None, help="the voice of a connection that names none (default: the "
                                                           "first --voice; none: the model's own)")
     ap.add_argument("--no-pace", dest="pace", action="store_false", help="send each chunk the moment it is complete")
-    ap.add_argument("--pace-alpha", type=float, default=0.95, help="a paced gap, in chunks of audio")
-    ap.add_argument("--pace-alpha-last", type=float, default=None,
-                    help="the pace of the last complete chunk queued (the server empty after it; default: --pace-alpha)")
+    ap.add_argument("--pace-alpha", type=float, default=0.93, help="a paced gap, in chunks of audio")
+    ap.add_argument("--pace-alpha-last", type=float, default=0.95,
+                    help="the pace of the last complete chunk queued (the server empty after it): the engine's next "
+                         "audio has the longest to come")
     ap.add_argument("--pace-reserve-ms", type=float, default=1000.0, help="audio queued beyond this goes out at "
                                                                           "once (-1: never)")
     ap.add_argument("--pace-margin-ms", type=float, default=4.0)
