@@ -16,11 +16,15 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
 - dialect: a name RoutedDialectTTS routes (--dialect: the default). The seed is the text's CRC32 (the same text, the
   same audio).
 - Pacing (default; --no-pace sends each chunk the moment it is complete): streaming.ChunkPacer per utterance, the
-  first chunk at once, the next ones on a grid of --pace-alpha x a chunk's audio (--pace-alpha-last for the last
-  chunk queued), more than --pace-reserve-ms queued at once, the rest at the end at once. The engine is told the
-  chunk's length (stream's chunk_ms) so that its deadlines allow for what the server holds back.
+  first chunk at once, the next ones on a grid of --pace-alpha (0.9) x a chunk's audio (--pace-alpha-last, 0.92,
+  for the last chunk queued), more than --pace-reserve-ms queued at once, the rest at the end at once; the chunk
+  after the first (or a late one) up to --pace-spread-ms sooner, a different amount per utterance. One task sends
+  every connection's due chunks as whole frames (StreamSender). A gap stays 10-13 ms under the shortest average
+  chunk (124.4 ms with 4096-byte chunks of 16 kHz): the event loops of both sides (the client's too) delayed
+  chunks by up to ~10 ms at 150-200 streams. The engine is told the chunk's length (stream's chunk_ms) so that its
+  deadlines allow for what the server holds back; the pace runs 1/0.9 as fast as real time.
 - Two processes (default; --procs 1: one): the connections and their pacers run in a process of their own, the
-  engine's client (RoutedDialectTTS) in this one, the audio crossing over a socket pair. At 200 streams the client's
+  engine's client (RoutedDialectTTS) in this one, the audio crossing over socket pairs. At 200 streams the client's
   event loop is busy 10-20 ms after every engine step (a patch of every stream at once), and a paced chunk due
   meanwhile went out that much late: a stall where the server had the audio.
 """
@@ -125,7 +129,7 @@ class Server:
         self.log = open(args.log, "a") if args.log else None
         self.conn = 0
         # paced chunks of every connection from one task (StreamSender), written to the transports as whole frames
-        self.sender = (StreamSender(getattr(args, "send_window_ms", 2.0) / 1000)
+        self.sender = (StreamSender(getattr(args, "send_window_ms", 0.0) / 1000)
                        if args.pace and getattr(args, "batch_sends", True) else None)
         self.utterances = 0
 
@@ -502,8 +506,8 @@ def cli():
     ap.add_argument("--default-voice", default=None, help="the voice of a connection that names none (default: the "
                                                           "first --voice; none: the model's own)")
     ap.add_argument("--no-pace", dest="pace", action="store_false", help="send each chunk the moment it is complete")
-    ap.add_argument("--pace-alpha", type=float, default=0.93, help="a paced gap, in chunks of audio")
-    ap.add_argument("--pace-alpha-last", type=float, default=0.95,
+    ap.add_argument("--pace-alpha", type=float, default=0.9, help="a paced gap, in chunks of audio")
+    ap.add_argument("--pace-alpha-last", type=float, default=0.92,
                     help="the pace of the last complete chunk queued (the server empty after it): the engine's next "
                          "audio has the longest to come")
     ap.add_argument("--pace-reserve-ms", type=float, default=1000.0, help="audio queued beyond this goes out at "
@@ -512,8 +516,8 @@ def cli():
     ap.add_argument("--expect-per-char", type=float, default=0.0,
                     help="> 0: an utterance lasts at least this x its characters (s): a slower pace's ratio for "
                          "short ones keeps their gaps under their shorter average chunk (ChunkPacer.ratio_for)")
-    ap.add_argument("--send-window-ms", type=float, default=2.0, help="paced chunks due within this go out together")
-    ap.add_argument("--pace-spread-ms", type=float, default=0.0,
+    ap.add_argument("--send-window-ms", type=float, default=0.0, help="paced chunks due within this go out together")
+    ap.add_argument("--pace-spread-ms", type=float, default=10.0,
                     help="the chunk after the first (or a late one) goes out up to this much sooner, a different "
                          "amount per utterance: streams that start together do not send on the same instants")
     ap.add_argument("--per-stream-sends", dest="batch_sends", action="store_false",
