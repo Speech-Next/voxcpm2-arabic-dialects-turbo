@@ -451,9 +451,10 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
 
     def emit_hook(seq_ids, waves) -> None:
         """Audio that leaves before its step ends (the first half of a prefill step's patch)."""
+        t_in = time.perf_counter()
         queue_out.put({"type": "batch", "items": [stream_item(i, w) for i, w in zip(seq_ids, waves)]})
         if _profile.StepProfile.enabled:
-            _profile.log(kind="emit", t=time.perf_counter(), n=len(seq_ids))
+            _profile.log(kind="emit", t=time.perf_counter(), t_in=t_in, n=len(seq_ids))
 
     srv.llm.model_runner.emit_hook = emit_hook
 
@@ -739,6 +740,19 @@ class AsyncVoxCPM2Server:
         """Every message waiting in the engine's output pipe, handled in the loop thread."""
         try:
             while self._reader.poll():
+                if _profile.StepProfile.enabled:  # (NANOVLLM_PROFILE: when a batch of audio reaches the client)
+                    t_in = time.perf_counter()
+                    res = self.queue_out.get()
+                    t_got = time.perf_counter()
+                    res = self._convert(res)
+                    t_conv = time.perf_counter()
+                    self._handle(res)
+                    items = res.get("items", [res]) if isinstance(res, dict) else []
+                    n_audio = sum(1 for it in items if isinstance(it, dict) and it.get("type") == "stream")
+                    if n_audio:
+                        _profile.log(kind="client_recv", t=t_in, t_got=t_got, t_conv=t_conv,
+                                     t_done=time.perf_counter(), n=n_audio)
+                    continue
                 self._handle(self._convert(self.queue_out.get()))
         except (EOFError, OSError, ValueError):  # the pipe is gone: the engine watch reports the exit
             with contextlib.suppress(Exception):
