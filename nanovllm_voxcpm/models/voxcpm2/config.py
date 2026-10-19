@@ -206,6 +206,9 @@ class TurboConfig(BaseModel):
     # audio during it, as a resuming step does (a burst whose requests arrive over tens of ms: the late ones' heads
     # no longer pause the first ones). Their heads then solve the first patch with the usual grid.
     mix_heads: bool = False
+    # With mix_heads: such a step must end before the least of the streams riding it needs its next audio (their
+    # deadline less 30 ms); a longer one waits for the next decode step (a paced front's first->second chunk, #31)
+    heads_deadline: bool = False
     # A head start's continuation (or intermediate stage) takes the KV of the prefix it shares with the stage
     # before it (the voice and that stage's text) from that stage's first block instead of computing it again.
     stage_kv_reuse: bool = False

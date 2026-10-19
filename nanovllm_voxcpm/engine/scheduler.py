@@ -104,6 +104,7 @@ class Scheduler:
         self.step_cap = (getattr(turbo, "step_cap_ms", 0) or 0) / 1000
         self.mix_decode = bool(getattr(turbo, "mix_decode", False))
         self.mix_heads = self.mix_decode and bool(getattr(turbo, "mix_heads", False))  # (TurboConfig.mix_heads)
+        self.heads_deadline = self.mix_heads and bool(getattr(turbo, "heads_deadline", False))
         margin = getattr(turbo, "realtime_margin_ms", -1)
         self.realtime_margin = margin / 1000 if isinstance(margin, (int, float)) and margin >= 0 else None
         # the last step: (is_prefill, rows, tokens computed), for the callbacks' step time model; mixed: the running
@@ -271,6 +272,10 @@ class Scheduler:
             if cap is not None:
                 t = cost(budget[0] + 1 + ride, budget[1] + seq.num_tokens - hint + ride, True)
                 first = max(cap, least - _PAUSE_MARGIN + (patch if mixed else 0.0))
+                if self.heads_deadline and mixed and not seq.has_stream and not self._resumes:
+                    # a step of new heads that streams ride (mix_heads): over by the time the least of them needs
+                    # its next audio (else the heads wait for the decode step)
+                    first = min(cap, least - _PAUSE_MARGIN)
                 late = t > (first if budget[0] == 0 else cap)
             if not seq.has_stream and not late and realtime is not None:
                 rows = len(running) + 1
