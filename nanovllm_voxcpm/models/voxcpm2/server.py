@@ -514,7 +514,21 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
         put(tok_sync.changed())  # (e.g. a tagged adapter's registration replaced it; ahead of the response)
         return res
 
+    # NANOVLLM_DEFER_EMIT (default 1): a step's audio is written out (shared-memory ring, queue) during the next
+    # step's GPU work (overlap_hook) instead of between the two steps, when the GPU had nothing to do (#31: ~2.5 ms
+    # of 200 streams); it is sent at once when no step follows
+    defer_emit = os.environ.get("NANOVLLM_DEFER_EMIT", "1") != "0"
+    pending: list = []  # the last step's (stream id, its audio or None: the stream's end)
+
+    def flush_pending() -> None:
+        if pending:
+            items = [stream_item(i, w) if w is not None else {"type": "stream", "id": i, "data": None}
+                     for i, w in pending]
+            pending.clear()
+            queue_out.put({"type": "batch", "items": items})
+
     def overlap_hook():
+        flush_pending()  # the previous step's audio, while the GPU runs this one
         # register (during this step's GPU work) only what the next prefill step can take: registering a whole
         # burst here would stretch a small step far beyond its GPU time and hold everybody behind it
         while not states["is_stoped"]:
@@ -624,21 +638,23 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
             else:
                 output = srv.step()
             t_put = time.perf_counter()
-            items = []
+            flush_pending()  # (a step without the hook: nothing ran)
             for seq in output:
                 if not seq.custom_payload.muted:  # (leading silence past TurboConfig.lead_silence_patches)
-                    items.append(stream_item(seq.seq_id, seq.custom_payload.generated_waveforms[-1]))
+                    pending.append((seq.seq_id, seq.custom_payload.generated_waveforms[-1]))
                 if seq.is_finished and not getattr(seq.custom_payload, "chained", False):  # head start continues
-                    items.append({"type": "stream", "id": seq.seq_id, "data": None})
-            if items:
-                queue_out.put({"type": "batch", "items": items})
+                    pending.append((seq.seq_id, None))
+            _profile.host_mark("emit_build")
+            if not defer_emit or srv.is_finished() or states["is_stoped"]:  # no step follows to carry it
+                flush_pending()
+            _profile.host_mark("emit_put")
             collect_if_idle()
             last_active[0] = time.perf_counter()
             if _profile.StepProfile.enabled:
                 t_end = time.perf_counter()
                 _profile.log(
                     kind="server", n=len(output), t=t_step,
-                    step_ms=(t_put - t_step) * 1000, put_ms=(t_end - t_put) * 1000,
+                    step_ms=(t_put - t_step) * 1000, put_ms=(t_end - t_put) * 1000, **_profile.host_take(),
                 )
 
 

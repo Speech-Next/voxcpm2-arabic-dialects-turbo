@@ -93,18 +93,6 @@ class VoxCPM2Payload:
     feat_keys: np.ndarray | list | None = None  # uint64 per position, LocEnc cache keys (0 = not cacheable)
 
 
-_SILENCE_RMS = 10 ** (-50 / 20)  # -50 dBFS
-
-
-def _patch_silent(wave) -> bool:
-    """A patch's audio (float in [-1, 1] or int16 PCM) below -50 dBFS RMS."""
-    x = np.asarray(wave)
-    if x.size == 0:
-        return True
-    x = x.astype(np.float32) / (32768.0 if x.dtype == np.int16 else 1.0)
-    return float(np.sqrt(np.mean(x * x))) < _SILENCE_RMS
-
-
 # NANOVLLM_FIRST_AUDIO_FRAMES=k: a prefill step's patch is decoded and sent as its first k latent frames (40 ms of
 # audio each), then the rest; 0 = in one piece
 _FIRST_AUDIO_FRAMES = int(os.environ.get("NANOVLLM_FIRST_AUDIO_FRAMES", "1"))
@@ -667,8 +655,10 @@ class VoxCPM2Runner(BaseModelRunner):
         prof.mark("tail")
         prof.write()
         full = full_waveforms or ret_waveforms
+        # the whole patch's audio (the step may stream only its rest): the engine tests its silence where it needs to
+        # (heads, leading silence), not for every stream (#31: ~2 ms at 200 streams)
         return [
             {"latents": np_latents[i], "stop_flag": stop_flag[i], "waveforms": ret_waveforms[i],
-             "patch_silent": _patch_silent(full[i])}
+             "patch_audio": full[i]}
             for i in range(len(seqs))
         ]

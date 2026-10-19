@@ -19,6 +19,7 @@ from nanovllm_voxcpm.config import Config
 from nanovllm_voxcpm.engine.llm_engine import LLMEngineBase
 from nanovllm_voxcpm.engine.sequence import Sequence
 from nanovllm_voxcpm.engine.step_cost import StepCost, head_patches_for
+from nanovllm_voxcpm.utils import profile as _profile
 from nanovllm_voxcpm.models.voxcpm2.config import VoxCPM2Config
 from nanovllm_voxcpm.models.voxcpm2.lora_loader import load_voxcpm2_lora_checkpoint, tagged_adapter_state
 from nanovllm_voxcpm.models.voxcpm2.runner import RunnerTask, VoxCPM2Payload, VoxCPM2Runner
@@ -33,6 +34,30 @@ _LEADING_TAG = re.compile(r"<reserved_\d+>")  # a tagged model's dialect tag in 
 # An intermediate stage's patches per token of its text (TurboConfig.mid_tokens): below the speaking rate (#28's
 # Egyptian texts: ~0.68 patches a token) so that the stage stops before the speech of its text's end
 _PATCHES_PER_TOKEN = 0.5
+
+
+class _ByteCount:
+    """A ChunkPacer's buffer that only counts its bytes (the engine's pacer needs its times, not the audio): the
+    same len, +=, slicing and deletion, without copying 5 KB in and 4 KB out per stream and patch (#31)."""
+
+    __slots__ = ("n",)
+
+    def __init__(self) -> None:
+        self.n = 0
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __iadd__(self, data):
+        self.n += len(data)
+        return self
+
+    def __getitem__(self, key) -> bytes:
+        return b""
+
+    def __delitem__(self, key) -> None:
+        start, stop, _ = key.indices(self.n)
+        self.n -= max(stop - start, 0)
 
 
 _PCM_RATE = 32000  # a paced front's bytes per second (16 kHz PCM16: the pacer counts audio, any format the same)
@@ -227,6 +252,7 @@ class VoxCPM2Engine(LLMEngineBase):
             kw = p.pace_kw or {"alpha": p.pace, "reserve_ms": self.client_pace_reserve * 1000,
                                "alpha_last": self.client_pace_last}
             p.pacer = ChunkPacer(int(round(p.client_chunk * _PCM_RATE)), _PCM_RATE, **kw)
+            p.pacer._buf = _ByteCount()  # (its times only)
         p.pacer.push(_PATCH_PCM if pcm is None else pcm, now)
         p.pace_due = p.pacer.due()
         self._pace_sync(p, now)
@@ -484,8 +510,8 @@ class VoxCPM2Engine(LLMEngineBase):
         seq.custom_payload.generated_waveforms.append(waveforms)
         payload = seq.custom_payload
         if payload.chain is not None or (self.lead_silence_patches >= 0 and payload.lead_silent >= 0):
-            silent = outputs.get("patch_silent")
-            silent = _is_silent(waveforms) if silent is None else bool(silent)
+            silent = outputs.get("patch_silent")  # (else the whole patch's audio, or the streamed one)
+            silent = _is_silent(outputs.get("patch_audio", waveforms)) if silent is None else bool(silent)
             if payload.chain is not None:  # a head-start head: its patches' silence decides the prompt
                 if payload.patch_silent is None:
                     payload.patch_silent = []
@@ -1130,6 +1156,7 @@ class VoxCPM2Engine(LLMEngineBase):
         return True
 
     def step(self):
+        _profile.host_begin()
         with self.stepping():  # a cancel during the step runs after it: it also reaches a continuation queued here
             if self.client_pace > 0 or self._paced:  # the paced fronts' sends up to now (their grids, deadlines)
                 now = time.perf_counter()
@@ -1140,6 +1167,7 @@ class VoxCPM2Engine(LLMEngineBase):
                             self._pace_sync(p, now)
             if self.head_patches_max > self.head_patches and self._head_phase and self.step_cost is not None:
                 self._replan_heads()
+            _profile.host_mark("pre")
             t0 = time.perf_counter()
             seqs = super().step()
             if seqs and self.step_cost is not None:
@@ -1156,6 +1184,7 @@ class VoxCPM2Engine(LLMEngineBase):
                         if self._head_phase:
                             self._phase_pop(seq.seq_id)
                         self.model_runner.call("release_sequence_state", seq.seq_id)
+            _profile.host_mark("continue")
             return seqs
 
     def on_seq_removed(self, seq: Sequence, *, was_running: bool) -> None:

@@ -978,6 +978,23 @@ def test_a_paced_stream_s_leading_silence_goes_out_when_its_front_would_run_dry(
     assert p.muted and p.streamed == pytest.approx(0.32)
 
 
+def test_the_engine_s_counting_pacer_keeps_the_real_one_s_times():
+    from nanovllm_voxcpm.models.voxcpm2.engine import _ByteCount
+    from nanovllm_voxcpm.streaming import ChunkPacer
+
+    real, counted = (ChunkPacer(4096, 32000, alpha=0.9, alpha_last=0.92, reserve_ms=1000.0, min_gap_ms=8.0)
+                     for _ in range(2))
+    counted._buf = _ByteCount()
+    t = 0.0
+    for k, (n, dt) in enumerate([(5120, 0.0), (5120, 0.09), (1280, 0.3), (5120, 0.05)] + [(5120, 0.02)] * 12):
+        t += dt
+        for p in (real, counted):
+            p.push(bytes(n), t)
+            while p.due() is not None and p.due() <= t:
+                p.pop()
+        assert (real.due(), real.dry_at(), real.sent) == (counted.due(), counted.dry_at(), counted.sent), k
+
+
 def test_mix_heads_decodes_the_short_streams_in_a_step_of_new_requests():
     buf = {"a": 0.05, "c": 0.5}
     sch = _timed(buf, mix_decode=True, mix_heads=True)  # 10 ms a token

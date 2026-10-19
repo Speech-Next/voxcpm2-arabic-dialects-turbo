@@ -262,6 +262,7 @@ class LLMEngineBase:
         with self.stepping():
             _profile.begin_step()  # NANOVLLM_PROFILE: the step record's t_begin (and GPU reference)
             seqs, is_prefill = self.scheduler.schedule()
+            _profile.host_mark("schedule")
             if not seqs:
                 return seqs
 
@@ -282,16 +283,20 @@ class LLMEngineBase:
             # (NANOVLLM_FIRST_PATCH_RESUMING=1, for evaluations: also steps that resume streams, e.g. continuations)
             resuming = getattr(self.scheduler, "resuming", False)
             first = is_prefill and not ride and (_FIRST_PATCH_RESUMING or not resuming)
+            _profile.host_mark("preprocess")
             outputs = self.model_runner.call("run", runner_tasks, is_prefill, first)
+            _profile.host_mark("run")
 
             for seq, output in zip(seqs, outputs):
                 self.postprocess_seq(seq, output, is_prefill and id(seq) not in ride)
+            _profile.host_mark("postprocess")
             if is_prefill:
                 self.after_prefill(fresh)
 
             for seq in seqs:
                 if seq.stoped:
                     self.scheduler.finish(seq)
+            _profile.host_mark("finish")
 
             return seqs
 
