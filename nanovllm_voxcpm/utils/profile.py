@@ -89,6 +89,29 @@ def mark(name: str) -> None:
         _current.mark(name)
 
 
+_host: dict = {}  # host time per engine-step phase (ms), the server's record takes it (host_take)
+_host_t = [0.0]
+
+
+def host_begin() -> None:
+    """NANOVLLM_PROFILE: the host phases of an engine step are timed from here (host_mark)."""
+    if StepProfile.enabled:
+        _host_t[0] = time.perf_counter()
+
+
+def host_mark(name: str) -> None:
+    if StepProfile.enabled:
+        now = time.perf_counter()
+        _host["h_" + name] = _host.get("h_" + name, 0.0) + (now - _host_t[0]) * 1000
+        _host_t[0] = now
+
+
+def host_take() -> dict:
+    out = dict(_host)
+    _host.clear()
+    return out
+
+
 def log(**rec) -> None:
     if StepProfile.enabled:
         with open(_PATH, "a") as f:

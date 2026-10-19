@@ -18,6 +18,7 @@ from nanovllm_voxcpm.config import Config
 from nanovllm_voxcpm.engine.llm_engine import LLMEngineBase
 from nanovllm_voxcpm.engine.sequence import Sequence
 from nanovllm_voxcpm.engine.step_cost import StepCost, head_patches_for
+from nanovllm_voxcpm.utils import profile as _profile
 from nanovllm_voxcpm.models.voxcpm2.config import VoxCPM2Config
 from nanovllm_voxcpm.models.voxcpm2.lora_loader import load_voxcpm2_lora_checkpoint, tagged_adapter_state
 from nanovllm_voxcpm.models.voxcpm2.runner import RunnerTask, VoxCPM2Payload, VoxCPM2Runner
@@ -1098,6 +1099,7 @@ class VoxCPM2Engine(LLMEngineBase):
         return True
 
     def step(self):
+        _profile.host_begin()
         with self.stepping():  # a cancel during the step runs after it: it also reaches a continuation queued here
             if self.client_pace > 0 or self._paced:  # the paced fronts' sends up to now (their grids, deadlines)
                 now = time.perf_counter()
@@ -1108,6 +1110,7 @@ class VoxCPM2Engine(LLMEngineBase):
                             self._pace_sync(p, now)
             if self.head_patches_max > self.head_patches and self._head_phase and self.step_cost is not None:
                 self._replan_heads()
+            _profile.host_mark("pre")
             t0 = time.perf_counter()
             seqs = super().step()
             if seqs and self.step_cost is not None:
@@ -1124,6 +1127,7 @@ class VoxCPM2Engine(LLMEngineBase):
                         if self._head_phase:
                             self._phase_pop(seq.seq_id)
                         self.model_runner.call("release_sequence_state", seq.seq_id)
+            _profile.host_mark("continue")
             return seqs
 
     def on_seq_removed(self, seq: Sequence, *, was_running: bool) -> None:
