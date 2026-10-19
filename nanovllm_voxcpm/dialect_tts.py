@@ -286,11 +286,14 @@ class DialectTTS:
 
     async def stream(self, text: str, dialect: str | None = None, voice: str | None = None, *,
                      clone_mode: str | None = None, seed: int | None = None, cfg_value: float = 2.0,
-                     max_patches: int = 600, normalize: bool = True) -> AsyncIterator[np.ndarray]:
+                     max_patches: int = 600, normalize: bool = True,
+                     chunk_ms: float | None = None) -> AsyncIterator[np.ndarray]:
         """Audio chunks (float32 in [-1, 1], ``sample_rate``) of ``text`` in ``dialect`` (None: the base model),
         cloning ``voice`` (None: no cloning). max_patches: at most this many 160 ms patches. normalize: Arabic text
         read as the model was trained on it (read_as: digits, dates, times, amounts as words; formal when the dialect,
-        aliases resolved, is msa); hindi_english and text without Arabic script stay as they are."""
+        aliases resolved, is msa); hindi_english and text without Arabic script stay as they are. chunk_ms: the
+        caller sends the audio on in chunks of this many ms, holding the rest back until a chunk is full (e.g. 128 for
+        4096-byte chunks of 16 kHz PCM16): the engine's deadlines allow for it (None: TurboConfig.client_chunk_ms)."""
         if dialect is not None and dialect not in self.dialects:
             raise ValueError(f"unknown dialect {dialect!r}; dialects: {', '.join(self.dialects)}")
         canonical = self.tags.canonical(dialect) if self.tags is not None and dialect is not None else dialect
@@ -314,6 +317,8 @@ class DialectTTS:
                                                              read_as(transcript, canonical) if norm else transcript)
                 else:
                     text = tag + text
+        if chunk_ms is not None:
+            kw["client_chunk_ms"] = chunk_ms
         async for chunk in self.server.generate(target_text=text, lora_name=lora, seed=seed, cfg_value=cfg_value,
                                                 max_generate_length=max_patches, **kw):
             # one pass to float32 (a burst's 200 first chunks reach their streams one after another)

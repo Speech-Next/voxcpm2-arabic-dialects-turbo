@@ -213,7 +213,8 @@ class RoutedDialectTTS:
 
     async def stream(self, text: str, dialect: str | None = None, voice: str | None = None, *,
                      clone_mode: str | None = None, seed: int | None = None, cfg_value: float = 2.0,
-                     max_patches: int = 600, normalize: bool = True) -> AsyncIterator[np.ndarray]:
+                     max_patches: int = 600, normalize: bool = True,
+                     chunk_ms: float | None = None) -> AsyncIterator[np.ndarray]:
         """As DialectTTS.stream, through the adapter, or the tagged adapter and tag, that ``dialect`` routes to."""
         r = self.route(dialect)
         if normalize:
@@ -234,6 +235,8 @@ class RoutedDialectTTS:
                                                          read_as(transcript, r.dialect) if norm else transcript)
             else:
                 text = tag + text
+        if chunk_ms is not None:
+            kw["client_chunk_ms"] = chunk_ms
         async for chunk in self.server.generate(target_text=text, lora_name=lora, seed=seed, cfg_value=cfg_value,
                                                 max_generate_length=max_patches, **kw):
             yield np.multiply(chunk, np.float32(1 / 32768), dtype=np.float32) if chunk.dtype == np.int16 else chunk

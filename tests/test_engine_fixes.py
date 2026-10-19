@@ -923,10 +923,27 @@ def test_the_buffer_leaves_out_what_the_front_holds_back():
     assert p.streamed == pytest.approx(0.32)
     p.play_end = time.perf_counter() + 1.0
     assert eng.stream_buffer(seq) == pytest.approx(1.0, abs=0.01)  # client_chunk_ms 0: every patch whole
-    eng.client_chunk = 0.128  # 4096-byte chunks of 16 kHz PCM16: 0.32 s streamed, 0.064 s of it held back
+    p.client_chunk = 0.128  # 4096-byte chunks of 16 kHz PCM16: 0.32 s streamed, 0.064 s of it held back
     assert eng.stream_buffer(seq) == pytest.approx(0.936, abs=0.01)
     p.streamed = 0.64  # five whole chunks: nothing held back
     assert eng.stream_buffer(seq) == pytest.approx(1.0, abs=0.01)
+
+
+def test_a_requests_chunk_size_goes_with_every_stage():
+    eng = _staged(0.032, mid_tokens=(16, 32))
+    eng.head_patches_max = 3
+    head = eng.add_request("r", _words(40), max_generate_length=60, client_chunk_ms=128)
+    plain = eng.add_request("q", _words(2), max_generate_length=4, head_start=False)  # the engine's default: 0
+    assert head.custom_payload.client_chunk == pytest.approx(0.128) and plain.custom_payload.client_chunk == 0.0
+    seen = set()
+    for _ in range(40):
+        for s in eng.step():
+            if s.seq_id == "r":
+                seen.add((s.custom_payload.chain or {}).get("stage", "whole") if s is not head else "head")
+                assert s.custom_payload.client_chunk == pytest.approx(0.128)
+        if eng.is_finished():
+            break
+    assert seen == {"head", 1, 2, "whole"}
 
 
 def test_intermediate_stages_are_not_first_patch_steps():
