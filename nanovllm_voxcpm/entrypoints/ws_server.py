@@ -200,8 +200,9 @@ class Server:
         if self.log is not None:  # perf_counter (CLOCK_MONOTONIC) times: comparable with the engine's profiles
             # yields: [t, samples from the engine, ms resampling, bytes out] (two processes: [t received, 0, 0,
             # bytes]); sends: [t after the send, bytes]
-            self.log.write(json.dumps({"conn": conn, "t_recv": t_recv, "t_end": time.perf_counter(),
-                                       "chars": len(text), "dialect": cfg["dialect"], "chunk_size": n, "rate": rate,
+            self.log.write(json.dumps({"conn": conn, "crc": zlib.crc32(text.encode()), "t_recv": t_recv,
+                                       "t_end": time.perf_counter(), "chars": len(text), "dialect": cfg["dialect"],
+                                       "chunk_size": n, "rate": rate,
                                        "paced": self.args.pace, "yields": yields, "sends": sends}) + "\n")
             self.log.flush()
 
@@ -220,16 +221,21 @@ async def read_frame(reader: asyncio.StreamReader) -> tuple[int, int, bytes]:
     return kind, utt, await reader.readexactly(n) if n else b""
 
 
-async def serve_engine(tts, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+async def serve_engine(tts, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, log=None) -> None:
     """The engine's side: START (an utterance's request, JSON) -> DATA frames, then END (or ERROR); CANCEL stops
-    one. Returns when the connections' side closes."""
+    one. Returns when the connections' side closes. log: a file, one jsonl line per utterance (perf_counter times:
+    the START frame read, the task started, the first yields [t, samples, ms resampling, bytes])."""
     jobs: dict[int, asyncio.Task] = {}
 
-    async def run(utt: int, req: dict):
+    async def run(utt: int, req: dict, t_start: float):
+        t_task, yields = time.perf_counter(), []
         try:
-            async for out in speak(tts, req):
+            async for out in speak(tts, req, yields if log is not None else None):
                 writer.write(frame(DATA, utt, out))
             writer.write(frame(END, utt))
+            if log is not None:
+                log.write(json.dumps({"utt": utt, "crc": zlib.crc32(req["text"].encode()), "t_start": t_start,
+                                      "t_task": t_task, "yields": yields[:6], "t_end": time.perf_counter()}) + "\n")
         except asyncio.CancelledError:
             pass
         except Exception as e:  # noqa: BLE001 - the client hears why
@@ -241,7 +247,7 @@ async def serve_engine(tts, reader: asyncio.StreamReader, writer: asyncio.Stream
         while True:
             kind, utt, payload = await read_frame(reader)
             if kind == START:
-                jobs[utt] = asyncio.create_task(run(utt, json.loads(payload)))
+                jobs[utt] = asyncio.create_task(run(utt, json.loads(payload), time.perf_counter()))
             elif kind == CANCEL and utt in jobs:
                 jobs.pop(utt).cancel()
     except (asyncio.IncompleteReadError, ConnectionError):
@@ -406,7 +412,8 @@ async def main_engine(args, sock, front_pid: int):
                 raise RuntimeError("the connections' process did not start")
             announce(args)
             lag = asyncio.create_task(lag_monitor(args.lag_log + ".engine")) if args.lag_log else None
-            engine = asyncio.create_task(serve_engine(tts, reader, writer))
+            log = open(args.log + ".engine", "a", buffering=1) if args.log else None
+            engine = asyncio.create_task(serve_engine(tts, reader, writer, log))
             await asyncio.wait([stop, engine], return_when=asyncio.FIRST_COMPLETED)
             engine.cancel()
             if lag is not None:
