@@ -152,6 +152,7 @@ class ChunkStream:
         self._wake = asyncio.Event()
         self._target = math.inf  # when the taking side wakes up anyway
         self._failed: BaseException | None = None
+        self.last_due: float | None = None  # when the chunk last taken out was due
 
     def push(self, data: bytes, t: float | None = None) -> None:
         self.pacer.push(data, self.clock() if t is None else t)
@@ -189,6 +190,7 @@ class ChunkStream:
                 timer.cancel()
                 continue
             self._target = -math.inf
+            self.last_due = due
             yield pacer.pop()
 
 

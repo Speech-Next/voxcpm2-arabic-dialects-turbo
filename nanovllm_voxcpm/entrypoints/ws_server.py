@@ -191,15 +191,16 @@ class Server:
         stop = self.feed(req, yields, stream)
         try:
             async for b in stream:
+                t = time.perf_counter()
                 await (ws.send(json.dumps({"type": "audio_chunk", "chunk_data": base64.b64encode(b).decode()}))
                        if b64 else ws.send(b))
-                sends.append([time.perf_counter(), len(b)])
+                sends.append([time.perf_counter(), len(b), stream.last_due, t])
         finally:
             stop()
         await ws.send(json.dumps({"type": "end_of_audio"}))
         if self.log is not None:  # perf_counter (CLOCK_MONOTONIC) times: comparable with the engine's profiles
             # yields: [t, samples from the engine, ms resampling, bytes out] (two processes: [t received, 0, 0,
-            # bytes]); sends: [t after the send, bytes]
+            # bytes]); sends: [t after the send, bytes, when it was due, t before the send]
             self.log.write(json.dumps({"conn": conn, "crc": zlib.crc32(text.encode()), "t_recv": t_recv,
                                        "t_end": time.perf_counter(), "chars": len(text), "dialect": cfg["dialect"],
                                        "chunk_size": n, "rate": rate,
