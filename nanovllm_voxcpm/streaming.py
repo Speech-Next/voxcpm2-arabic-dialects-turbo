@@ -149,9 +149,15 @@ class ChunkPacer:
     def dry_at(self) -> float | None:
         """When the next chunk not yet complete is due if none comes before: the time by which the stream's next
         audio must reach the server for the client to see no gap longer than alpha x a chunk (None before the first
-        chunk). With audio queued it is later by alpha x a chunk for each complete chunk waiting."""
+        chunk). With audio queued it is later by alpha x a chunk for each complete chunk waiting. Before the first
+        chunk went out but once it is complete (it waits start_ms): as if it had gone out when it is due."""
         if self._grid is None:
-            return None
+            first = self.due()
+            if first is None:
+                return None
+            k = min(self.chunk_bytes, len(self._buf))
+            waiting = (len(self._buf) - k) // self.chunk_bytes
+            return first + self.alpha * (k + waiting * self.chunk_bytes) / self.bytes_per_s
         waiting = len(self._buf) // self.chunk_bytes
         return self._grid + self.alpha * (self._last_s + waiting * self.chunk_bytes / self.bytes_per_s)
 

@@ -262,6 +262,7 @@ def test_start_delays_the_first_chunk_and_the_grid_with_it():
     assert gaps(s) == pytest.approx([0.95 * CS] * 4)
     p = ChunkPacer(C, 32000, alpha=0.9, reserve_ms=None, start_ms=100)
     p.push(b"\0" * 2 * C, 0.0)
-    assert p.due() == pytest.approx(0.1) and p.dry_at() is None
+    # the engine's deadline, 100 ms later as well, and already while the first chunk waits (the same as after it)
+    assert p.due() == pytest.approx(0.1) and p.dry_at() == pytest.approx(0.1 + 0.9 * 2 * CS)
     p.pop()
-    assert p.dry_at() == pytest.approx(0.1 + 0.9 * 2 * CS)  # the engine's deadline, 100 ms later as well
+    assert p.dry_at() == pytest.approx(0.1 + 0.9 * 2 * CS)
