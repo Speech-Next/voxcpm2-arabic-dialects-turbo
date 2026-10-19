@@ -178,13 +178,19 @@ class TurboConfig(BaseModel):
     # waits). No underruns in bursts beyond what the A10 can cover (#28's WebSocket benchmark: about 110 at once and
     # up), at the cost of time to first audio there (p95 at 150 / 200 at once: ~0.15 -> 0.8 / 1.7 s).
     head_hold: bool = False
-    # Head start under load, an intermediate stage (#31; 0 = off): a head whose audio would run out before its
-    # whole continuation is prefilled (a burst: ~65 tokens a stream, ~0.8 s for 200 on one A10) is continued first
-    # with the text's first <= mid_tokens tokens (a word-boundary prefix; with stage_kv_reuse its prefill computes
-    # only the tokens after the head's), for at most mid_patches_max patches, enough to last until the whole
-    # continuation is prefilled; then with the whole text. Streams that are in time go to the whole text at once.
-    mid_tokens: int = 0
+    # Head start under load, intermediate stages (#31; 0 = off): a head whose audio would run out before its whole
+    # continuation is prefilled (a burst: ~65 tokens a stream, ~0.8 s for 200 on one A10) is continued first with
+    # the text's first <= mid_tokens tokens (a word-boundary prefix; with stage_kv_reuse its prefill computes only
+    # the tokens after the head's), for at most mid_patches_max patches; then with the whole text. A list (e.g.
+    # [24, 48]): stages of growing prefixes; at the end of each, the stream goes to the whole text if that comes in
+    # time, else to the longest further stage that does (the shortest if none). Streams in time skip the stages.
+    mid_tokens: int | list[int] = 0
     mid_patches_max: int = 10
+    # The front sends a stream's audio in chunks of this many ms (e.g. 128: 4096 bytes of 16 kHz PCM16) and holds
+    # the rest back: the engine's estimate of a player's queued audio (stream_buffer: the scheduler's deadlines,
+    # mixed steps' riders, mid_tokens) leaves out the held-back part (the audio streamed so far modulo a chunk).
+    # 0: every patch reaches the client whole (with a chunk size set such a client only looks a little more urgent).
+    client_chunk_ms: int = 0
     # A head start's continuation (or intermediate stage) takes the KV of the prefix it shares with the stage
     # before it (the voice and that stage's text) from that stage's first block instead of computing it again.
     stage_kv_reuse: bool = False

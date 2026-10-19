@@ -67,6 +67,7 @@ class VoxCPM2SeqPayload:
     lead_silent: int = 0  # silent patches at the stream's start so far (-1: its sound has begun)
     muted: bool = False  # this step's patch is leading silence past TurboConfig.lead_silence_patches: not streamed
     play_end: float | None = None  # perf_counter when a player started at the first streamed patch runs out of audio
+    streamed: float = 0.0  # seconds of audio the stream has given its player so far (TurboConfig.client_chunk_ms)
 
 
 def _rows_from(arrays: list[np.ndarray], start: int) -> np.ndarray:
@@ -112,7 +113,8 @@ class VoxCPM2Engine(LLMEngineBase):
     lead_silence_patches = -1  # leading silence as generated
     head_start_limit = 0  # head start for every request long enough
     head_patches_max, head_margin, step_cap, head_hold = 0, 0.15, 0.0, False  # every head head_patches long
-    mid_tokens, mid_patches_max, stage_kv_reuse = 0, 10, False  # no intermediate stage, every stage prefilled whole
+    mid_stages, mid_patches_max, stage_kv_reuse = (), 10, False  # no intermediate stage, every stage prefilled whole
+    client_chunk = 0.0  # seconds; 0: the player gets every patch whole
     # stream id -> (KV block kept from its finished stage, the token ids it holds KV for, their PreparedAudio)
     _stream_prefix = MappingProxyType({})
     _head_phase = MappingProxyType({})  # (instances built without __init__: read-only, never added to)
@@ -153,7 +155,10 @@ class VoxCPM2Engine(LLMEngineBase):
         self.head_start_limit = turbo.head_start_limit
         self.head_patches_max, self.head_margin = turbo.head_patches_max, turbo.head_margin_ms / 1000
         self.step_cap, self.head_hold = turbo.step_cap_ms / 1000, turbo.head_hold
-        self.mid_tokens, self.mid_patches_max = turbo.mid_tokens, turbo.mid_patches_max
+        mid = turbo.mid_tokens if isinstance(turbo.mid_tokens, (list, tuple)) else [turbo.mid_tokens]
+        self.mid_stages = tuple(sorted({int(m) for m in mid if int(m) > self.head_tokens}))
+        self.mid_patches_max = turbo.mid_patches_max
+        self.client_chunk = turbo.client_chunk_ms / 1000
         self.stage_kv_reuse = turbo.stage_kv_reuse
         self._stream_prefix: dict[str, tuple[int, list, PreparedAudio | None]] = {}
         self._head_phase: dict[str, int] = {}
@@ -189,9 +194,13 @@ class VoxCPM2Engine(LLMEngineBase):
 
     def stream_buffer(self, seq: Sequence[VoxCPM2SeqPayload]) -> float | None:
         """Seconds of audio still queued at the stream's player (started at its first patch, waiting when empty);
-        negative: the player has been waiting that long. None: nothing streamed yet."""
-        end = seq.custom_payload.play_end
-        return None if end is None else end - time.perf_counter()
+        negative: the player has been waiting that long. None: nothing streamed yet. TurboConfig.client_chunk_ms:
+        less the audio the front holds back (what it has streamed beyond its last whole chunk)."""
+        p = seq.custom_payload
+        if p.play_end is None:
+            return None
+        held = math.fmod(p.streamed + 1e-9, self.client_chunk) - 1e-9 if self.client_chunk > 0 else 0.0
+        return p.play_end - max(held, 0.0) - time.perf_counter()
 
     def step_seconds(self, rows: int, tokens: int, prefill: bool) -> float:
         """Predicted seconds of a step of ``rows`` sequences computing ``tokens`` tokens (the scheduler's time
@@ -451,6 +460,7 @@ class VoxCPM2Engine(LLMEngineBase):
         if not payload.muted:  # the player's clock: it waits while it has nothing, then plays this patch
             now = time.perf_counter()
             payload.play_end = max(payload.play_end or now, now) + self.patch_seconds
+            payload.streamed += self.patch_seconds
 
         latents = latents.reshape(-1, self.feat_dim)
         if seq.custom_payload.decode_pad is not None:
@@ -537,11 +547,15 @@ class VoxCPM2Engine(LLMEngineBase):
                              temperature=temperature, cfg_value=cfg_value, lora_name=lora_name, seed=seed,
                              voice=voice, voice_entry=entry, clone_mode=clone_mode, text_ids=full_ids)
                 patches, cont = self.head_patches, 0
-                if self.mid_tokens > self.head_tokens:  # #31: an intermediate stage, for a head whose whole
-                    # continuation would come too late
-                    mid = self._split_head(prompt_text, target_text, voice, clone_mode, limit=self.mid_tokens)
-                    if mid is not None and len(mid[0]) >= len(head_ids) + self.head_min_rest:
-                        chain["mid_ids"] = mid[0]
+                stages, last = [], len(head_ids)
+                for limit in self.mid_stages:  # #31: intermediate stages, for a head whose whole continuation
+                    # would come too late; each a prefix at least head_min_rest longer than the one before
+                    mid = self._split_head(prompt_text, target_text, voice, clone_mode, limit=limit)
+                    if mid is not None and len(mid[0]) >= last + self.head_min_rest:
+                        stages.append(mid[0])
+                        last = len(mid[0])
+                if stages:
+                    chain["mid_ids"] = stages
                 if self.head_patches_max > self.head_patches or self.head_start_limit or "mid_ids" in chain:
                     cont = self._continuation_tokens(full_ids, prompt_text, prompt_latents, ref_audio_latents,
                                                      entry, clone_mode)
@@ -550,8 +564,9 @@ class VoxCPM2Engine(LLMEngineBase):
                     chain["cont_tokens"] = cont
                     chain["prompt_ids"] = self._prompt_text_len(prompt_text, entry, clone_mode)
                     cont = self._stage_tokens(chain, cont, len(head_ids))
-                    if "mid_ids" in chain:  # the head lasts until its next prefill: the intermediate one, if needed
-                        cont = min(cont, self._stage_tokens(chain, self._mid_tokens(chain), len(head_ids)))
+                    if "mid_ids" in chain:  # the head lasts until its next prefill: the first stage's, if needed
+                        cont = min(cont, self._stage_tokens(chain, self._mid_tokens(chain, stages[0]),
+                                                            len(head_ids)))
                 chain["stage_len"] = len(head_ids)  # the text the head holds (its continuation may reuse its KV)
                 if self.head_patches_max > self.head_patches and self.step_cost is not None:
                     patches = min(self._plan_head(cont), max_generate_length - 1)
@@ -826,9 +841,10 @@ class VoxCPM2Engine(LLMEngineBase):
         return max(1, tokens - (prev_len - chain.get("prompt_ids", 0)))
 
     @staticmethod
-    def _mid_tokens(chain: dict) -> int:
-        """The intermediate stage's prefill before any reuse: the whole continuation's, with its shorter text."""
-        return chain["cont_tokens"] - (len(chain["text_ids"]) - len(chain["mid_ids"]))
+    def _mid_tokens(chain: dict, ids: list[int]) -> int:
+        """An intermediate stage's prefill (text ``ids``) before any reuse: the whole continuation's, with its
+        shorter text."""
+        return chain["cont_tokens"] - (len(chain["text_ids"]) - len(ids))
 
     def _head_plan(self):
         """TurboConfig.head_patches_max, from the predicted step times: plan(backlog, tokens) -> (patches, covered),
@@ -913,8 +929,8 @@ class VoxCPM2Engine(LLMEngineBase):
             return True
         return plan(backlog, own)[1]
 
-    def _whole_in_time(self, seq: Sequence[VoxCPM2SeqPayload], tokens: int) -> bool:
-        """At the end of a head (TurboConfig.mid_tokens): would its whole continuation (``tokens`` to prefill) be
+    def _in_time(self, seq: Sequence[VoxCPM2SeqPayload], tokens: int) -> bool:
+        """At the end of a head (TurboConfig.mid_tokens): would its next stage (``tokens`` to prefill) be
         prefilled before its player runs out of the audio it has, with head_margin to spare, after the next prefill
         of every other stream in its head phase (in a burst they all come due about when this one does, as in
         _plan_head)? The continuations' steps also carry every other stream (mix_decode), as _head_plan."""
@@ -940,9 +956,9 @@ class VoxCPM2Engine(LLMEngineBase):
     def _continue_head(self, seq: Sequence[VoxCPM2SeqPayload]) -> bool:
         """Queue the whole request after a finished head: its patches become prompt audio (after the voice's
         own prompt audio, if any); seed, noise step, LoRA and stream id carry over. False: nothing was queued.
-        TurboConfig.mid_tokens: a head whose whole continuation would come too late (_whole_in_time) is continued
-        with the text's first mid_tokens tokens first (an intermediate stage, itself continued the same way when it
-        ends); its patches join the prompt audio of the whole continuation."""
+        TurboConfig.mid_tokens: a head whose whole continuation would come too late (_in_time) is continued with a
+        prefix of its text first (an intermediate stage: the longest further one in time, else the shortest; itself
+        continued the same way when it ends); every stage's patches join the prompt audio of the next."""
         chain, payload = seq.custom_payload.chain, seq.custom_payload
         n = len(payload.generated_waveforms)
         done = chain.get("done", 0) + n  # the stream's patches so far (an intermediate stage: the head's too)
@@ -965,10 +981,13 @@ class VoxCPM2Engine(LLMEngineBase):
         if prior is not None:
             head = prior if head is None else np.concatenate([prior, head], axis=0)
         prev = chain.get("stage_len", 0)  # the text ids the stage that ended holds
-        mid = chain.get("mid_ids") if not chain.get("stage") else None
         whole = self._stage_tokens(chain, chain.get("cont_tokens", 0), prev) + done  # the whole continuation's
-        if mid is not None and self._whole_in_time(seq, whole):
-            mid = None
+        mid, cost = None, None  # the next intermediate stage (its text ids), its prefill
+        later = [ids for ids in chain.get("mid_ids") or () if len(ids) > prev]
+        if later and not self._in_time(seq, whole):
+            costs = [self._stage_tokens(chain, self._mid_tokens(chain, ids), prev) + done for ids in later]
+            k = next((i for i in reversed(range(len(later))) if self._in_time(seq, costs[i])), 0)
+            mid, cost = later[k], costs[k]
         kw = dict(chain)
         for key in ("mid_ids", "cont_tokens", "prompt_ids", "stage_len", "stage", "prior", "done"):
             kw.pop(key, None)
@@ -994,11 +1013,12 @@ class VoxCPM2Engine(LLMEngineBase):
         new.custom_payload.seed_step = payload.seed_step
         new.custom_payload.lead_silent = payload.lead_silent  # the stream's leading silence goes on counting
         new.custom_payload.play_end = payload.play_end  # and its player keeps playing the head's audio
+        new.custom_payload.streamed = payload.streamed
         if mid is not None:
-            new.custom_payload.chain = dict(chain, stage=1, stage_len=len(mid), prior=head, done=done)
+            new.custom_payload.chain = dict(chain, stage=chain.get("stage", 0) + 1, stage_len=len(mid), prior=head,
+                                            done=done)
         if self._head_phase and seq.seq_id in self._head_phase:  # the stream's next prefill
-            nxt = self._stage_tokens(chain, self._mid_tokens(chain), prev) + done if mid is not None else whole
-            self._phase_set(seq.seq_id, nxt)
+            self._phase_set(seq.seq_id, cost if mid is not None else whole)
         return True
 
     def step(self):

@@ -3,6 +3,7 @@ cancels, head start, streamed-audio errors. Nothing runs on a GPU (CUDA calls ar
 the real model are tests/gpu/verify_engine_fixes.py."""
 
 import asyncio
+import time
 from collections import OrderedDict
 from types import SimpleNamespace
 
@@ -790,11 +791,11 @@ def _steps_until_chained(eng, seq_id):
     raise AssertionError("the head was not continued")
 
 
-def _staged(per_token, mid_tokens=16):
-    """_loaded with #31's intermediate stage (head: 3 ids, intermediate: mid_tokens ids, whole: one per word) and stage
-    KV reuse; records the KV copies."""
+def _staged(per_token, mid_tokens=(16,)):
+    """_loaded with #31's intermediate stages (head: 3 ids, a stage: its mid_tokens ids, whole: one per word) and
+    stage KV reuse; records the KV copies."""
     eng = _loaded(per_token)
-    eng.mid_tokens, eng.mid_patches_max, eng.stage_kv_reuse, eng._stream_prefix = mid_tokens, 6, True, {}
+    eng.mid_stages, eng.mid_patches_max, eng.stage_kv_reuse, eng._stream_prefix = mid_tokens, 6, True, {}
     eng._split_head = lambda prompt_text, target_text, voice, clone_mode, limit=None: (
         [7] * (limit or 3), [7] * len((prompt_text + target_text).split()))
     eng.copies, call = [], eng.model_runner.call
@@ -848,6 +849,61 @@ def test_a_late_head_speaks_the_intermediate_stage_first():
     assert eng.copies[-1] == [16]  # the intermediate stage's 16 ids
     _run(eng, 80)
     assert len(bm.free_block_ids) == free and not eng._stream_prefix and not eng._head_phase
+
+
+def _next_queued(eng):
+    for _ in range(12):
+        if eng.scheduler.waiting:
+            return eng.scheduler.waiting[0]
+        eng.step()
+    raise AssertionError("nothing was queued")
+
+
+def test_stages_go_on_until_the_whole_continuation_is_in_time():
+    eng = _staged(0.032, mid_tokens=(16, 32))  # 32 ms a token: from the head no stage is in time (the shortest)
+    eng.head_patches_max = 3  # (heads not lengthened: 3 patches)
+    bm = eng.scheduler.block_manager
+    free = len(bm.free_block_ids)
+    eng.add_request("r", _words(40), max_generate_length=60)
+    _steps_until_chained(eng, "r")
+    one = eng.scheduler.waiting[0]
+    assert one.custom_payload.chain["stage"] == 1 and one.custom_payload.chain["stage_len"] == 16
+    assert one.custom_payload.max_generate_length == 4  # 0.5 a token of its 16 (2 kept back), less the head's 3
+    eng.step()  # its prefill: the head's 3 ids copied
+    two = _next_queued(eng)  # 7 patches (0.97 s to spare): the whole (32 tokens, 1.02 s) is late, the 32-id stage is not
+    assert two.custom_payload.chain["stage"] == 2 and two.custom_payload.chain["stage_len"] == 32
+    assert two.num_tokens == 32 + 1 + 7 and two.custom_payload.max_generate_length == 6  # mid_patches_max
+    eng.step()
+    whole = _next_queued(eng)  # 13 patches (2.1 s): the whole is in time
+    assert whole.custom_payload.chain is None and whole.num_tokens == 40 + 1 + 13
+    assert whole.custom_payload.max_generate_length == 60 - 13
+    eng.step()
+    assert eng.copies[-3:] == [[3], [16], [32]]  # every stage copies the prefix of the one before
+    _run(eng, 120)
+    assert len(bm.free_block_ids) == free and not eng._stream_prefix and not eng._head_phase
+
+
+def test_a_stage_in_time_is_preferred_to_shorter_ones():
+    eng = _staged(0.01, mid_tokens=(16, 32))  # 10 ms a token: the 32-id stage is in time from the head already
+    eng.add_request("r", _words(40), max_generate_length=60)
+    eng.head_margin = 0.1
+    _steps_until_chained(eng, "r")
+    assert eng.scheduler.waiting[0].custom_payload.chain["stage_len"] == 32
+
+
+def test_the_buffer_leaves_out_what_the_front_holds_back():
+    eng = _voxcpm2_engine()
+    seq = eng.add_request("r", _words(2), max_generate_length=8, head_start=False)
+    for _ in range(2):
+        eng.step()
+    p = seq.custom_payload
+    assert p.streamed == pytest.approx(0.32)
+    p.play_end = time.perf_counter() + 1.0
+    assert eng.stream_buffer(seq) == pytest.approx(1.0, abs=0.01)  # client_chunk_ms 0: every patch whole
+    eng.client_chunk = 0.128  # 4096-byte chunks of 16 kHz PCM16: 0.32 s streamed, 0.064 s of it held back
+    assert eng.stream_buffer(seq) == pytest.approx(0.936, abs=0.01)
+    p.streamed = 0.64  # five whole chunks: nothing held back
+    assert eng.stream_buffer(seq) == pytest.approx(1.0, abs=0.01)
 
 
 def test_a_cancelled_continuation_frees_the_block_it_would_copy():
