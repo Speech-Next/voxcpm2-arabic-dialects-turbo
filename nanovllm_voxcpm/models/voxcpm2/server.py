@@ -805,8 +805,7 @@ class AsyncVoxCPM2Server:
         # receiving thread.
         reader = getattr(getattr(self.queue_out, "_q", None), "_reader", None)
         if reader is not None and os.environ.get("NANOVLLM_CLIENT_READER", "loop") != "thread":
-            self._reader = reader
-            loop.add_reader(reader.fileno(), self._on_readable)
+            self._attach_reader(loop, reader)
             self.recv_task: asyncio.Task = asyncio.create_task(self._watch_engine())
             return
         self._queue_out_thread = threading.Thread(
@@ -844,6 +843,14 @@ class AsyncVoxCPM2Server:
                     await self._wake.wait()
         except asyncio.CancelledError:
             return
+
+    def _attach_reader(self, loop: asyncio.AbstractEventLoop, reader) -> None:
+        self._reader = reader
+        loop.add_reader(reader.fileno(), self._on_readable)
+        # get() reads a whole message. uvloop makes the descriptor non-blocking: a message larger than the pipe's
+        # buffer (the engine's tokenizer, NANOVLLM_CLIENT_TOKENIZE) then failed half-read (BlockingIOError), the
+        # reader was dropped and the engine blocked on its write for good (#31: ws_server hung at start, 2 in 4)
+        os.set_blocking(reader.fileno(), True)
 
     def _on_readable(self) -> None:
         """Every message waiting in the engine's output pipe, handled in the loop thread."""
