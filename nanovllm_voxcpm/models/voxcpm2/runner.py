@@ -1,5 +1,6 @@
 import os
 import random
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from multiprocessing.synchronize import Event
@@ -474,7 +475,10 @@ class VoxCPM2Runner(BaseModelRunner):
         if self._fast_noise:
             seeds = self._noise_seeds(seqs)
             i_seed = pack.add(seeds)
+        t_up = time.perf_counter() if prof.enabled else 0.0
         views = pack.upload()
+        if prof.enabled:  # (the pinned staging and the one copy, inside the "h2d" stage)
+            prof.rec["upload"] = (time.perf_counter() - t_up) * 1000
         inputs = {"positions": finish_ctx(views)}
         inputs["text_tokens"] = views[i_tok]
         inputs["feat"] = views[i_feat].to(self.dtype)
