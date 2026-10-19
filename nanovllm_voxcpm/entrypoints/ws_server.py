@@ -37,6 +37,7 @@ import numpy as np
 from nanovllm_voxcpm.streaming import ChunkPacer, paced
 
 PATH = "/api/tts/stream"
+FRAME_S = 0.04  # the AudioVAE's frame: a stream's audio is a whole number of them
 
 
 def pcm16(y: np.ndarray) -> bytes:
@@ -69,8 +70,9 @@ class Server:
         if not a.pace:
             return rechunk(source, n)
         expect = a.expect_per_char * chars if a.expect_per_char > 0 else None
+        unit = max(2, round(FRAME_S * rate) * 2)  # the engine's audio comes in 40 ms frames
         return paced(source, ChunkPacer(n, 2 * rate, a.pace_alpha, a.pace_reserve_ms if a.pace_reserve_ms >= 0
-                                        else None, expect_s=expect, margin_ms=a.pace_margin_ms))
+                                        else None, expect_s=expect, margin_ms=a.pace_margin_ms, unit_bytes=unit))
 
     async def handler(self, ws):
         u = urlparse(ws.request.path)
@@ -152,10 +154,12 @@ class Server:
                                                cfg_value=cfg["cfg_value"], chunk_ms=chunk_ms):
                     t = time.perf_counter()
                     out = pcm16(rs.resample_chunk(c, last=False) if rs is not None else c)
-                    yields.append([t, int(c.size), (time.perf_counter() - t) * 1000])
+                    yields.append([t, int(c.size), (time.perf_counter() - t) * 1000, len(out)])
                     yield out
             if rs is not None:
-                yield pcm16(rs.resample_chunk(np.zeros(0, np.float32), last=True))
+                out = pcm16(rs.resample_chunk(np.zeros(0, np.float32), last=True))
+                yields.append([time.perf_counter(), 0, 0.0, len(out)])
+                yield out
 
         async for b in self.chunker(pcm(), n, rate, len(text)):
             await (ws.send(json.dumps({"type": "audio_chunk", "chunk_data": base64.b64encode(b).decode()}))
@@ -163,6 +167,7 @@ class Server:
             sends.append([time.perf_counter(), len(b)])
         await ws.send(json.dumps({"type": "end_of_audio"}))
         if self.log is not None:  # perf_counter (CLOCK_MONOTONIC) times: comparable with the engine's profiles
+            # yields: [t, samples from the engine, ms resampling, bytes out]; sends: [t after the send, bytes]
             self.log.write(json.dumps({"conn": conn, "t_recv": t_recv, "t_end": time.perf_counter(),
                                        "chars": len(text), "dialect": cfg["dialect"], "chunk_size": n, "rate": rate,
                                        "paced": self.args.pace, "yields": yields, "sends": sends}) + "\n")
