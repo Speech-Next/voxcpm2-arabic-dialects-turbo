@@ -246,3 +246,11 @@ def test_stream_sender_batches_streams_in_order_and_finishes_them():
     assert [(i, b) for i, b, _ in sent if b % 10 == 0] == [(0, 0), (1, 10), (2, 20)]  # first chunks, in order
     for i in range(3):
         assert [b for j, b, _ in sent if j == i] == [i * 10, i * 10 + 1, i * 10 + 2]
+
+
+def test_min_gap_spreads_the_end_flush_and_the_reserve_release():
+    s = run(ChunkPacer(C, 32000, alpha=0.95, reserve_ms=None, min_gap_ms=8), [(0.0, 4 * C + C // 2)], end=0.1)
+    t = [x[0] for x in s]
+    assert t[0] == 0.0 and t[1] == pytest.approx(0.1) and gaps(s)[1:] == pytest.approx([0.008] * 3)
+    s = run(ChunkPacer(C, 32000, alpha=0.95, reserve_ms=256, min_gap_ms=8), [(0.0, 10 * C)], end=9.0)
+    assert min(gaps(s)) == pytest.approx(0.008)

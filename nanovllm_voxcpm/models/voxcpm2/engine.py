@@ -76,6 +76,7 @@ class VoxCPM2SeqPayload:
     streamed: float = 0.0  # seconds of audio the stream has given its player so far (client_chunk)
     client_chunk: float = 0.0  # seconds: its client gets the audio in chunks of this length (add_request)
     pace: float = 0.0  # its front sends a chunk per pace x client_chunk at most (client_pace)
+    pace_kw: dict | None = None  # its ChunkPacer's settings (alpha, alpha_last, reserve_ms, phase_ms, min_gap_ms)
     pacer: object | None = None  # streaming.ChunkPacer: the paced front's sends as the engine's audio reaches it
     pace_due: float | None = None  # when its next chunk goes out (None: no complete chunk queued)
     pace_dry: float | None = None  # when it needs a chunk not produced yet (dry_at)
@@ -222,8 +223,9 @@ class VoxCPM2Engine(LLMEngineBase):
         if p.pacer is None:
             from nanovllm_voxcpm.streaming import ChunkPacer
 
-            p.pacer = ChunkPacer(int(round(p.client_chunk * _PCM_RATE)), _PCM_RATE, alpha=p.pace,
-                                 reserve_ms=self.client_pace_reserve * 1000, alpha_last=self.client_pace_last)
+            kw = p.pace_kw or {"alpha": p.pace, "reserve_ms": self.client_pace_reserve * 1000,
+                               "alpha_last": self.client_pace_last}
+            p.pacer = ChunkPacer(int(round(p.client_chunk * _PCM_RATE)), _PCM_RATE, **kw)
         p.pacer.push(_PATCH_PCM if pcm is None else pcm, now)
         p.pace_due = p.pacer.due()
         self._pace_sync(p, now)
@@ -562,7 +564,7 @@ class VoxCPM2Engine(LLMEngineBase):
         text_tokens: list[int] | None = None,
         resume: bool = False,
         client_chunk_ms: float | None = None,
-        client_pace: float | None = None,
+        client_pace: float | dict | None = None,
     ) -> Sequence[VoxCPM2SeqPayload]:
         """voice / clone_mode: a registered voice in "prompt_ref" (reference + continuation, the default with a
         transcript), "ref" (the default without one) or "prompt" mode, in place of latents and prompt_text.
@@ -571,8 +573,9 @@ class VoxCPM2Engine(LLMEngineBase):
         resume: a head start's continuation (internal): it keeps the head's stream and is queued first.
         client_chunk_ms: the request's client gets its audio in chunks of this many ms, the rest held back until the
         next chunk (e.g. 128: 4096 bytes of 16 kHz PCM16); the engine's deadlines allow for it. None:
-        TurboConfig.client_chunk_ms; 0: every patch reaches the client whole. client_pace: its front paces the chunks
-        (TurboConfig.client_pace, the default); 0: not paced.
+        TurboConfig.client_chunk_ms; 0: every patch reaches the client whole. client_pace: its front paces the chunks,
+        alpha (TurboConfig.client_pace, the default; client_pace_last and _reserve_ms the rest) or the front's own
+        ChunkPacer settings (a dict: alpha, alpha_last, reserve_ms, phase_ms, min_gap_ms); 0: not paced.
         Returns the queued sequence (the head, with head start)."""
         if max_generate_length < 1:
             raise ValueError(f"max_generate_length must be >= 1, got {max_generate_length}")
@@ -622,6 +625,7 @@ class VoxCPM2Engine(LLMEngineBase):
                 chain["stage_len"] = len(head_ids)  # the text the head holds (its continuation may reuse its KV)
                 if self.head_patches_max > self.head_patches and self.step_cost is not None:
                     pace = self.client_pace if client_pace is None else client_pace
+                    pace = float(pace.get("alpha", 0.0)) if isinstance(pace, dict) else pace
                     chunked = (self.client_chunk if client_chunk_ms is None else client_chunk_ms) > 0
                     patches = min(self._plan_head(cont, pace if chunked else 0.0), max_generate_length - 1)
                 head = self.add_request(seq_id, target_text, prompt_text, prompt_latents, ref_audio_latents,
@@ -723,7 +727,11 @@ class VoxCPM2Engine(LLMEngineBase):
         )
         seq.custom_payload.client_chunk = (self.client_chunk if client_chunk_ms is None
                                            else max(float(client_chunk_ms), 0.0) / 1000)
-        seq.custom_payload.pace = self.client_pace if client_pace is None else max(float(client_pace), 0.0)
+        cp = self.client_pace if client_pace is None else client_pace
+        if isinstance(cp, dict):  # the front's own pacer settings: the engine runs the very same pacer
+            seq.custom_payload.pace_kw = {k: v for k, v in cp.items() if v is not None or k == "reserve_ms"}
+            cp = cp.get("alpha", 0.0)
+        seq.custom_payload.pace = max(float(cp), 0.0)
         if seq.custom_payload.pace > 0 and seq.custom_payload.client_chunk > 0:
             self._paced = True  # (a paced stream: step() keeps the pacers' sends from now on)
         seq.has_stream = resume  # a continuation carries on the head's stream (VAE state): ahead of new requests

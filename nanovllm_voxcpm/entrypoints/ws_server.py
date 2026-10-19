@@ -16,11 +16,16 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
 - dialect: a name RoutedDialectTTS routes (--dialect: the default). The seed is the text's CRC32 (the same text, the
   same audio).
 - Pacing (default; --no-pace sends each chunk the moment it is complete): streaming.ChunkPacer per utterance, the
-  first chunk at once, the next ones on a grid of --pace-alpha x a chunk's audio (--pace-alpha-last for the last
-  chunk queued), more than --pace-reserve-ms queued at once, the rest at the end at once. The engine is told the
-  chunk's length (stream's chunk_ms) so that its deadlines allow for what the server holds back.
+  first chunk at once, the next ones on a grid of --pace-alpha (0.9) x a chunk's audio (--pace-alpha-last, 0.92,
+  for the last chunk queued), more than --pace-reserve-ms queued and the rest at the end sooner (at least
+  --pace-min-gap-ms, 8, apart: an end flushed at once held both event loops for 6-7 ms at 200 streams); the chunk
+  after the first (or a late one) up to --pace-spread-ms sooner, a different amount per utterance. One task sends
+  every connection's due chunks as whole frames (StreamSender). A gap stays 10-13 ms under the shortest average
+  chunk (124.4 ms with 4096-byte chunks of 16 kHz): the event loops of both sides (the client's too) delayed
+  chunks by up to ~10 ms at 150-200 streams. The engine is told the chunk's length (stream's chunk_ms) so that its
+  deadlines allow for what the server holds back; the pace runs 1/0.9 as fast as real time.
 - Two processes (default; --procs 1: one): the connections and their pacers run in a process of their own, the
-  engine's client (RoutedDialectTTS) in this one, the audio crossing over a socket pair. At 200 streams the client's
+  engine's client (RoutedDialectTTS) in this one, the audio crossing over socket pairs. At 200 streams the client's
   event loop is busy 10-20 ms after every engine step (a patch of every stream at once), and a paced chunk due
   meanwhile went out that much late: a stall where the server had the audio.
 """
@@ -53,6 +58,15 @@ def ws_frame(opcode: int, payload: bytes) -> bytes:
     if n < 65536:
         return struct.pack("!BBH", 0x80 | opcode, 126, n) + payload
     return struct.pack("!BBQ", 0x80 | opcode, 127, n) + payload
+
+
+def pacer_settings(p: ChunkPacer) -> dict | float:
+    """An utterance's pacer settings for the engine, which runs the same pacer (its deadlines); 0.0: not paced."""
+    if not p.alpha:
+        return 0.0
+    return {"alpha": p.alpha, "alpha_last": p.alpha_last,
+            "reserve_ms": None if p.reserve is None else p.reserve / p.bytes_per_s * 1000,
+            "phase_ms": p.phase * 1000, "min_gap_ms": p.min_gap * 1000}
 
 
 def pcm16(y: np.ndarray) -> bytes:
@@ -125,7 +139,9 @@ class Server:
         self.log = open(args.log, "a") if args.log else None
         self.conn = 0
         # paced chunks of every connection from one task (StreamSender), written to the transports as whole frames
-        self.sender = StreamSender() if args.pace and getattr(args, "batch_sends", True) else None
+        self.sender = (StreamSender(getattr(args, "send_window_ms", 0.0) / 1000)
+                       if args.pace and getattr(args, "batch_sends", True) else None)
+        self.utterances = 0
 
     def pacer(self, n: int, rate: int, chars: int) -> ChunkPacer:
         a = self.args
@@ -133,8 +149,11 @@ class Server:
             return ChunkPacer(n, 2 * rate, alpha=0.0, reserve_ms=None)
         expect = a.expect_per_char * chars if a.expect_per_char > 0 else None
         unit = max(2, round(FRAME_S * rate) * 2)  # the engine's audio comes in 40 ms frames
+        self.utterances += 1  # each its own phase in [0, --pace-spread-ms) (golden-ratio sequence)
+        phase = getattr(a, "pace_spread_ms", 0.0) * ((self.utterances * 0.6180339887) % 1.0)
         return ChunkPacer(n, 2 * rate, a.pace_alpha, a.pace_reserve_ms if a.pace_reserve_ms >= 0 else None,
-                          expect_s=expect, margin_ms=a.pace_margin_ms, unit_bytes=unit, alpha_last=a.pace_alpha_last)
+                          expect_s=expect, margin_ms=a.pace_margin_ms, unit_bytes=unit, alpha_last=a.pace_alpha_last,
+                          phase_ms=phase, min_gap_ms=getattr(a, "pace_min_gap_ms", 0.0))
 
     async def handler(self, ws):
         u = urlparse(ws.request.path)
@@ -199,7 +218,7 @@ class Server:
         pacer = self.pacer(n, rate, len(text))
         # the engine runs the same pacer (chunk_ms, pace: its deadlines are the pacer's)
         req = dict(text=text, dialect=cfg["dialect"], voice=cfg["voice"], cfg_value=cfg["cfg_value"], rate=rate,
-                   chunk_ms=n / (2 * rate) * 1000, pace=pacer.alpha, segmenting=cfg["segmenting"])
+                   chunk_ms=n / (2 * rate) * 1000, pace=pacer_settings(pacer), segmenting=cfg["segmenting"])
         yields, sends = [], []
         stream = ChunkStream(pacer)
         stop = self.feed(req, yields, stream)
@@ -254,14 +273,17 @@ async def read_frame(reader: asyncio.StreamReader) -> tuple[int, int, bytes]:
     return kind, utt, await reader.readexactly(n) if n else b""
 
 
-async def serve_engine(tts, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, log=None) -> None:
+async def serve_engine(tts, reader: asyncio.StreamReader, writers, log=None) -> None:
     """The engine's side: START (an utterance's request, JSON) -> DATA frames, then END (or ERROR); CANCEL stops
-    one. Returns when the connections' side closes. log: a file, one jsonl line per utterance (perf_counter times:
+    one. Returns when the connections' side closes. writers: the link's sockets (a StreamWriter or a list): an
+    utterance's frames all go to writers[utt % len]. log: a file, one jsonl line per utterance (perf_counter times:
     the START frame read, the task started, the yields [t, samples, ms resampling, bytes])."""
     jobs: dict[int, asyncio.Task] = {}
+    writers = writers if isinstance(writers, list) else [writers]
 
     async def run(utt: int, req: dict, t_start: float):
         t_task, yields = time.perf_counter(), []
+        writer = writers[utt % len(writers)]
         try:
             async for out in speak(tts, req, yields if log is not None else None):
                 writer.write(frame(DATA, utt, out))
@@ -293,47 +315,60 @@ async def serve_engine(tts, reader: asyncio.StreamReader, writer: asyncio.Stream
 class EngineLink(asyncio.Protocol):
     """The connections' side of the two processes' link: each frame's audio goes straight into its utterance's
     ChunkStream as the bytes arrive (no task or queue per frame: after each engine step a patch of every stream
-    arrives at once). start(req, yields, stream) is a Feed."""
+    arrives at once). start(req, yields, stream) is a Feed. More sockets (``primary``: the first one's link, whose
+    utterances they share) carry more of a step's audio at once: a socket pair holds ~340 KB, a step of 200
+    streams ~1 MB, and the rest waited in the engine client until its event loop got round to the socket again
+    (the process hop's delay p99 7-9 ms at 200 at once)."""
 
-    def __init__(self):
+    def __init__(self, primary: "EngineLink | None" = None):
         loop = asyncio.get_running_loop()
-        self.ready, self.closed = loop.create_future(), loop.create_future()
         self.buf = bytearray()
-        self.sinks: dict[int, tuple[ChunkStream, list | None]] = {}
-        self.next_utt = 0
         self.transport = None
+        if primary is None:
+            self.ready, self.closed = loop.create_future(), loop.create_future()
+            self.sinks: dict[int, tuple[ChunkStream, list | None]] = {}
+            self.next_utt = 0
+        else:
+            self.ready, self.closed, self.sinks = primary.ready, primary.closed, primary.sinks
 
     def connection_made(self, transport):
         self.transport = transport
 
     def data_received(self, data: bytes) -> None:
-        self.buf += data
-        t, off, buf, size = time.perf_counter(), 0, self.buf, _HDR.size
-        while len(buf) - off >= size:
-            kind, utt, n = _HDR.unpack_from(buf, off)
-            if len(buf) - off - size < n:
-                break
-            payload = bytes(buf[off + size:off + size + n])
-            off += size + n
-            if kind == READY:
-                if not self.ready.done():
-                    self.ready.set_result(json.loads(payload))
-                continue
-            sink = self.sinks.get(utt)
-            if sink is None:
-                continue
-            stream, yields = sink
-            if kind == DATA:
-                if yields is not None:
-                    yields.append([t, 0, 0.0, len(payload)])
-                stream.push(payload, t)
-            else:
-                del self.sinks[utt]
-                if kind == END:
-                    stream.finish()
-                else:
-                    stream.fail(RuntimeError(payload.decode(errors="replace")))
-        del buf[:off]
+        """Frames parsed from views of the bytes as they came (no copy but the pacer's own): at 200 streams an
+        engine step's ~1 MB arrives at once, and every microsecond here delays the chunks waiting behind it."""
+        src = data
+        if self.buf:  # (the rest of a frame from the last read)
+            self.buf += data
+            src = self.buf
+        t, off, size, end = time.perf_counter(), 0, _HDR.size, len(src)
+        with memoryview(src) as mv:
+            while end - off >= size:
+                kind, utt, n = _HDR.unpack_from(src, off)
+                if end - off - size < n:
+                    break
+                payload = mv[off + size:off + size + n]
+                off += size + n
+                if kind == READY:
+                    if not self.ready.done():
+                        self.ready.set_result(json.loads(payload.tobytes()))
+                elif (sink := self.sinks.get(utt)) is not None:
+                    stream, yields = sink
+                    if kind == DATA:
+                        if yields is not None:
+                            yields.append([t, 0, 0.0, n])
+                        stream.push(payload, t)  # (the pacer copies it)
+                    else:
+                        del self.sinks[utt]
+                        if kind == END:
+                            stream.finish()
+                        else:
+                            stream.fail(RuntimeError(payload.tobytes().decode(errors="replace")))
+                payload.release()
+        if src is self.buf:
+            del self.buf[:off]
+        elif off < end:
+            self.buf += data[off:]
 
     def connection_lost(self, exc) -> None:
         for stream, _ in self.sinks.values():
@@ -432,9 +467,10 @@ async def main_one(args):
         await serve_ws(server, args, stop_signal(), lambda: announce(args))
 
 
-async def main_engine(args, sock, front_pid: int):
+async def main_engine(args, socks, front_pid: int):
     """--procs 2, this process: the engine's client, serving the connections' process."""
-    reader, writer = await asyncio.open_connection(sock=sock)
+    conns = [await asyncio.open_connection(sock=s) for s in socks]
+    reader, writer = conns[0]
     stop = stop_signal()
     try:
         tts = await load_tts(args)
@@ -446,7 +482,7 @@ async def main_engine(args, sock, front_pid: int):
             announce(args)
             lag = asyncio.create_task(lag_monitor(args.lag_log + ".engine")) if args.lag_log else None
             log = open(args.log + ".engine", "a", buffering=1) if args.log else None
-            engine = asyncio.create_task(serve_engine(tts, reader, writer, log))
+            engine = asyncio.create_task(serve_engine(tts, reader, [w for _, w in conns], log))
             await asyncio.wait([stop, engine], return_when=asyncio.FIRST_COMPLETED)
             engine.cancel()
             if lag is not None:
@@ -459,9 +495,12 @@ async def main_engine(args, sock, front_pid: int):
         await asyncio.to_thread(os.waitpid, front_pid, 0)
 
 
-async def main_front(args, sock):
+async def main_front(args, socks):
     """--procs 2, the connections' process."""
-    _, link = await asyncio.get_running_loop().create_connection(EngineLink, sock=sock)
+    loop = asyncio.get_running_loop()
+    _, link = await loop.create_connection(EngineLink, sock=socks[0])
+    for s in socks[1:]:
+        await loop.create_connection(lambda: EngineLink(link), sock=s)
     info = await link.ready  # once the engine is up
     if info is None:
         return
@@ -486,8 +525,8 @@ def cli():
     ap.add_argument("--default-voice", default=None, help="the voice of a connection that names none (default: the "
                                                           "first --voice; none: the model's own)")
     ap.add_argument("--no-pace", dest="pace", action="store_false", help="send each chunk the moment it is complete")
-    ap.add_argument("--pace-alpha", type=float, default=0.93, help="a paced gap, in chunks of audio")
-    ap.add_argument("--pace-alpha-last", type=float, default=0.95,
+    ap.add_argument("--pace-alpha", type=float, default=0.9, help="a paced gap, in chunks of audio")
+    ap.add_argument("--pace-alpha-last", type=float, default=0.92,
                     help="the pace of the last complete chunk queued (the server empty after it): the engine's next "
                          "audio has the longest to come")
     ap.add_argument("--pace-reserve-ms", type=float, default=1000.0, help="audio queued beyond this goes out at "
@@ -496,10 +535,18 @@ def cli():
     ap.add_argument("--expect-per-char", type=float, default=0.0,
                     help="> 0: an utterance lasts at least this x its characters (s): a slower pace's ratio for "
                          "short ones keeps their gaps under their shorter average chunk (ChunkPacer.ratio_for)")
+    ap.add_argument("--send-window-ms", type=float, default=0.0, help="paced chunks due within this go out together")
+    ap.add_argument("--pace-spread-ms", type=float, default=10.0,
+                    help="the chunk after the first (or a late one) goes out up to this much sooner, a different "
+                         "amount per utterance: streams that start together do not send on the same instants")
+    ap.add_argument("--pace-min-gap-ms", type=float, default=8.0,
+                    help="chunks sent ahead of the pace (above the reserve, the rest at the end) at least this far apart")
     ap.add_argument("--per-stream-sends", dest="batch_sends", action="store_false",
                     help="each connection sends its own paced chunks (default: one task sends every due chunk)")
     ap.add_argument("--procs", type=int, choices=(1, 2), default=2,
                     help="2: the connections in a process of their own (default), 1: on the engine client's loop")
+    ap.add_argument("--link-sockets", type=int, default=8, help="--procs 2: socket pairs between the two processes (an "
+                                                                    "engine step of 200 streams is ~1 MB of audio)")
     ap.add_argument("--no-uvloop", dest="uvloop", action="store_false", help="asyncio's own event loop even when "
                                                                               "uvloop is installed")
     ap.add_argument("--log", default=None, help="jsonl, one line per utterance: the engine's yields and the sends")
@@ -521,16 +568,24 @@ def cli():
         return
     import socket
 
-    a, b = socket.socketpair()
+    pairs = [socket.socketpair() for _ in range(args.link_sockets)]
     pid = os.fork()  # before the engine (CUDA, threads) starts: the connections' process
     if pid == 0:
-        a.close()
+        for a, _ in pairs:
+            a.close()
+        import gc
+
+        # what this process inherited (imports) out of the collector's reach: a full collection over it paused the
+        # connections' event loop for 29 ms at 150 at once, and paced chunks due meanwhile went out late
+        gc.collect()
+        gc.freeze()
         try:
-            asyncio.run(main_front(args, b), loop_factory=factory)
+            asyncio.run(main_front(args, [b for _, b in pairs]), loop_factory=factory)
         finally:
             os._exit(0)
-    b.close()
-    asyncio.run(main_engine(args, a, pid), loop_factory=factory)
+    for _, b in pairs:
+        b.close()
+    asyncio.run(main_engine(args, [a for a, _ in pairs], pid), loop_factory=factory)
 
 
 if __name__ == "__main__":

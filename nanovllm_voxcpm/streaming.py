@@ -46,7 +46,8 @@ class ChunkPacer:
 
     def __init__(self, chunk_bytes: int = 4096, bytes_per_s: float = 32000.0, alpha: float = 0.95,
                  reserve_ms: float | None = 1000.0, expect_s: float | None = None, margin_ms: float = 4.0,
-                 unit_bytes: int = 1, alpha_last: float | None = None):
+                 unit_bytes: int = 1, alpha_last: float | None = None, phase_ms: float = 0.0,
+                 min_gap_ms: float = 0.0):
         if chunk_bytes <= 0 or bytes_per_s <= 0 or not 0 <= alpha <= 1:
             raise ValueError("chunk_bytes and bytes_per_s must be positive, 0 <= alpha <= 1 (0: no pace)")
         self.chunk_bytes = chunk_bytes
@@ -63,6 +64,15 @@ class ChunkPacer:
         self._grid: float | None = None  # when the last chunk was due (None: no chunk sent yet)
         self._last_s = 0.0  # its audio, seconds
         self.sent = 0  # chunks sent
+        # the chunk after one sent off the grid (the first, or a late one) goes out this much sooner: streams that
+        # start (or are late) together then do not send on the same instants (a client reading 200 streams in one
+        # event loop timestamps the last of a burst several ms late); costs the server that much lead each time
+        self.phase = phase_ms / 1000
+        self._shift = 0.0
+        # chunks sent ahead of the grid (above the reserve, or what is left at the end) go out at least this far
+        # apart: at 200 streams, ends flushed at once (up to a second's chunks of each of a dozen streams) held the
+        # connections' event loop and the client's for 6-7 ms, and other streams' paced chunks came late
+        self.min_gap = min_gap_ms / 1000
 
     @staticmethod
     def ratio_for(expect_s: float, chunk_bytes: int = 4096, bytes_per_s: float = 32000.0, margin_ms: float = 4.0,
@@ -110,18 +120,20 @@ class ChunkPacer:
         # the last complete chunk queued (the server is empty after it): as late as the pace allows (alpha_last),
         # the engine's next audio has the most time to come
         a = self.alpha_last if n < 2 * self.chunk_bytes and self._ended is None else self.alpha
-        t = self._grid + a * self._last_s
+        t = self._grid + a * self._last_s - self._shift
         if self._ended is not None:  # what is left goes out at once
             t = min(t, self._ended)
         if self.reserve is not None and n > self.chunk_bytes + self.reserve:  # more than the reserve behind it
             t = min(t, self._arrival(self._base + self.chunk_bytes + self.reserve + 1))
-        return max(ready, t)
+        return max(ready, t, self._grid + self.min_gap)
 
     def pop(self) -> bytes:
         """Take the next chunk (call once ``due`` has passed); the grid moves to when it was due."""
         t = self.due()
         if t is None:
             raise RuntimeError("no chunk is due")
+        on_grid = self._grid is not None and t <= self._grid + self.alpha_last * self._last_s - self._shift + 1e-9
+        self._shift = 0.0 if on_grid else self.phase
         k = min(self.chunk_bytes, len(self._buf))
         out = bytes(self._buf[:k])
         del self._buf[:k]
@@ -214,6 +226,7 @@ class StreamSender:
         self.window, self.clock = window_s, clock
         self._streams: dict[int, tuple[ChunkStream, Callable[[bytes], None], asyncio.Future]] = {}
         self._queued: dict[int, float] = {}  # the due time each stream is queued with
+        self._ending: set[int] = set()  # streams done or failed, to be finished
         self._heap: list[tuple[float, int]] = []
         self._next = 0
         self._wake = asyncio.Event()
@@ -243,6 +256,7 @@ class StreamSender:
             return
         stream, _, fut = item
         if stream._failed is not None or stream.pacer.done:
+            self._ending.add(sid)
             self._wake.set()  # (finished in _run)
             return
         due = stream.pacer.due()
@@ -254,7 +268,14 @@ class StreamSender:
             self._wake.set()
 
     def _finish_done(self) -> None:
-        for sid, (stream, _, fut) in list(self._streams.items()):
+        """Only the streams _update saw end: scanning every stream on every pass was a third of the connections'
+        process's busy time at 200 at once (cProfile)."""
+        while self._ending:
+            sid = self._ending.pop()
+            item = self._streams.get(sid)
+            if item is None:
+                continue
+            stream, _, fut = item
             if stream._failed is not None or stream.pacer.done:
                 del self._streams[sid]
                 self._queued.pop(sid, None)

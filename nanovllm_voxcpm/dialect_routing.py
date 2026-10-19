@@ -214,7 +214,7 @@ class RoutedDialectTTS:
     async def stream(self, text: str, dialect: str | None = None, voice: str | None = None, *,
                      clone_mode: str | None = None, seed: int | None = None, cfg_value: float = 2.0,
                      max_patches: int = 600, normalize: bool = True,
-                     chunk_ms: float | None = None, pace: float | None = None) -> AsyncIterator[np.ndarray]:
+                     chunk_ms: float | None = None, pace: float | dict | None = None) -> AsyncIterator[np.ndarray]:
         """As DialectTTS.stream, through the adapter, or the tagged adapter and tag, that ``dialect`` routes to."""
         r = self.route(dialect)
         if normalize:

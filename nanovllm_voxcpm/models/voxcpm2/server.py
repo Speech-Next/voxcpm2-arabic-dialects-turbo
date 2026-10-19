@@ -151,7 +151,7 @@ class VoxCPM2ServerImpl:
         voice: str | None = None,
         clone_mode: str | None = None,
         client_chunk_ms: float | None = None,
-        client_pace: float | None = None,
+        client_pace: float | dict | None = None,
     ) -> None:
         extra = {k: v for k, v in (("client_chunk_ms", client_chunk_ms), ("client_pace", client_pace))
                  if v is not None}  # (None: the engine's default)
@@ -972,7 +972,7 @@ class AsyncVoxCPM2Server:
         voice: str | None = None,
         clone_mode: str | None = None,
         client_chunk_ms: float | None = None,
-        client_pace: float | None = None,
+        client_pace: float | dict | None = None,
     ) -> AsyncGenerator[Waveform, None]:
         seq_id = gen_uuid()
         self.stream_table[seq_id] = asyncio.Queue()
@@ -1127,7 +1127,7 @@ class AsyncVoxCPM2ServerPool:
         voice: str | None = None,
         clone_mode: str | None = None,
         client_chunk_ms: float | None = None,
-        client_pace: float | None = None,
+        client_pace: float | dict | None = None,
     ):
         if prompt_id is not None:
             if prompt_id not in self._prompt_pool:

@@ -79,7 +79,8 @@ def test_protocol_chunks_and_end(pace):
     assert sum(map(len, chunks)) == total
     assert all(len(c) == 4096 for c in chunks[:-1]) and 0 < len(chunks[-1]) <= 4096
     assert tts.calls[0][1:3] == ("egyptian", "default") and tts.calls[0][3]["chunk_ms"] == 128.0
-    assert tts.calls[0][3]["pace"] == (0.95 if pace else 0.0)  # the engine runs the same pacer
+    sent = tts.calls[0][3]["pace"]  # the engine runs the same pacer
+    assert (sent["alpha"] == 0.95 and sent["reserve_ms"] == pytest.approx(1000.0)) if pace else sent == 0.0
 
 
 def test_control_dialect_and_json_base64():
@@ -170,10 +171,12 @@ def test_through_the_two_processes_link():
         from websockets.asyncio.client import connect
         from websockets.asyncio.server import serve
 
-        sa, sb = socket.socketpair()
-        ra, wa = await asyncio.open_connection(sock=sa)
-        engine = asyncio.create_task(serve_engine(tts, ra, wa))
-        tb, link = await asyncio.get_running_loop().create_connection(EngineLink, sock=sb)
+        pairs = [socket.socketpair() for _ in range(3)]  # utterances striped over 3 sockets
+        conns = [await asyncio.open_connection(sock=a) for a, _ in pairs]
+        engine = asyncio.create_task(serve_engine(tts, conns[0][0], [w for _, w in conns]))
+        loop = asyncio.get_running_loop()
+        tb, link = await loop.create_connection(EngineLink, sock=pairs[0][1])
+        others = [(await loop.create_connection(lambda: EngineLink(link), sock=b))[0] for _, b in pairs[1:]]
         async with serve(Server({"default"}, link.start, args()).handler, "127.0.0.1", 0) as s:
             port = s.sockets[0].getsockname()[1]
             url = f"ws://127.0.0.1:{port}/api/tts/stream?chunk_size=4096"
@@ -192,6 +195,8 @@ def test_through_the_two_processes_link():
                     break
                 await asyncio.sleep(0.01)
         tb.close()
+        for t in others:
+            t.close()
         await asyncio.wait_for(engine, 2)
         return msgs
 

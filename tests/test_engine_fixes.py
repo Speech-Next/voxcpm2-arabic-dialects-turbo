@@ -954,6 +954,12 @@ def test_a_paced_front_s_send_clock_is_the_deadline():
     unpaced = eng.add_request("q", _words(2), max_generate_length=4, head_start=False, client_chunk_ms=128)
     eng.step()
     assert unpaced.custom_payload.pacer is None  # (pace 0: the real-time player from the first chunk)
+    own = eng.add_request("o", _words(2), max_generate_length=4, head_start=False, client_chunk_ms=128,
+                          client_pace={"alpha": 0.9, "alpha_last": 0.92, "reserve_ms": 1000.0, "phase_ms": 0.0,
+                                       "min_gap_ms": 8.0})  # (the front's own pacer settings, ws_server's)
+    eng.step()
+    pacer = own.custom_payload.pacer
+    assert (pacer.alpha, pacer.alpha_last, pacer.min_gap) == (0.9, 0.92, pytest.approx(0.008))
 
 
 def test_a_paced_stream_s_leading_silence_goes_out_when_its_front_would_run_dry():

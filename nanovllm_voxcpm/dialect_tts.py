@@ -294,7 +294,7 @@ class DialectTTS:
     async def stream(self, text: str, dialect: str | None = None, voice: str | None = None, *,
                      clone_mode: str | None = None, seed: int | None = None, cfg_value: float = 2.0,
                      max_patches: int = 600, normalize: bool = True,
-                     chunk_ms: float | None = None, pace: float | None = None) -> AsyncIterator[np.ndarray]:
+                     chunk_ms: float | None = None, pace: float | dict | None = None) -> AsyncIterator[np.ndarray]:
         """Audio chunks (float32 in [-1, 1], ``sample_rate``) of ``text`` in ``dialect`` (None: the base model),
         cloning ``voice`` (None: no cloning). max_patches: at most this many 160 ms patches. normalize: Arabic text
         read as the model was trained on it (read_as: digits, dates, times, amounts as words; formal when the dialect,
