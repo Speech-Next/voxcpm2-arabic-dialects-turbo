@@ -262,32 +262,20 @@ async def serve_engine(tts, reader: asyncio.StreamReader, writer: asyncio.Stream
     one. Returns when the connections' side closes. log: a file, one jsonl line per utterance (perf_counter times:
     the START frame read, the task started, the yields [t, samples, ms resampling, bytes])."""
     jobs: dict[int, asyncio.Task] = {}
-    pending: list[bytes] = []  # frames of this event-loop turn: one write (an engine step hands over every stream)
-    loop = asyncio.get_running_loop()
-
-    def flush():
-        data = b"".join(pending)
-        pending.clear()
-        writer.write(data)
-
-    def send(data: bytes):
-        if not pending:
-            loop.call_soon(flush)
-        pending.append(data)
 
     async def run(utt: int, req: dict, t_start: float):
         t_task, yields = time.perf_counter(), []
         try:
             async for out in speak(tts, req, yields if log is not None else None):
-                send(frame(DATA, utt, out))
-            send(frame(END, utt))
+                writer.write(frame(DATA, utt, out))
+            writer.write(frame(END, utt))
             if log is not None:
                 log.write(json.dumps({"utt": utt, "crc": zlib.crc32(req["text"].encode()), "t_start": t_start,
                                       "t_task": t_task, "yields": yields, "t_end": time.perf_counter()}) + "\n")
         except asyncio.CancelledError:
             pass
         except Exception as e:  # noqa: BLE001 - the client hears why
-            send(frame(ERROR, utt, repr(e).encode()))
+            writer.write(frame(ERROR, utt, repr(e).encode()))
         finally:
             jobs.pop(utt, None)
 
