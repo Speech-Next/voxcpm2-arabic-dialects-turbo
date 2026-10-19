@@ -60,8 +60,11 @@ async def rechunk(source: AsyncIterator[bytes], n: int) -> AsyncIterator[bytes]:
 
 
 class Server:
-    def __init__(self, tts, args):
-        self.tts, self.args = tts, args
+    """The connections' handler. engine_loop: the event loop the engine's client runs on, when the connections run
+    on another one (a thread of their own: the paced sends then wait for a busy engine loop no longer)."""
+
+    def __init__(self, tts, args, engine_loop: asyncio.AbstractEventLoop | None = None):
+        self.tts, self.args, self.engine_loop = tts, args, engine_loop
         self.log = open(args.log, "a") if args.log else None
         self.conn = 0
 
@@ -161,10 +164,39 @@ class Server:
                 yields.append([time.perf_counter(), 0, 0.0, len(out)])
                 yield out
 
-        async for b in self.chunker(pcm(), n, rate, len(text)):
-            await (ws.send(json.dumps({"type": "audio_chunk", "chunk_data": base64.b64encode(b).decode()}))
-                   if b64 else ws.send(b))
-            sends.append([time.perf_counter(), len(b)])
+        loop, job = asyncio.get_running_loop(), None
+        if self.engine_loop is None or self.engine_loop is loop:
+            source = pcm()
+        else:  # the engine's audio from its loop
+            q: asyncio.Queue = asyncio.Queue()
+
+            async def produce():
+                gen = pcm()
+                try:
+                    async for out in gen:
+                        loop.call_soon_threadsafe(q.put_nowait, out)
+                    loop.call_soon_threadsafe(q.put_nowait, None)
+                except BaseException as e:  # noqa: BLE001 - passed on to the connection
+                    loop.call_soon_threadsafe(q.put_nowait, e)
+                    raise
+                finally:
+                    await gen.aclose()
+
+            async def bridged():
+                while (x := await q.get()) is not None:
+                    if isinstance(x, BaseException):
+                        raise x
+                    yield x
+
+            job, source = asyncio.run_coroutine_threadsafe(produce(), self.engine_loop), bridged()
+        try:
+            async for b in self.chunker(source, n, rate, len(text)):
+                await (ws.send(json.dumps({"type": "audio_chunk", "chunk_data": base64.b64encode(b).decode()}))
+                       if b64 else ws.send(b))
+                sends.append([time.perf_counter(), len(b)])
+        finally:
+            if job is not None:
+                job.cancel()  # the client gone: the engine request ends
         await ws.send(json.dumps({"type": "end_of_audio"}))
         if self.log is not None:  # perf_counter (CLOCK_MONOTONIC) times: comparable with the engine's profiles
             # yields: [t, samples from the engine, ms resampling, bytes out]; sends: [t after the send, bytes]
@@ -209,23 +241,81 @@ async def main(args):
         if args.default_voice is None and args.voice:
             args.default_voice = args.voice[0].partition("=")[0]
         await tts.synthesize("أهلاً بيك، إزيك النهارده؟", dialect=args.dialect, voice=args.default_voice)  # warm up
-        server = Server(tts, args)
-        lag = asyncio.create_task(lag_monitor(args.lag_log)) if args.lag_log else None
-        async with serve(server.handler, args.host, args.port, max_size=None, compression=None, ping_interval=None,
-                         max_queue=None) as ws_server:
-            if args.ready:
-                with open(args.ready, "w") as f:
-                    f.write(str(os.getpid()))
-            print(f"[ws_server] ws://{args.host}:{args.port}{PATH} ready (pacing "
-                  f"{'alpha %.2f, reserve %g ms' % (args.pace_alpha, args.pace_reserve_ms) if args.pace else 'off'})",
-                  flush=True)
-            stop = asyncio.get_running_loop().create_future()
-            for sig in (signal.SIGTERM, signal.SIGINT):  # close the engine (its process holds the GPU) on the way out
-                asyncio.get_running_loop().add_signal_handler(sig, lambda: stop.done() or stop.set_result(None))
-            await stop
-            ws_server.close()
-        if lag is not None:
-            lag.cancel()
+        if args.sender_thread:
+            await serve_in_thread(tts, args)
+        else:
+            server = Server(tts, args)
+            lag = asyncio.create_task(lag_monitor(args.lag_log)) if args.lag_log else None
+            async with serve(server.handler, args.host, args.port, max_size=None, compression=None,
+                             ping_interval=None, max_queue=None) as ws_server:
+                announce(args)
+                await stopped()
+                ws_server.close()
+            if lag is not None:
+                lag.cancel()
+
+
+def announce(args):
+    if args.ready:
+        with open(args.ready, "w") as f:
+            f.write(str(os.getpid()))
+    print(f"[ws_server] ws://{args.host}:{args.port}{PATH} ready (pacing "
+          f"{'alpha %.2f, reserve %g ms' % (args.pace_alpha, args.pace_reserve_ms) if args.pace else 'off'}"
+          f"{', connections in a thread of their own' if args.sender_thread else ''})", flush=True)
+
+
+async def stopped():
+    """Until SIGTERM / SIGINT (then the engine is closed: its process holds the GPU)."""
+    stop = asyncio.get_running_loop().create_future()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        asyncio.get_running_loop().add_signal_handler(sig, lambda: stop.done() or stop.set_result(None))
+    await stop
+
+
+async def serve_in_thread(tts, args):
+    """The connections (and their paced sends) on an event loop in a thread of their own, the engine's client on
+    this one: a burst of the engine's outputs (a step's patches for every stream) keeps this loop busy for 10-30 ms
+    at 200 streams, which delayed sends due meanwhile past the chunk's audio. The GIL is handed over within
+    --switch-interval-ms."""
+    import sys
+    import threading
+
+    from websockets.asyncio.server import serve
+
+    sys.setswitchinterval(args.switch_interval_ms / 1000)
+    engine_loop = asyncio.get_running_loop()
+    server = Server(tts, args, engine_loop)
+    started, box = threading.Event(), {}
+
+    def run():
+        async def body():
+            box["loop"], box["stop"] = asyncio.get_running_loop(), asyncio.get_running_loop().create_future()
+            lag = asyncio.create_task(lag_monitor(args.lag_log)) if args.lag_log else None
+            async with serve(server.handler, args.host, args.port, max_size=None, compression=None,
+                             ping_interval=None, max_queue=None) as ws_server:
+                started.set()
+                await box["stop"]
+                ws_server.close()
+            if lag is not None:
+                lag.cancel()
+
+        try:
+            asyncio.run(body())
+        finally:
+            started.set()
+
+    th = threading.Thread(target=run, name="ws-connections", daemon=True)
+    th.start()
+    await asyncio.to_thread(started.wait)
+    if "stop" not in box:
+        raise RuntimeError("the connections' thread did not start")
+    lag = asyncio.create_task(lag_monitor(args.lag_log + ".engine")) if args.lag_log else None
+    announce(args)
+    await stopped()
+    box["loop"].call_soon_threadsafe(lambda: box["stop"].done() or box["stop"].set_result(None))
+    await asyncio.to_thread(th.join, 30)
+    if lag is not None:
+        lag.cancel()
 
 
 def cli():
@@ -250,6 +340,9 @@ def cli():
     ap.add_argument("--expect-per-char", type=float, default=0.0,
                     help="> 0: an utterance lasts at least this x its characters (s): a slower pace's ratio for "
                          "short ones keeps their gaps under their shorter average chunk (ChunkPacer.ratio_for)")
+    ap.add_argument("--same-loop", dest="sender_thread", action="store_false",
+                    help="connections on the engine client's event loop (default: a thread of their own)")
+    ap.add_argument("--switch-interval-ms", type=float, default=1.0, help="with the thread: the GIL's switch interval")
     ap.add_argument("--log", default=None, help="jsonl, one line per utterance: the engine's yields and the sends")
     ap.add_argument("--lag-log", default=None, help="jsonl: the event loop's lag once a second")
     ap.add_argument("--ready", default=None, help="a file written once the server accepts connections")
