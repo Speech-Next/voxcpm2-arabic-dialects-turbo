@@ -548,7 +548,7 @@ class _FakeRunner:
 
     def call(self, name, *args):
         if name == "run":
-            tasks, is_prefill = args
+            tasks, is_prefill = args[:2]
             if self.overlap_hook is not None:
                 self.overlap_hook()
             for t in tasks:
@@ -585,6 +585,29 @@ def _run(engine, max_steps=50):
             return
         engine.step()
     raise AssertionError("engine did not finish")
+
+
+def test_only_a_prefill_step_of_new_streams_is_a_first_patch_step():
+    """The runner's first_patch (the first patch's LocDiT settings, TurboConfig.dit_first_t_span): a prefill step of
+    new streams only; a step that resumes a stream (a preempted one, a continuation) or decodes running ones is not."""
+    eng = _Engine(stop_at=4)
+    firsts = []
+    call = eng.model_runner.call
+
+    def record(name, *args):
+        if name == "run":
+            firsts.append((args[1], args[2]))
+        return call(name, *args)
+
+    eng.model_runner.call = record
+    for i in range(2):
+        eng.add_sequence(_seq(f"s{i}", [i + 1]))
+    eng.step()  # the two new streams' prefill
+    eng.step()  # a decode step
+    resumed = eng.scheduler.running.pop()
+    eng.scheduler.preempt(resumed)
+    eng.step()  # the preempted stream resumes: a prefill step, not a first patch
+    assert firsts == [(True, True), (False, False), (True, False)]
 
 
 def test_cancel_during_a_step_runs_after_it():
@@ -904,6 +927,24 @@ def test_the_buffer_leaves_out_what_the_front_holds_back():
     assert eng.stream_buffer(seq) == pytest.approx(0.936, abs=0.01)
     p.streamed = 0.64  # five whole chunks: nothing held back
     assert eng.stream_buffer(seq) == pytest.approx(1.0, abs=0.01)
+
+
+def test_intermediate_stages_are_not_first_patch_steps():
+    """#31's intermediate stages resume their stream, as continuations do: the first patch's LocDiT settings
+    (first_patch) are only for the heads' prefill."""
+    eng = _staged(0.032, mid_tokens=(16, 32))
+    eng.head_patches_max = 3
+    firsts, call = [], eng.model_runner.call
+
+    def record(name, *args):
+        if name == "run" and args[1]:
+            firsts.append((tuple(t.seq_id for t in args[0]), len(args[0][0].custom_payload.text_tokens), args[2]))
+        return call(name, *args)
+
+    eng.model_runner.call = record
+    eng.add_request("r", _words(40), max_generate_length=60)
+    _run(eng, 120)
+    assert [f[2] for f in firsts] == [True, False, False, False]  # the head; two stages; the whole continuation
 
 
 def test_a_cancelled_continuation_frees_the_block_it_would_copy():

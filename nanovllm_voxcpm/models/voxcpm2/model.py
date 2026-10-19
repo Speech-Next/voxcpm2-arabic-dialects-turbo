@@ -761,6 +761,13 @@ class VoxCPM2Model(nn.Module):
     def set_first_patch(self, enabled: bool) -> None:
         self.feat_decoder.first_patch = enabled
 
+    def first_patch_differs(self) -> bool:
+        """The first patch's LocDiT solve differs from the others' (dit_first_t_span, first_steps, first_cfg_steps)."""
+        d = self.feat_decoder
+        own_grid = d.first_t_span_override is not None and not (
+            d.t_span_override is not None and torch.equal(d.first_t_span_override, d.t_span_override))
+        return own_grid or d.first_steps != d.inference_timesteps or d.first_cfg_steps != d.cfg_steps
+
     def forward_diffusion(
         self,
         mu: torch.Tensor,
@@ -797,7 +804,8 @@ class VoxCPM2Model(nn.Module):
         z_noise: torch.Tensor | None = None,
         **enc_inputs,
     ):
-        self.set_first_patch(get_context().is_prefill)
+        context = get_context()
+        self.set_first_patch(context.is_prefill and context.first_patch)
         diffusion_inputs, outputs = self.forward_backbone(
             positions=positions,
             text_tokens=text_tokens,

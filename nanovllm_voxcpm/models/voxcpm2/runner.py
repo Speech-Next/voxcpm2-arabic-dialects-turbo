@@ -14,6 +14,7 @@ from nanovllm_voxcpm.engine.model_runner import BaseModelRunner, HostPack, Runne
 from nanovllm_voxcpm.layers.audio_vae_v2 import AudioVAEV2
 from nanovllm_voxcpm.models.voxcpm2.config import VoxCPM2Config
 from nanovllm_voxcpm.models.voxcpm2.model import VoxCPM2Model
+from nanovllm_voxcpm.utils.context import get_context
 from nanovllm_voxcpm.utils.loader import load_model, load_state_dict_into
 from nanovllm_voxcpm.utils.profile import StepProfile
 from nanovllm_voxcpm.utils.seed import _UINT64_MASK, derive_step_seed, derive_step_seeds
@@ -50,8 +51,10 @@ _TRACE_PATH = os.environ.get("NANOVLLM_KERNEL_TRACE")
 _trace_seen = [0]
 
 
-def _kernel_trace(is_prefill: bool, bs: int):
+def _kernel_trace(is_prefill: bool, bs: int, tokens: int = 0):
     if not _TRACE_PATH or not is_prefill or bs < int(os.environ.get("NANOVLLM_KERNEL_TRACE_MIN_BS", "128")):
+        return None
+    if tokens > int(os.environ.get("NANOVLLM_KERNEL_TRACE_MAX_TOKENS", "1000000000")):  # e.g. heads only
         return None
     _trace_seen[0] += 1
     skip = int(os.environ.get("NANOVLLM_KERNEL_TRACE_SKIP", "2"))
@@ -359,8 +362,14 @@ class VoxCPM2Runner(BaseModelRunner):
         return lambda views: {"enc_pos": views[i_pos], "enc_rows": views[i_rows], "enc_miss": views[i_miss],
                               "enc_cache": self._enc_cache}
 
-    def run(self, seqs: list[RunnerTask[VoxCPM2Payload]], is_prefill: bool):
-        trace = _kernel_trace(is_prefill, len(seqs))
+    _first_patch = True  # this prefill step's Context.first_patch (run's first_patch)
+
+    def run(self, seqs: list[RunnerTask[VoxCPM2Payload]], is_prefill: bool, first_patch: bool = True):
+        """first_patch: a prefill step whose sequences all start their stream (the engine's step: no resumed stream,
+        no decode riding along); its LocDiT solves with the first patch's settings."""
+        self._first_patch = first_patch
+        trace = _kernel_trace(is_prefill, len(seqs), sum(len(t.custom_payload.text_tokens) for t in seqs)
+                              if _TRACE_PATH and is_prefill else 0)
         if trace is None:
             return self._run(seqs, is_prefill)
         with trace:
@@ -540,6 +549,8 @@ class VoxCPM2Runner(BaseModelRunner):
     def _run_with_inputs(self, seqs, inputs, is_prefill, prof):
         if prof.enabled:
             prof.rec["tokens"] = int(inputs["text_tokens"].numel())
+        if is_prefill:
+            get_context().first_patch = self._first_patch
         prof.mark("prep")
 
         outputs = self.run_model(inputs, is_prefill)

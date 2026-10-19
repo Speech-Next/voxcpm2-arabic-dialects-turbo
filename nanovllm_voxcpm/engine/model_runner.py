@@ -382,7 +382,7 @@ class BaseModelRunner:
     ) -> torch.Tensor:
         raise NotImplementedError()
 
-    def run(self, seqs: list[RunnerTask], is_prefill: bool):
+    def run(self, seqs: list[RunnerTask], is_prefill: bool, first_patch: bool = True):
         raise NotImplementedError()
 
     def _dit_lora_sequence_length(self) -> int:
@@ -1245,36 +1245,46 @@ class BaseModelRunner:
                 )
             },
         }
+        # graphs of the first patch's LocDiT solve ("base" / "lora"); when the first patch has settings of its own
+        # (dit_first_t_span, first_steps), also of the others' ("rest_base" / "rest_lora"), for prefill steps that
+        # resume streams or decode running ones (Context.first_patch False)
         self.prefill_diffusion_graphs: dict[str, dict[int, torch.cuda.CUDAGraph]] = {"base": {}, "lora": {}}
         capture_lora_graphs = bool(
             self._config.lora_config is not None
             and getattr(self._config.lora_config, "enable_dit", False)
             and is_lora_available()
         )
+        differs = getattr(self.model, "first_patch_differs", None)
+        firsts = [True, False] if callable(differs) and differs() else [True]
 
-        for bs in reversed(self.graph_bs):
-            dit_rows = dit_rows_per_sample * bs
-            base_context = build_lora_context_from_slot_list([-1] * dit_rows)
-            self._set_graph_lora_context(graph_vars, DIT_LORA_DOMAIN, base_context)
-            outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
-
-            base_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(base_graph, self.graph_pool):
-                outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
-            self.prefill_diffusion_graphs["base"][bs] = base_graph
-
-            if capture_lora_graphs:
-                lora_context = build_lora_context_from_slot_list([0] * dit_rows)
-                self._set_graph_lora_context(graph_vars, DIT_LORA_DOMAIN, lora_context)
+        for first in firsts:
+            prefix = "" if first else "rest_"
+            self.prefill_diffusion_graphs.setdefault(prefix + "base", {})
+            self.prefill_diffusion_graphs.setdefault(prefix + "lora", {})
+            self._set_first_patch(first)
+            for bs in reversed(self.graph_bs):
+                dit_rows = dit_rows_per_sample * bs
+                base_context = build_lora_context_from_slot_list([-1] * dit_rows)
+                self._set_graph_lora_context(graph_vars, DIT_LORA_DOMAIN, base_context)
                 outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
 
-                lora_graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(lora_graph, self.graph_pool):
+                base_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(base_graph, self.graph_pool):
                     outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
-                self.prefill_diffusion_graphs["lora"][bs] = lora_graph
+                self.prefill_diffusion_graphs[prefix + "base"][bs] = base_graph
 
-            torch.cuda.synchronize()
-            reset_all_contexts()
+                if capture_lora_graphs:
+                    lora_context = build_lora_context_from_slot_list([0] * dit_rows)
+                    self._set_graph_lora_context(graph_vars, DIT_LORA_DOMAIN, lora_context)
+                    outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
+
+                    lora_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(lora_graph, self.graph_pool):
+                        outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
+                    self.prefill_diffusion_graphs[prefix + "lora"][bs] = lora_graph
+
+                torch.cuda.synchronize()
+                reset_all_contexts()
 
         self.prefill_diffusion_graph_vars = graph_vars
         self._set_first_patch(False)
@@ -1434,6 +1444,7 @@ class BaseModelRunner:
         _profile.mark("backbone")
         batch_size = diffusion_inputs["mu"].size(0)
         dit_context = lora_contexts[DIT_LORA_DOMAIN]
+        first = get_context().first_patch  # (Context.first_patch: no resumed stream, no decode riding along)
 
         def run_diffusion_eager():
             eager_dit_context = materialize_lora_context(dit_context)
@@ -1455,7 +1466,7 @@ class BaseModelRunner:
                         build_lora_context_from_token_to_slot(token_to_slot),
                         domain=DIT_LORA_DOMAIN,
                     )
-            self._set_first_patch(True)
+            self._set_first_patch(first)
             try:
                 outputs["latents"] = self.model.forward_diffusion(**diffusion_inputs)
             finally:
@@ -1468,6 +1479,8 @@ class BaseModelRunner:
 
         has_active_dit_lora = not dit_context.no_lora_flag and dit_context.token_count > 0
         graph_kind = "lora" if has_active_dit_lora else "base"
+        if not first and "rest_" + graph_kind in self.prefill_diffusion_graphs:
+            graph_kind = "rest_" + graph_kind
         graphs = self.prefill_diffusion_graphs[graph_kind]
         if not graphs:
             return run_diffusion_eager()

@@ -16,6 +16,9 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
+    # a prefill step whose sequences all start their stream (no resumed one, no decode riding along): the LocDiT
+    # solves with the first patch's settings (TurboConfig.dit_first_t_span / first_steps / first_cfg_steps)
+    first_patch: bool = True
 
 
 @dataclass
