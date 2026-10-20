@@ -14,7 +14,7 @@ import sys
 from collections.abc import Callable, Iterator
 
 CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
-OUTCOMES = ("ok", "client_error", "server_error", "busy", "cancelled")
+OUTCOMES = ("ok", "client_error", "server_error", "busy", "limited", "cancelled")
 # time to first audio, seconds: the engine's is 25-100 ms up to 150 streams at once (README), a paced first chunk
 # 150 ms later
 FIRST_AUDIO_BUCKETS = (0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1.0, 2.0, 5.0)
@@ -153,7 +153,8 @@ class ServerMetrics(Metrics):
         super().__init__()
         self.requests = self.add(Counter(
             "voxcpm_requests_total", f"{what}s by outcome: ok, client_error (the request's fault), server_error "
-            "(the engine failed), busy (--max-streams, shutting down), cancelled (the client left)", ("outcome",),
+            "(the engine failed), busy (--max-streams, shutting down), limited (over its client's max_streams or rpm, "
+            "--api-keys-file), cancelled (the client left)", ("outcome",),
             OUTCOMES))
         self.add(Gauge("voxcpm_active_streams", f"{what}s in progress", active))
         self.first_audio = self.add(Histogram(

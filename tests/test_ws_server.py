@@ -698,3 +698,59 @@ def test_audio_cache_one_generation_for_utterances_at_the_same_time_and_a_direct
     assert played == a and len(tts.calls) == 1 and stats["disk_hits"] == 1
     other, stats = asyncio.run(restarted({"default": "b2"}))  # "default" now another file: another voice
     assert other != a and len(tts.calls) == 2 and stats["misses"] == 1
+
+
+def test_client_keys_and_limits(tmp_path):
+    """--api-keys-file: an unknown key is refused at the handshake (401); an utterance beyond its client's limits is
+    an error (the connection goes on), another client's are not touched; counts by client in /metrics."""
+    from websockets.exceptions import InvalidStatus
+
+    keys = tmp_path / "keys.txt"
+    keys.write_text("a ka max_streams=1\nb kb rpm=1\nm km metrics=true\n")
+    tts = FakeTTS(patches=6, burst=1, pause=0.05)
+    srv = Server(set(tts.voices), local_feed(tts), args(api_keys_file=str(keys)))
+
+    async def main():
+        out = {}
+        try:
+            await exchange(srv, "chunk_size=4096&api_key=kx", ["x"])
+        except InvalidStatus as e:
+            out["unknown"] = e.response.status_code
+        first = asyncio.ensure_future(exchange(srv, texts=["one"], headers={"Authorization": "Bearer ka"}))
+        await asyncio.sleep(0.1)
+        out["a_second"] = await exchange(srv, texts=["two"], headers={"Authorization": "Bearer ka"})
+        out["b"] = await exchange(srv, "chunk_size=4096&api_key=kb", ["one", "two", "three"])
+        out["a_first"] = await first
+        return out
+
+    out = asyncio.run(main())
+    assert out["unknown"] == 401 and kinds(out["a_first"]) == ["start", "end_of_audio"]
+    assert kinds(out["a_second"]) == ["error"] and "client a" in out["a_second"][0]["message"]
+    assert kinds(out["b"]) == ["start", "end_of_audio", "error", "error"]  # rpm=1: one; the connection goes on
+    assert "rpm" in out["b"][-1]["message"] and "try again in" in out["b"][-1]["message"]
+    text = srv.metrics.render()
+    assert 'voxcpm_client_requests_total{client="a",outcome="limited"} 1' in text
+    assert 'voxcpm_client_requests_total{client="b",outcome="ok"} 1' in text
+    assert 'voxcpm_client_requests_total{client="b",outcome="limited"} 2' in text
+
+
+def test_a_key_removed_from_the_file_ends_its_open_connection_s_utterances(tmp_path, monkeypatch):
+    """A connection keeps its handshake's client, as the keys file has it now: a key removed (revoked) while its
+    connection is open speaks no more."""
+    from nanovllm_voxcpm.entrypoints.clients import Clients
+
+    monkeypatch.setattr(Clients, "RECHECK_S", 0.0)
+    keys = tmp_path / "keys.txt"
+    keys.write_text("a ka\n")
+    tts = FakeTTS(patches=1)
+    srv = Server(set(tts.voices), local_feed(tts), args(api_keys_file=str(keys)))
+    stream = tts.stream
+
+    async def revoked_after(text, *a, **kw):
+        async for c in stream(text, *a, **kw):
+            yield c
+        keys.write_text("z kz-new\n")
+
+    tts.stream = revoked_after
+    out = asyncio.run(exchange(srv, "chunk_size=4096&api_key=ka", ["one", "two"]))
+    assert kinds(out) == ["start", "end_of_audio", "error"] and "no longer valid" in out[-1]["message"]

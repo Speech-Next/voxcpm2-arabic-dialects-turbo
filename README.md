@@ -140,6 +140,7 @@ the pitch in good quality). `cfg_value` has no effect with the distilled LocDiT 
 | | WebSocket server | HTTP server |
 |---|---|---|
 | API key (`--api-key` or `VOXCPM_API_KEY`) | `Authorization: Bearer <key>` or `?api_key=<key>` | `Authorization: Bearer <key>` (all but `/health`) |
+| clients (`--api-keys-file`): a key each, with its own `max_streams` and `rpm` | an utterance beyond them gets `{"type": "error", "message": "client <name>: .., try again in <s> s"}`, its connection goes on | beyond them: 429 with `Retry-After` |
 | requests at once (`--max-streams`, one A10: 150) | more get `{"type": "error", "message": "busy: .."}` | more get 503 with `Retry-After` |
 | health | `GET /health` on the same port | `GET /health`, 503 once the engine process died |
 | input | `--max-text-chars` (4096), messages up to 1 MiB, an unknown dialect refused at the handshake | `--max-input-chars` (4096), `cfg_value` 0-10, voice clips up to `--max-voice-mb` (10) and `--max-voice-seconds` (30) |
@@ -149,7 +150,7 @@ the pitch in good quality). `cfg_value` has no effect with the distilled LocDiT 
 | SIGTERM | no new connection or utterance; those in progress get `--shutdown-timeout` (10 s) to end, then are cut; the connections close with 1001 | no new connection; requests in progress get `--shutdown-timeout` (10 s) to end, then are cut |
 | `DELETE /v1/audio/voices/{name}` | | 409 while a speech request uses the voice |
 | logs (`--log-level`, `info`) | a line per connection opened and closed (code, reason) and per utterance not spoken; shutdown, engine death | a line per speech request refused or failed (status, why) and per voice registered or deleted; shutdown, engine death |
-| metrics | `GET /metrics` on the same port, behind the API key | `GET /metrics`, behind the API key |
+| metrics | `GET /metrics` on the same port, behind the API key (with `--api-keys-file`: a client with `metrics=true`) | `GET /metrics`, behind the API key (with `--api-keys-file`: a client with `metrics=true`) |
 | audio cache (`--audio-cache-mb`, 512; `0`: off) | each sentence's first audio, by sentence, dialect, voice (its file's content) and `cfg_value` | each sentence's first audio, by sentence as read, voice (its latents and transcript), dialect, `seed`, `cfg_value` and `max_tokens` |
 | audio cache on disk (`--audio-cache-dir`, `--audio-cache-dir-mb` 4096) | the kept sentences as files: they outlive restarts, replicas on a shared disk share them | the same |
 
@@ -172,11 +173,32 @@ files are written whole, its `.json` last, so a replica never reads half a voice
 its `--voice` options, the same on every replica. The audio cache is each replica's own, unless the replicas
 share a cache directory.
 
+`--api-keys-file` gives each client its own key and limits, in lines (or JSON, `nanovllm_voxcpm/entrypoints/clients.py`):
+
+```
+# name    key              limits (optional)
+acme      sk-acme-7f3a...  max_streams=20 rpm=600
+beta      sk-beta-91c2...  rpm=60
+monitor   sk-prom-0d4e...  metrics=true
+```
+
+- `max_streams`: the client's requests at once. `rpm`: its requests a minute, a token bucket of a minute's worth.
+  Beyond either, its request is refused (HTTP 429 with `Retry-After`; WebSocket: an error for that utterance). The
+  server's own `--max-streams` (503) comes first.
+- `metrics=true`: the key reads `/metrics`, which holds every client's name and counts. `--api-key` (the client
+  `default`) works next to the file and reads `/metrics`.
+- The file is read again when it changes (looked at no more than once a second): replace it whole (write, then
+  rename) to add, remove or rotate keys and change limits without a restart; an open WebSocket connection's key is
+  looked up again at each utterance (a removed key speaks no more). A file that does not parse keeps the clients
+  read before, and logs an error.
+- Keys are compared in constant time and never logged. Logs and `voxcpm_client_requests_total{client,outcome}` carry
+  the client's name.
+
 `/metrics` is Prometheus' text format; with an API key, scrape it with the key as a bearer token
 (`authorization: {credentials: <key>}` in the scrape config). Both servers export:
 - `voxcpm_requests_total{outcome}`: speech requests (HTTP) or utterances (WebSocket). The outcomes are `ok`,
-  `client_error` (the request's fault), `server_error` (the engine failed), `busy` (`--max-streams`, shutting down)
-  and `cancelled` (the client left);
+  `client_error` (the request's fault), `server_error` (the engine failed), `busy` (`--max-streams`, shutting down),
+  `limited` (over its client's `max_streams` or `rpm`) and `cancelled` (the client left);
 - `voxcpm_active_streams`;
 - `voxcpm_first_audio_seconds`, a histogram from a request's turn to the engine's first audio at the server;
 - `voxcpm_audio_seconds_total`;
