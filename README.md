@@ -147,6 +147,7 @@ python examples/streaming_benchmark.py       # requests arriving at random
 
 | | license |
 |---|---|
-| this code | MIT |
+| this code | [PolyForm Noncommercial 1.0.0](LICENSE): free for noncommercial use; commercial use needs the author's permission |
+| the code it builds on (Nano-vLLM-VoxCPM, Nano-vLLM; vLLM's LoRA kernels) | MIT; Apache-2.0: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) |
 | [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2), VoxCPM2-Arabic-Dialects (the adapters) | Apache-2.0 |
 | VoxCPM2-Arabic-Teacher-v3, VoxCPM2-Arabic-Dialects-Distilled-DiT (both used by default) | CC BY-NC-SA 4.0: non-commercial |
