@@ -105,6 +105,10 @@ python -m nanovllm_voxcpm.entrypoints.ws_server --voice default=reference.wav --
 | server: `{"type": "start", "sample_rate": 16000}` | then the 16-bit PCM in `chunk_size` binary messages |
 | server: `{"type": "end_of_audio"}` | after each utterance |
 
+Before it listens, the server synthesizes bursts of 1 to 150 requests with the default voice, so that every kernel
+variant is compiled before the first client (no stalls on a fresh machine): it is ready after ~75 s, ~5.5 minutes
+the first time.
+
 `transport=json_base64` sends `{"type": "audio_chunk", "chunk_data": ..}` instead of binary messages;
 `segmenting=true` speaks a long text sentence by sentence. The benchmark:
 

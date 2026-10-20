@@ -403,8 +403,21 @@ async def load_tts(args):
     for spec in args.voice:
         name, _, path = spec.partition("=")
         await tts.add_voice(name, path)
-    await tts.synthesize("أهلاً بيك، إزيك النهارده؟", dialect=args.dialect, voice=args.default_voice)  # warm up
+    # warm-up: bursts of the sizes a server meets, texts of three lengths, so that Triton compiles the kernel variants
+    # (tile sizes per row count) now and not while the first streams play (#39)
+    for n in WARMUP_BURSTS:
+        await asyncio.gather(*(tts.synthesize(WARMUP_TEXTS[i % len(WARMUP_TEXTS)], dialect=args.dialect,
+                                              voice=args.default_voice) for i in range(n)))
     return tts
+
+
+WARMUP_BURSTS = (1, 10, 40, 100, 150)
+WARMUP_TEXTS = (
+    "أهلاً بيك، إزيك النهارده؟",
+    "النهارده الجو حلو قوي، تعالى نتمشى شوية على الكورنيش ونشرب حاجة ساقعة.",
+    "لو عندك وقت بكره الصبح، ممكن نعدي على المكتب سوا ونخلص الورق اللي فاضل، وبعدين نروح نتغدى في المطعم اللي "
+    "جنب المحطة.",
+)
 
 
 async def serve_ws(server: Server, args, until: asyncio.Future, on_listening: Callable[[], None]):
