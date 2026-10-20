@@ -148,6 +148,8 @@ the pitch in good quality). `cfg_value` has no effect with the distilled LocDiT 
 | the engine process dies, or hangs (sends nothing for `--hang-timeout`, 60 s, while requests wait) | the server exits with code 1 | the server exits with code 1 |
 | SIGTERM | no new connection or utterance; those in progress get `--shutdown-timeout` (10 s) to end, then are cut; the connections close with 1001 | no new connection; requests in progress get `--shutdown-timeout` (10 s) to end, then are cut |
 | `DELETE /v1/audio/voices/{name}` | | 409 while a speech request uses the voice |
+| logs (`--log-level`, `info`) | a line per connection opened and closed (code, reason) and per utterance not spoken; shutdown, engine death | a line per speech request refused or failed (status, why) and per voice registered or deleted; shutdown, engine death |
+| metrics | `GET /metrics` on the same port, behind the API key | `GET /metrics`, behind the API key |
 
 Run a server under a supervisor that starts it again when it exits (systemd `Restart=always`, Docker
 `--restart unless-stopped`, Kubernetes), and send traffic once `/health` answers (~75 s after start). A stop
@@ -156,6 +158,20 @@ engine process ends with its server, also when the server is killed (`kill -9`, 
 127.0.0.1 by default: put them behind a TLS proxy, or listen on 0.0.0.0 only with an API key. After the first
 download, `HF_HUB_OFFLINE=1` keeps a restart on the models already downloaded. Voices registered over HTTP live in
 that server's process; several replicas share them with `--voice-dir` on a shared disk (read at startup).
+
+`/metrics` is Prometheus' text format; with an API key, scrape it with the key as a bearer token
+(`authorization: {credentials: <key>}` in the scrape config). Both servers export:
+- `voxcpm_requests_total{outcome}`: speech requests (HTTP) or utterances (WebSocket). The outcomes are `ok`,
+  `client_error` (the request's fault), `server_error` (the engine failed), `busy` (`--max-streams`, shutting down)
+  and `cancelled` (the client left);
+- `voxcpm_active_streams`;
+- `voxcpm_first_audio_seconds`, a histogram from a request's turn to the engine's first audio at the server;
+- `voxcpm_audio_seconds_total`;
+- `voxcpm_engine_alive`.
+
+The WebSocket server also exports `voxcpm_connections`, `voxcpm_connections_total` and `voxcpm_first_chunk_seconds`
+(to the first chunk sent, the pacer's `--pace-start-ms` hold included). Log lines are written by a thread of their
+own, never by the event loop that paces the audio.
 
 ## Examples
 

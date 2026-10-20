@@ -36,6 +36,11 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
   (``--hang-timeout``) the server exits with code 1, for its supervisor to start it again. On SIGTERM no new
   connection or utterance is taken, those in progress get ``--shutdown-timeout`` seconds to end, and the connections
   close with 1001 (going away).
+- Logs and metrics: a line per connection opened and closed (code, reason), per utterance that fails or is cut, and
+  on shutdown and engine death (``--log-level``), written by a thread of their own (telemetry: never the event loop
+  that paces the chunks). ``GET /metrics`` on the same port (behind the API key, as a bearer token): Prometheus'
+  text format, utterances by outcome, utterances and connections open, time to first audio (the engine's audio at
+  the server) and to the first chunk sent (the pacer's hold included), seconds of audio sent, the engine alive.
 """
 
 import argparse
@@ -44,6 +49,7 @@ import base64
 import contextlib
 import hmac
 import json
+import logging
 import math
 import os
 import signal
@@ -56,10 +62,13 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
+from nanovllm_voxcpm.entrypoints.telemetry import (CONTENT_TYPE, FIRST_AUDIO_BUCKETS, Counter, Gauge, Histogram,
+                                                   ServerMetrics, setup_logging)
 from nanovllm_voxcpm.streaming import ChunkPacer, ChunkStream, StreamSender
 
 PATH = "/api/tts/stream"
 QUEUED_TEXTS = 64  # a connection's texts waiting for their turn; more wait in the socket (backpressure)
+logger = logging.getLogger("ws_server")
 
 
 def ws_frame(opcode: int, payload: bytes) -> bytes:
@@ -149,12 +158,17 @@ def message(e: BaseException) -> str:
     return str(e) or type(e).__name__
 
 
+def _peer(connection) -> str:
+    addr = getattr(connection, "remote_address", None)
+    return f"{addr[0]}:{addr[1]}" if addr else "?"
+
+
 class Server:
     """The connections. voices: the registered voice names; feed(req, yields, stream): fills an utterance's
     ChunkStream with its PCM16 and returns what stops it; dialects: the names a connection may ask for (None: not
-    checked here)."""
+    checked here); engine_alive: whether the engine process runs (/metrics)."""
 
-    def __init__(self, voices, feed: Feed, args, dialects=None):
+    def __init__(self, voices, feed: Feed, args, dialects=None, engine_alive: Callable[[], bool] | None = None):
         self.voices, self.feed, self.args, self.dialects = voices, feed, args, dialects
         self.log = open(args.log, "a") if args.log else None
         self.conn = 0
@@ -162,11 +176,19 @@ class Server:
         self.sender = StreamSender(0.0) if args.pace else None
         self.utterances = 0
         self.active = 0  # utterances in progress (--max-streams)
+        self.connections = 0  # open
         self.draining = False  # shutting down: no new connection or utterance (drain)
+        self.metrics = ServerMetrics("utterance", lambda: self.active, engine_alive or (lambda: True))
+        self.connections_total = self.metrics.add(Counter("voxcpm_connections_total", "WebSocket connections"))
+        self.metrics.add(Gauge("voxcpm_connections", "WebSocket connections open", lambda: self.connections))
+        self.first_chunk = self.metrics.add(Histogram(
+            "voxcpm_first_chunk_seconds", "from an utterance's turn to its first chunk sent (the pacer's hold, "
+            "--pace-start-ms, included)", FIRST_AUDIO_BUCKETS))
 
     def process_request(self, connection, request):
         """Before a handshake: GET /health answered here (this process runs only while the engine's does); with
-        --api-key, a client without it (``Authorization: Bearer <key>`` or ``?api_key=<key>``, browsers) gets 401."""
+        --api-key, a client without it (``Authorization: Bearer <key>`` or ``?api_key=<key>``, browsers) gets 401;
+        GET /metrics: the counters (telemetry), behind the key too."""
         from http import HTTPStatus
 
         u = urlparse(request.path)
@@ -177,7 +199,13 @@ class Server:
             bearer = request.headers.get("Authorization", "").encode()
             query = parse_qs(u.query).get("api_key", [""])[0].encode()
             if not (hmac.compare_digest(bearer, f"Bearer {key}".encode()) or hmac.compare_digest(query, key.encode())):
+                logger.info("%s %s refused: missing or wrong API key (401)", _peer(connection), u.path[:100])
                 return connection.respond(HTTPStatus.UNAUTHORIZED, "missing or wrong API key\n")
+        if u.path == "/metrics":
+            response = connection.respond(HTTPStatus.OK, self.metrics.render())
+            del response.headers["Content-Type"]
+            response.headers["Content-Type"] = CONTENT_TYPE
+            return response
         return None
 
     def control(self, cfg: dict, obj: dict) -> dict:
@@ -213,16 +241,33 @@ class Server:
         then ``cut`` fails the rest (their streams), and the connections are closed (1001, going away)."""
         self.draining = True
         ws_server.server.close()  # (stops listening; the connections stay open)
+        logger.info("shutting down: %d utterances in progress get up to %g s", self.active, timeout)
         loop = asyncio.get_running_loop()
         end = loop.time() + timeout
         while self.active and loop.time() < end:
             await asyncio.sleep(0.05)
         if self.active and cut is not None:
+            logger.warning("shutting down: %d utterances cut after %g s", self.active, timeout)
             cut()
 
     async def handler(self, ws):
+        """A connection: counted (metrics) and its end logged."""
+        self.conn += 1
+        conn, spoken = self.conn, [0, 0]  # utterances spoken, failed
+        self.connections += 1
+        self.connections_total.inc()
+        try:
+            await self.serve(ws, conn, spoken)
+        finally:
+            self.connections -= 1
+            code = ws.close_code  # (None: the server closes it once this returns, 1000)
+            logger.info("conn %d closed: %s, %d utterances spoken, %d failed", conn,
+                        f"code {code} {ws.close_reason!r}" if code is not None else "by the server", *spoken)
+
+    async def serve(self, ws, conn: int, spoken: list[int]):
         u = urlparse(ws.request.path)
         if u.path != PATH:
+            logger.info("conn %d refused: unknown path %r", conn, u.path[:100])
             await ws.close(1008, "unknown path")
             return
         if self.draining:
@@ -239,6 +284,7 @@ class Server:
         # (chunks under ~8 ms of audio streamed slower than real time; a huge one held the whole utterance back)
         if (not 8000 <= rate <= 48000 or n % 2 or not 0.02 <= n / (2 * rate) <= 10.0
                 or transport not in ("bytes", "json_base64") or segmenting not in ("true", "false")):
+            logger.info("conn %d refused: query %s", conn, {k: v[:40] for k, v in q.items() if k != "api_key"})
             await ws.send(json.dumps({"type": "error", "message": "audio_format pcm_<8000-48000>, chunk_size even "
                                       "and 20 ms to 10 s of audio, transport bytes or json_base64, segmenting true "
                                       "or false"}))
@@ -246,14 +292,15 @@ class Server:
             return
         dialect = q.get("dialect", self.args.dialect)
         if self.dialects is not None and dialect not in self.dialects:
+            logger.info("conn %d refused: unknown dialect %r", conn, dialect[:100])
             await ws.send(json.dumps({"type": "error", "message": f"unknown dialect {dialect!r}; dialects: "
                                                                   f"{', '.join(sorted(self.dialects))}"}))
             await ws.close()
             return
         cfg = dict(rate=rate, chunk_size=n, transport=transport, segmenting=segmenting == "true",
                    dialect=dialect, voice=self.args.default_voice, cfg_value=2.0)
-        self.conn += 1
-        conn = self.conn
+        logger.info("conn %d open: %s, dialect %s, %s, chunk_size %d, %s%s", conn, _peer(ws), dialect[:40], fmt, n,
+                    transport, ", segmenting" if cfg["segmenting"] else "")
         texts: asyncio.Queue = asyncio.Queue(QUEUED_TEXTS)
 
         async def reader():
@@ -281,7 +328,9 @@ class Server:
             while (item := await texts.get()) is not None:
                 try:
                     await self.utterance(ws, conn, cfg, *item)
+                    spoken[0] += 1
                 except Exception as e:  # noqa: BLE001 - the client hears why; its next text is still spoken
+                    spoken[1] += 1
                     try:
                         await ws.send(json.dumps({"type": "error", "message": message(e)}))
                     except Exception:  # noqa: BLE001 - the client is gone
@@ -293,25 +342,55 @@ class Server:
             rd.cancel()
 
     async def utterance(self, ws, conn, cfg, t_recv, text):
-        """One text spoken (speak_text), within --max-text-chars and --max-streams."""
+        """One text spoken (speak_text), within --max-text-chars and --max-streams; its outcome counted (metrics)
+        and, unless it was spoken, logged."""
+        from websockets.exceptions import ConnectionClosed
+
         from nanovllm_voxcpm.dialect_tts import check_text
 
-        if self.draining:
-            raise ValueError("the server is shutting down")
-        check_text(text)  # (empty, or punctuation / symbols / emoji only: an error, not made-up sounds)
-        limit = getattr(self.args, "max_text_chars", 0)
-        if limit and len(text) > limit:
-            raise ValueError(f"text: at most {limit} characters (--max-text-chars)")
-        most = getattr(self.args, "max_streams", 0)
-        if most and self.active >= most:
-            raise ValueError(f"busy: {self.active} utterances in progress (--max-streams), try again")
-        self.active += 1
+        outcome = "client_error"
         try:
-            await self.speak_text(ws, conn, cfg, t_recv, text)
+            if self.draining:
+                outcome = "busy"
+                raise ValueError("the server is shutting down")
+            check_text(text)  # (empty, or punctuation / symbols / emoji only: an error, not made-up sounds)
+            limit = getattr(self.args, "max_text_chars", 0)
+            if limit and len(text) > limit:
+                raise ValueError(f"text: at most {limit} characters (--max-text-chars)")
+            most = getattr(self.args, "max_streams", 0)
+            if most and self.active >= most:
+                outcome = "busy"
+                raise ValueError(f"busy: {self.active} utterances in progress (--max-streams), try again")
+            self.active += 1
+            try:
+                await self.speak_text(ws, conn, cfg, t_recv, text)
+            finally:
+                self.active -= 1
+            outcome = "ok"
+        except ValueError as e:  # (the engine's too: the request's fault, e.g. too long for the model)
+            logger.info("conn %d: utterance refused: %s", conn, message(e))
+            raise
+        except (ConnectionError, ConnectionClosed, asyncio.CancelledError):
+            outcome = "cancelled"
+            logger.info("conn %d: utterance cut: the client is gone", conn)
+            raise
+        except Exception as e:
+            outcome = "server_error"
+            logger.warning("conn %d: utterance failed: %s", conn, message(e))
+            raise
         finally:
-            self.active -= 1
+            self.metrics.requests.inc(outcome)
+
+    def count_audio(self, stream: ChunkStream, sends: list, t_turn: float, rate: int) -> None:
+        """An utterance's audio in the metrics: its time to first audio and to the first chunk sent, the seconds."""
+        if stream.first_push is not None:
+            self.metrics.first_audio.observe(stream.first_push - t_turn)
+        if sends:
+            self.first_chunk.observe(sends[0][0] - t_turn)
+            self.metrics.audio.inc(by=sum(s[1] for s in sends) / (2 * rate))
 
     async def speak_text(self, ws, conn, cfg, t_recv, text):
+        t_turn = time.perf_counter()
         n, rate, b64 = cfg["chunk_size"], cfg["rate"], cfg["transport"] == "json_base64"
         await ws.send(json.dumps({"type": "start", "sample_rate": rate}))
         pacer = self.pacer(n, rate)
@@ -347,6 +426,7 @@ class Server:
                     sends.append([time.perf_counter(), len(b), stream.last_due, t])
         finally:
             stop()
+            self.count_audio(stream, sends, t_turn, rate)
         await ws.send(json.dumps({"type": "end_of_audio"}))
         if self.log is not None:  # perf_counter (CLOCK_MONOTONIC) times: comparable with the engine's profiles
             # yields: [t, samples from the engine, ms resampling, bytes out] (two processes: [t received, 0, 0,
@@ -393,7 +473,8 @@ async def serve_engine(tts, reader: asyncio.StreamReader, writers, log=None) -> 
         except asyncio.CancelledError:
             pass
         except Exception as e:  # noqa: BLE001 - the client hears why
-            writer.write(frame(ERROR, utt, message(e).encode()))
+            # (V: a ValueError, the request's fault, raised as one on the other side: its metrics count it so)
+            writer.write(frame(ERROR, utt, (b"V" if isinstance(e, ValueError) else b"E") + message(e).encode()))
         finally:
             jobs.pop(utt, None)
 
@@ -462,7 +543,9 @@ class EngineLink(asyncio.Protocol):
                         if kind == END:
                             stream.finish()
                         else:
-                            stream.fail(RuntimeError(payload.tobytes().decode(errors="replace")))
+                            err = payload.tobytes()
+                            stream.fail((ValueError if err[:1] == b"V" else RuntimeError)(
+                                err[1:].decode(errors="replace")))
                 payload.release()
         if src is self.buf:
             del self.buf[:off]
@@ -555,6 +638,7 @@ async def main_engine(args, socks, front_pid: int) -> int:
     conns = [await asyncio.open_connection(sock=s) for s in socks]
     reader, writer = conns[0]
     stop = stop_signal()
+    listener = setup_logging("ws_server", getattr(args, "log_level", "info"))
     try:
         tts = await load_tts(args)
         async with tts:
@@ -573,6 +657,7 @@ async def main_engine(args, socks, front_pid: int) -> int:
             if stop.done() and not dead.done():
                 # SIGTERM: the connections' process drains (its utterances get --shutdown-timeout s to end, the engine
                 # serving them meanwhile) and exits, which ends serve_engine
+                logger.info("stopping: the connections' process drains, then the engine stops")
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(front_pid, signal.SIGTERM)
                 await asyncio.wait([engine, dead], timeout=args.shutdown_timeout + 3,
@@ -581,11 +666,12 @@ async def main_engine(args, socks, front_pid: int) -> int:
             died = dead.done()
             dead.cancel()
             if died:
-                print("[ws_server] the engine process died: exiting (code 1)", flush=True)
+                logger.error("the engine process died: exiting (code 1)")
                 return 1
             return 0
     finally:
         await end_front(front_pid)
+        listener.stop()
 
 
 async def end_front(pid: int, timeout: float = 5.0) -> None:
@@ -607,18 +693,26 @@ async def end_front(pid: int, timeout: float = 5.0) -> None:
 
 async def main_front(args, socks):
     """The connections' process."""
-    loop = asyncio.get_running_loop()
-    _, link = await loop.create_connection(EngineLink, sock=socks[0])
-    for s in socks[1:]:
-        await loop.create_connection(lambda: EngineLink(link), sock=s)
-    info = await link.ready  # once the engine is up
-    if info is None:
-        return
-    server = Server(set(info["voices"]), link.start, args, set(info["dialects"]) if info.get("dialects") else None)
-    stop = stop_signal()
-    until = asyncio.ensure_future(asyncio.wait([stop, link.closed], return_when=asyncio.FIRST_COMPLETED))
-    await serve_ws(server, args, until, lambda: link.send(LISTENING),
-                   lambda: link.fail_all("the server is shutting down"))
+    listener = setup_logging("ws_server", getattr(args, "log_level", "info"))
+    try:
+        loop = asyncio.get_running_loop()
+        _, link = await loop.create_connection(EngineLink, sock=socks[0])
+        for s in socks[1:]:
+            await loop.create_connection(lambda: EngineLink(link), sock=s)
+        info = await link.ready  # once the engine is up
+        if info is None:
+            return
+        server = Server(set(info["voices"]), link.start, args, set(info["dialects"]) if info.get("dialects") else None,
+                        engine_alive=lambda: not link.closed.done())
+        stop = stop_signal()
+        # (a SIGTERM closes the link after the drain; the engine's process gone first: it died, e.g. a kill -9)
+        link.closed.add_done_callback(lambda _: stop.done() or logger.error("the engine's process is gone: the "
+                                                                            "connections close"))
+        until = asyncio.ensure_future(asyncio.wait([stop, link.closed], return_when=asyncio.FIRST_COMPLETED))
+        await serve_ws(server, args, until, lambda: link.send(LISTENING),
+                       lambda: link.fail_all("the server is shutting down"))
+    finally:
+        listener.stop()
 
 
 def cli():
@@ -669,6 +763,9 @@ def cli():
                          "hung: the server exits with code 1 (0: not watched)")
     ap.add_argument("--shutdown-timeout", type=float, default=10.0,
                     help="on SIGTERM, utterances in progress get this many seconds to end, then they are cut")
+    ap.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"],
+                    help="info: a line per connection opened and closed and per utterance not spoken; warning: "
+                         "failures only")
     args = ap.parse_args()
     if args.default_voice is None and args.voice:
         args.default_voice = args.voice[0].partition("=")[0]

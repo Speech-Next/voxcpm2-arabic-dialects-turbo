@@ -486,3 +486,57 @@ def test_unsupported_format_and_speed(server, tmp_path):
         {"input": "ok", "speed": 0.1}, {"input": "ok", "speed": 1.0}]))
     assert [status for status, _ in out] == [400, 400, 422, 422, 200]
     assert b"pcm, wav, mp3, opus, flac" in out[0][1] and b"only 1.0" in out[1][1]
+
+
+def metric_values(text: str) -> dict[str, float]:
+    """Prometheus text: {'name{labels}': value}."""
+    return {k: float(v) for k, v in (line.rsplit(" ", 1) for line in text.splitlines() if line and line[0] != "#")}
+
+
+def test_metrics_and_logs(server, monkeypatch, tmp_path, caplog):
+    # every speech request's outcome counted, its audio timed and measured; /metrics behind the API key; a line
+    # logged per request refused
+    import logging
+
+    caplog.set_level(logging.INFO, logger="openai_server")
+    monkeypatch.setattr(nanovllm_voxcpm, "VoxCPM", SlowEngine)
+    asgi = server.build_app(server_args(tmp_path, api_key="k", max_streams=1))
+    key = [(b"authorization", b"Bearer k")]
+
+    def leave_after_two_chunks(m, gone):
+        if m.get("more_body") and m.get("body"):
+            leave_after_two_chunks.n += 1
+            if leave_after_two_chunks.n == 2:
+                gone.set()
+
+    leave_after_two_chunks.n = 0
+
+    async def main():
+        async with running(asgi):
+            statuses = [(await request(asgi, "POST", "/v1/audio/speech", body, headers=h))[0] for body, h in (
+                (speech_body(), key), (speech_body(input="..."), key), (b"{", key), (speech_body(), ()))]
+            first = asyncio.ensure_future(request(asgi, "POST", "/v1/audio/speech", speech_body(), headers=key))
+            await asyncio.sleep(0.05)
+            statuses.append((await request(asgi, "POST", "/v1/audio/speech", speech_body(), headers=key))[0])
+            statuses.append((await first)[0])
+            await request(asgi, "POST", "/v1/audio/speech", speech_body(), headers=key, on_send=leave_after_two_chunks)
+            await asyncio.sleep(0.05)
+            return statuses, await request(asgi, "GET", "/metrics"), await request(asgi, "GET", "/metrics",
+                                                                                     headers=key)
+
+    statuses, (no_key, _, _), (status, headers, body) = asyncio.run(main())
+    assert statuses == [200, 400, 422, 401, 503, 200] and no_key == 401 and status == 200
+    assert headers[b"content-type"] == b"text/plain; version=0.0.4; charset=utf-8"
+    m = metric_values(body.decode())
+    assert {o: m[f'voxcpm_requests_total{{outcome="{o}"}}'] for o in ("ok", "client_error", "server_error", "busy",
+                                                                     "cancelled")} == {
+        "ok": 2, "client_error": 3, "server_error": 0, "busy": 1, "cancelled": 1}
+    assert m["voxcpm_active_streams"] == 0 and m["voxcpm_engine_alive"] == 1
+    assert m["voxcpm_first_audio_seconds_count"] == 3  # (the client that left had its first audio)
+    assert 0 < m['voxcpm_first_audio_seconds_bucket{le="0.1"}'] and m["voxcpm_first_audio_seconds_sum"] < 1.0
+    assert 400 / 48000 < m["voxcpm_audio_seconds_total"] < 500 / 48000  # 2 x 50 chunks of 4 samples, and 2-3 more
+    logged = [(r.levelname, r.getMessage()) for r in caplog.records if r.name == "openai_server"]
+    assert ("INFO", "speech request refused (400): input has nothing to speak (only punctuation, symbols or emoji)") \
+        in logged
+    assert ("WARNING", "speech request refused (503): busy: 1 speech requests in progress (--max-streams)") in logged
+    assert any(level == "INFO" and "(401)" in msg and "/metrics" in msg for level, msg in logged)
