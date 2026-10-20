@@ -8,6 +8,8 @@ text is brought to that form; the caller keeps the original. ``style`` "msa" rea
   (ﻻ، ﷺ) as Arabic letters; tatweel, harakat (tanwin and shadda included; letters stay: شكراً -> شكرا), Quranic marks
   and invisible bidi / zero-width characters removed (the transcripts are undiacritized: harakat in none of 7590
   lahgtna texts, in 1-4 % of the eval, sada and synth texts); Arabic-Indic and Persian digits, ٫ ٬ ٪ as 0-9 . , %.
+- Equals: = between two operands is يساوي (x=-5 -> x يساوي ناقص خمسة, س = ص); left as written in URLs and query
+  strings (?a=1&b=2) and in code (==, <=, >=, !=, :=, +=, =>).
 - Joining: a proclitic (ب ل ك و ف, وب ...) or the article (ال، بال، لل ...) joins the number after it (بـ 3000 ->
   بثلاثة آلاف); any other word glued to digits is split off (رقم5 -> رقم خمسة, 100km -> مية كيلومتر, 5G -> خمسة G).
 - Dates d/m/yyyy, d-m-yyyy, d.m.yyyy (also yy with / and -) and yyyy-mm-dd: day, month name, year (12/05/2024 -> اثني
@@ -19,7 +21,7 @@ text is brought to that form; the caller keeps the original. ``style`` "msa" rea
   وعشرين دقيقة.
 - Phone numbers (>= 8 digits) digit by digit: after a +, from a leading 0 (also in groups split by spaces or hyphens),
   or as 3+ hyphen-joined groups (800-123-4567). Other digit groups are separate numbers (100 200 300).
-- Signs: - (or −) before a digit at the start or after a space, a bracket, = : < > * / , ; (x=-5) is ناقص, + زائد
+- Signs: - (or −) before a digit at the start or after a space, a bracket, = : < > * / , ; (x>-5) is ناقص, + زائد
   (2010-2015 keeps its hyphen).
 - Dotted groups: 192.168.1.1, 1.2.3 as numbers joined by نقطة; 1.000.000 as one number.
 - Years with an era: 1445هـ -> ... هجري, 2024م -> ... ميلادي.
@@ -321,6 +323,8 @@ _TIME = re.compile(rf"(?<![\d:.,])(\d{{1,2}}):(\d{{2}})(?::(\d{{2}}))?(?![\d:]|[
 _HOUR = re.compile(rf"(الساعة\s?)(\d{{1,2}})\s?({_AMPM})(?![A-Za-z{_AR}])")
 _PHONE = re.compile(rf"(?<![\d.,])(?:\+\d[\d\- ]*\d|0\d{{7,}}|0\d{{1,4}}(?:[ \-]\d{{2,4}})+"
                     rf"|\d{{2,4}}(?:-\d{{2,4}}){{2,}}){_END}")  # >= 8 digits: _phone
+_EQUALS = re.compile(r"\s*=\s*")
+_CODE_BEFORE_EQUALS = frozenset("=<>!:+-*/%^&|~?")  # ==, <=, >=, !=, :=, +=, ...: code, not an equation
 _SIGN = re.compile(r"(?:(?<=[\s(\[{«\"'=:<>*/×÷,،;؛])|^)([-+])(?=\d)")
 _DOTTED = re.compile(rf"(?<![\d.,])\d+(?:\.\d+){{2,}}{_END}")
 _ERA = re.compile(rf"(?<![\d.,])(\d{{4}})\s?(ه|م)(?![{_AR}])")
@@ -369,6 +373,8 @@ def normalize(text: str, style: str = "colloquial") -> str:
     if _COMBINING_HAMZA.search(text):
         text = unicodedata.normalize("NFC", text)  # ا + hamza above -> أ, before the marks are dropped
     t = text.translate(_CHARS) if _MAPPED.search(text) else text
+    if "=" in t:
+        t = _EQUALS.sub(_equals, t)
     if _DIGIT.search(t):
         for gate, rule, repl in _GLUE_RULES:
             if gate.search(t):
@@ -381,6 +387,23 @@ def normalize(text: str, style: str = "colloquial") -> str:
         t = _DOCTOR.sub(_doctor, t)
     t = t.replace(",", "،").replace("?", "؟").replace(";", "؛")
     return (_SPACES.sub(" ", t) if "  " in t or "\t" in t else t).strip()
+
+
+def _equals(m: re.Match) -> str:
+    """= between two operands (x=-5, 5 = 5, س = ص) -> يساوي; not in a URL or a query string (?a=1&b=2), nor in code
+    (==, <=, >=, !=, :=, +=, =>)."""
+    s, i, j = m.string, m.start(), m.end()
+    eq = s.index("=", i)
+    if (eq and s[eq - 1] in _CODE_BEFORE_EQUALS) or s[eq + 1:eq + 2] in ("=", ">"):
+        return m.group(0)
+    if not i or j == len(s) or not (s[i - 1].isalnum() or s[i - 1] in ")]") \
+            or not (s[j].isalnum() or s[j] in "([-+−"):
+        return m.group(0)
+    end = s.find(" ", j)
+    word = s[s.rfind(" ", 0, i) + 1:len(s) if end < 0 else end]
+    if "://" in word or "?" in word or "&" in word or word.startswith("www."):  # a URL, a query string
+        return m.group(0)
+    return " يساوي "
 
 
 def _join(m: re.Match) -> str:

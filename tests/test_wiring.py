@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 import io
 import json
+import os
+import shutil
 from types import SimpleNamespace
 
 import numpy as np
@@ -480,12 +482,134 @@ def test_response_formats(server, monkeypatch, tmp_path, fmt, stream):
     assert rate == 48000 and abs(len(audio) / rate - 1.0) <= (0.06 if fmt == "mp3" and stream else 0.0)
 
 
-def test_unsupported_format_and_speed(server, tmp_path):
+def test_unsupported_format_and_speed(server, monkeypatch, tmp_path):
+    """Without ffmpeg on the PATH: no aac, no speed but 1.0 (400s that say so); OpenAI's speed bounds (422)."""
+    monkeypatch.setenv("PATH", str(tmp_path))  # (no ffmpeg)
     out = run(serve(server.build_app(server_args(tmp_path)), [
         {"input": "ok", "response_format": "aac"}, {"input": "ok", "speed": 1.5}, {"input": "ok", "speed": 5.0},
-        {"input": "ok", "speed": 0.1}, {"input": "ok", "speed": 1.0}]))
-    assert [status for status, _ in out] == [400, 400, 422, 422, 200]
-    assert b"pcm, wav, mp3, opus, flac" in out[0][1] and b"only 1.0" in out[1][1]
+        {"input": "ok", "speed": 0.1}, {"input": "ok", "speed": 1.0}, {"input": "ok", "response_format": "vorbis"}]))
+    assert [status for status, _ in out] == [400, 400, 422, 422, 200, 400]
+    assert b"pcm, wav, mp3, opus, flac (not 'aac'); it needs ffmpeg" in out[0][1] and b"only 1.0" in out[1][1]
+
+
+TONE_HZ = 220.0
+
+
+def tone_engine(monkeypatch, chunks: int = 10, pause: float = 0.005):
+    """The fake engine's audio: a 220 Hz tone at 48 kHz, ``chunks`` of 0.1 s, a pause between them (a stream)."""
+
+    async def generate(self, target_text, **kw):
+        t = np.arange(4800) / 48000
+        for i in range(chunks if target_text.endswith("ok") else 1):  # (the startup warm-up's texts: one chunk)
+            if i:
+                await asyncio.sleep(pause)
+            yield (np.sin(2 * np.pi * TONE_HZ * (t + i * 0.1)) * 8000).astype(np.int16)
+
+    monkeypatch.setattr(FakeEngine, "generate", generate)
+
+
+def decoded(body: bytes, fmt: str) -> np.ndarray:
+    """A response's audio as 48 kHz mono int16 (ffmpeg decodes all but pcm)."""
+    import subprocess
+
+    if fmt == "pcm":
+        return np.frombuffer(body, np.int16)
+    out = subprocess.run(["ffmpeg", "-v", "error", "-i", "-", "-f", "s16le", "-ac", "1", "-ar", "48000", "-"],
+                         input=body, capture_output=True, check=True).stdout
+    return np.frombuffer(out, np.int16)
+
+
+def pitch(audio: np.ndarray) -> float:
+    spectrum = np.abs(np.fft.rfft(audio.astype(np.float64) * np.hanning(len(audio))))
+    return float(np.argmax(spectrum) * 48000 / len(audio))
+
+
+needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="no ffmpeg on the PATH")
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("stream", [True, False])
+@pytest.mark.parametrize("speed", [1.0, 0.5, 1.5, 2.5])
+@pytest.mark.parametrize("fmt", ["pcm", "wav", "mp3", "opus", "flac", "aac"])
+def test_speed_and_aac_through_ffmpeg(server, monkeypatch, tmp_path, fmt, speed, stream):
+    """With ffmpeg: aac (ADTS), and a speed other than 1.0 by atempo for every format, streamed too: 1 s of a 220 Hz
+    tone comes back 1/speed s long at 220 Hz (the pitch kept)."""
+    tone_engine(monkeypatch)
+    asgi = server.build_app(server_args(tmp_path))
+    sent = []
+
+    async def main():
+        async with running(asgi):
+            body = json.dumps({"input": "ok", "response_format": fmt, "speed": speed, "stream": stream}).encode()
+            return await request(asgi, "POST", "/v1/audio/speech", body,
+                                 on_send=lambda m, gone: sent.append(m.get("body")))
+
+    status, headers, body = run(main())
+    assert status == 200, body[:300]
+    assert headers[b"content-type"] == (b"audio/aac" if fmt == "aac" else server.AUDIO_FORMATS[fmt][0])
+    if stream and fmt != "wav":  # sent as it comes
+        assert sum(1 for b in sent if b) >= 2
+    audio = decoded(body, fmt)
+    assert abs(len(audio) / 48000 - 1.0 / speed) < 0.08 + (0.06 if fmt == "mp3" else 0.0)  # (mp3: its padding)
+    assert abs(pitch(audio) - TONE_HZ) < 4.0
+
+
+@needs_ffmpeg
+def test_speed_1_takes_no_ffmpeg(server, monkeypatch, tmp_path):
+    """speed 1.0 (also given) is today's path, byte for byte: no ffmpeg process."""
+    tone_engine(monkeypatch)
+
+    def no_ffmpeg(*a, **kw):
+        raise AssertionError("ffmpeg at speed 1.0")
+
+    monkeypatch.setattr(server, "FfmpegStage", no_ffmpeg)
+    out = run(serve(server.build_app(server_args(tmp_path)), [
+        {"input": "ok", "response_format": "mp3"}, {"input": "ok", "response_format": "mp3", "speed": 1.0},
+        {"input": "ok"}, {"input": "ok", "speed": 1.0}]))
+    assert [status for status, _ in out] == [200] * 4
+    assert out[0][1] == out[1][1] and out[2][1] == out[3][1]
+
+
+def ffmpeg_children() -> list[int]:
+    """This process's ffmpeg children (zombies included)."""
+    me, found = os.getpid(), []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                fields = f.read().split()
+        except OSError:
+            continue
+        if fields[1] == "(ffmpeg)" and int(fields[3]) == me:
+            found.append(int(pid))
+    return found
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("fmt", ["aac", "pcm"])
+def test_a_client_gone_mid_stream_ends_ffmpeg(server, monkeypatch, tmp_path, fmt):
+    """A client that leaves after the first bytes of a stream through ffmpeg (aac, speed 1.5): its ffmpeg process
+    ends, no zombie left."""
+    tone_engine(monkeypatch, chunks=200, pause=0.02)  # 20 s of audio, 4 s to generate
+    asgi = server.build_app(server_args(tmp_path))
+    seen = []
+
+    async def main():
+        def on_send(m, gone):
+            if m.get("body"):
+                seen.extend(ffmpeg_children())
+                gone.set()  # the client leaves
+
+        async with running(asgi):
+            body = json.dumps({"input": "ok", "response_format": fmt, "speed": 1.5}).encode()
+            status, _, _ = await request(asgi, "POST", "/v1/audio/speech", body, on_send=on_send)
+            for _ in range(100):
+                if not ffmpeg_children():
+                    break
+                await asyncio.sleep(0.02)
+            return status
+
+    assert run(main()) == 200
+    assert seen and not ffmpeg_children()
 
 
 def metric_values(text: str) -> dict[str, float]:
