@@ -13,7 +13,7 @@ Endpoints (request shapes follow vLLM-Omni's, so one client can drive both serve
     GET    /v1/audio/voices
     DELETE /v1/audio/voices/{name}
     POST   /v1/audio/speech         JSON: input, voice, stream, response_format ("pcm" | "wav" | "mp3" | "opus" |
-                                    "flac"), speed (1.0 only), clone_mode, seed, cfg_value, max_tokens, split,
+                                    "flac" | "aac"), speed (0.25-4), clone_mode, seed, cfg_value, max_tokens, split,
                                     normalize (default true)
     GET    /v1/models, /health
 
@@ -24,9 +24,12 @@ the voice has a transcript), "ref" (reference prefix only, the default otherwise
 Audio is 16-bit little-endian mono PCM at the model's output rate (header X-Sample-Rate), streamed per chunk.
 response_format (AUDIO_FORMATS; "pcm" by default, OpenAI's default is "mp3"): "mp3" (constant bitrate), "opus" (Ogg)
 and "flac" are encoded as the audio comes (streamed, a page of Ogg per 100 ms); "wav" is sent whole (its header holds
-the length). "aac" is not offered (libsndfile does not encode it). ``speed`` other than 1.0 is a 400: a time-stretch
-that keeps the pitch was not available in good quality. ``cfg_value`` has no effect with the distilled LocDiT (the
-default), which runs without CFG; it applies with ``--dit none``.
+the length). With an ``ffmpeg`` binary on the PATH (the Docker image has one): "aac" (ADTS, encoded as the audio
+comes), and ``speed`` 0.25-4 (OpenAI's bounds) through ffmpeg's atempo, which keeps the pitch, streamed too
+(FfmpegStage: ~50 ms to its first audio); without ffmpeg, "aac" and a speed other than 1.0 are a 400. Speed 1.0 never
+runs ffmpeg.
+``cfg_value`` has no effect with the distilled LocDiT (the default), which runs without CFG; it applies with
+``--dit none``.
 
 Long input is split into sentences (``split_text``) that are generated one after another into the same stream: the
 first audio comes from the first sentence, and no request is longer than a sentence. ``--voice-dir`` keeps
@@ -81,10 +84,12 @@ import math
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
 import time
 import wave
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -227,8 +232,8 @@ class SpeechRequest(BaseModel):
     model: str | None = None
     stream: bool = True
     stream_format: str | None = None  # accepted for OpenAI / vLLM-Omni compatibility
-    response_format: str = "pcm"  # AUDIO_FORMATS
-    speed: float = Field(1.0, ge=0.25, le=4.0)  # OpenAI's bounds; only 1.0 is served (respond)
+    response_format: str = "pcm"  # AUDIO_FORMATS, and FFMPEG_FORMATS with ffmpeg
+    speed: float = Field(1.0, ge=0.25, le=4.0)  # OpenAI's bounds; other than 1.0 with ffmpeg only (FfmpegStage)
     clone_mode: str | None = None
     seed: int | None = None
     # (NaN and infinity fail the bounds)
@@ -341,6 +346,91 @@ def encode_audio(fmt: str, pcm: bytes, sample_rate: int) -> bytes:
     enc = AudioEncoder(fmt, sample_rate)
     enc.feed(pcm)
     return enc.whole()
+
+
+# response_format: Content-Type, encoded by ffmpeg (FfmpegStage) when its binary is on the PATH
+FFMPEG_FORMATS = {"aac": b"audio/aac"}
+
+
+def ffmpeg_binary() -> str | None:
+    return shutil.which("ffmpeg")
+
+
+def atempo_filter(speed: float) -> str:
+    """ffmpeg's atempo filter for ``speed`` (0.25-4): a chain of stages within 0.5-2, the range every ffmpeg takes."""
+    stages = []
+    while speed > 2.0:
+        stages.append(2.0)
+        speed /= 2.0
+    while speed < 0.5:
+        stages.append(0.5)
+        speed /= 0.5
+    return ",".join(f"atempo={s:.6g}" for s in stages + [speed])
+
+
+class FfmpegStage:
+    """16-bit mono PCM through an ffmpeg process: ``speed`` other than 1.0 by atempo (it keeps the pitch), out as ADTS
+    AAC (``aac``) or as PCM. write() and end() feed it; output() yields what it gives as it comes (PCM in whole
+    samples). Its stdout and stderr are read by tasks of their own: a full pipe never holds the writer, and the event
+    loop never waits on the process. ``-probesize 32 -analyzeduration 0``: else it took ~1 s of audio before its
+    first output (now ~50 ms, the process start included). kill(): a client gone, an error."""
+
+    def __init__(self, ffmpeg: str, sample_rate: int, speed: float = 1.0, aac: bool = False) -> None:
+        self.args = [ffmpeg, "-hide_banner", "-loglevel", "error", "-probesize", "32", "-analyzeduration", "0",
+                     "-f", "s16le", "-ar", str(sample_rate), "-ac", "1", "-i", "pipe:0"]
+        if speed != 1.0:
+            self.args += ["-af", atempo_filter(speed)]
+        self.args += (["-c:a", "aac", "-b:a", "96k", "-f", "adts"] if aac else ["-f", "s16le"])
+        self.args += ["-flush_packets", "1", "pipe:1"]
+        self.aligned = not aac
+        self.proc: asyncio.subprocess.Process | None = None
+        self.err = b""
+
+    async def start(self) -> None:
+        self.proc = await asyncio.create_subprocess_exec(*self.args, stdin=asyncio.subprocess.PIPE,
+                                                         stdout=asyncio.subprocess.PIPE,
+                                                         stderr=asyncio.subprocess.PIPE)
+        self.errors = asyncio.create_task(self._errors())
+
+    async def _errors(self) -> None:
+        self.err = (await self.proc.stderr.read())[-2000:]
+
+    async def write(self, pcm: bytes) -> None:
+        self.proc.stdin.write(pcm)
+        await self.proc.stdin.drain()
+
+    def end(self) -> None:
+        self.proc.stdin.close()
+
+    async def output(self) -> AsyncIterator[bytes]:
+        held = b""  # (PCM: an odd byte, the rest of its sample to come)
+        while data := await self.proc.stdout.read(1 << 16):
+            data = held + data
+            n = len(data) - (len(data) % 2 if self.aligned else 0)
+            held = data[n:]
+            if n:
+                yield data[:n]
+        await self.errors
+        if await self.proc.wait() != 0:
+            raise RuntimeError("ffmpeg failed: " + self.err.decode(errors="replace").strip()[-300:])
+
+    async def run(self, pcm: bytes) -> bytes:
+        """A whole clip through it."""
+        self.proc = await asyncio.create_subprocess_exec(*self.args, stdin=asyncio.subprocess.PIPE,
+                                                         stdout=asyncio.subprocess.PIPE,
+                                                         stderr=asyncio.subprocess.PIPE)
+        try:
+            out, self.err = await self.proc.communicate(pcm)
+        finally:
+            self.kill()
+        if self.proc.returncode != 0:
+            raise RuntimeError("ffmpeg failed: " + self.err.decode(errors="replace").strip()[-300:])
+        return out[:len(out) - (len(out) % 2 if self.aligned else 0)]
+
+    def kill(self) -> None:
+        if self.proc is not None and self.proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                self.proc.kill()
 
 
 def brief(detail) -> str:
@@ -909,6 +999,8 @@ def build_app(args: argparse.Namespace):
             metrics.audio.inc(by=samples / state["sample_rate"])
             await gen.aclose()
 
+    ffmpeg = ffmpeg_binary()  # aac and a speed other than 1.0 (FfmpegStage); None: not on the PATH
+
     async def respond(body: bytes, send, t0: float, client: Client | None = None) -> str:
         """A speech request's response, once its body is read (speech): its outcome (metrics). Beyond its client's
         limits (max_streams, rpm): 429 with Retry-After, after the server's own (--max-streams: 503)."""
@@ -916,11 +1008,13 @@ def build_app(args: argparse.Namespace):
         retry = None
         try:
             req = SpeechRequest.model_validate_json(body)
-            if req.response_format not in AUDIO_FORMATS:
-                raise HTTPException(400, f"response_format: one of {', '.join(AUDIO_FORMATS)} (not "
-                                         f"{req.response_format!r})")
-            if req.speed != 1.0:  # (a time-stretch that keeps the pitch, in good quality, is not available here)
-                raise HTTPException(400, "speed: only 1.0 is supported")
+            formats = [*AUDIO_FORMATS, *(FFMPEG_FORMATS if ffmpeg else ())]
+            if req.response_format not in formats:
+                raise HTTPException(400, f"response_format: one of {', '.join(formats)} (not {req.response_format!r})"
+                                         + ("; it needs ffmpeg on the server" if req.response_format in FFMPEG_FORMATS
+                                            else ""))
+            if req.speed != 1.0 and not ffmpeg:  # (atempo keeps the pitch; no time-stretch as good without it)
+                raise HTTPException(400, "speed: only 1.0 is supported (another speed needs ffmpeg on the server)")
             if len(req.input) > args.max_input_chars:
                 raise HTTPException(400, f"input: at most {args.max_input_chars} characters (--max-input-chars)")
             if not engine_alive():
@@ -970,19 +1064,37 @@ def build_app(args: argparse.Namespace):
                 raise HTTPException(503, "the engine process died; the server restarts") from e
         except HTTPException as e:
             return await refuse(send, e.status_code, e.detail, who=client)
-        enc = None
+        enc = ff = pumping = None
         try:
             sr = str(state["sample_rate"]).encode()
             fmt = req.response_format
-            ctype = AUDIO_FORMATS[fmt][0]
+            ctype = AUDIO_FORMATS[fmt][0] if fmt in AUDIO_FORMATS else FFMPEG_FORMATS[fmt]
+            # through ffmpeg (FfmpegStage): a speed other than 1.0 (atempo), aac; mp3, opus or flac after it as without
+            through = fmt in FFMPEG_FORMATS or req.speed != 1.0
             if req.stream and fmt != "wav":
                 # pcm as it comes; mp3, opus and flac encoded as it comes, in a thread (libsndfile's calls release the
                 # GIL: the loop serves the other streams meanwhile)
-                enc = None if fmt == "pcm" else AudioEncoder(fmt, int(sr))
+                enc = None if fmt == "pcm" or fmt in FFMPEG_FORMATS else AudioEncoder(fmt, int(sr))
                 await send({"type": "http.response.start", "status": 200,
                             "headers": [(b"content-type", ctype), (b"x-sample-rate", sr)]})
                 chunk = first
-                while chunk is not None:
+                if through and chunk is not None:
+                    ff = FfmpegStage(ffmpeg, int(sr), req.speed, aac=fmt in FFMPEG_FORMATS)
+                    await ff.start()
+
+                    async def pump():  # ffmpeg's output on to the client as it comes
+                        async for data in ff.output():
+                            body = data if enc is None else await asyncio.to_thread(enc.feed, data)
+                            if body:
+                                await send({"type": "http.response.body", "body": body, "more_body": True})
+
+                    pumping = asyncio.create_task(pump())
+                    while chunk is not None and not pumping.done():
+                        await ff.write(pcm16(chunk))
+                        chunk = await anext(gen, None)
+                    ff.end()
+                    await pumping  # (the rest of its output; its error, if it failed)
+                while chunk is not None and ff is None:
                     body = pcm16(chunk) if enc is None else await asyncio.to_thread(enc.feed, pcm16(chunk))
                     if body:
                         await send({"type": "http.response.body", "body": body, "more_body": True})
@@ -993,12 +1105,20 @@ def build_app(args: argparse.Namespace):
             chunks = [] if first is None else [pcm16(first)]
             async for chunk in gen:
                 chunks.append(pcm16(chunk))
-            out = await asyncio.to_thread(encode_audio, fmt, b"".join(chunks), int(sr))
+            pcm = b"".join(chunks)
+            if through and pcm:
+                ff = FfmpegStage(ffmpeg, int(sr), req.speed, aac=fmt in FFMPEG_FORMATS)
+                pcm = await ff.run(pcm)
+            out = pcm if fmt in FFMPEG_FORMATS else await asyncio.to_thread(encode_audio, fmt, pcm, int(sr))
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", ctype), (b"content-length", str(len(out)).encode()),
                                     (b"x-sample-rate", sr)]})
             await send({"type": "http.response.body", "body": out})
         finally:
+            if pumping is not None and not pumping.done():  # (a client gone, an error: ffmpeg ends with it)
+                pumping.cancel()
+            if ff is not None:
+                ff.kill()
             if enc is not None:  # (a client gone: libsndfile's file closed now, not by the garbage collector)
                 with contextlib.suppress(Exception):
                     enc.close()

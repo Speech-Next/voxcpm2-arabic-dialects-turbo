@@ -115,8 +115,17 @@ def test_signs():
            ("−2.5", "ناقص اثنين فاصلة خمسة"), ("+5", "زائد خمسة"), ("-5%", "ناقص خمسة بالمية"),
            ("COVID-19", "COVID-تسعة عشر")])
     # after = : < > and the like the sign was left as a bare hyphen
-    check([("x=-5", "x=ناقص خمسة"), ("x=+5", "x=زائد خمسة"), ("س=-2.5", "س=ناقص اثنين فاصلة خمسة"),
+    check([("x=-5", "x يساوي ناقص خمسة"), ("x=+5", "x يساوي زائد خمسة"), ("س=-2.5", "س يساوي ناقص اثنين فاصلة خمسة"),
            ("الحرارة:-5", "الحرارة:ناقص خمسة"), ("x>-5", "x>ناقص خمسة"), ("-5،-3", "ناقص خمسة،ناقص ثلاثة")])
+
+
+def test_equals():
+    check([("5=5", "خمسة يساوي خمسة"), ("a = b", "a يساوي b"), ("س = ص", "س يساوي ص"), ("(2)=2", "(اثنين) يساوي اثنين"),
+           ("المجموع=10 جنيه", "المجموع يساوي عشرة جنيه")])
+    # not between two operands, in a URL or a query string, in code
+    for text in ["?a=1&b=2", "https://x.com/?q=5", "www.x.com/a=b", "a==b", "a!=b", "x<=y", "x>=y", "a:=b", "x+=y",
+                 "a=>b", "= 5", "x =", "="]:
+        assert normalize(text) == text or "يساوي" not in normalize(text), text
 
 
 def test_dotted_groups():

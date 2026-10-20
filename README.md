@@ -132,8 +132,11 @@ curl http://127.0.0.1:8092/v1/audio/speech -H 'Content-Type: application/json' \
 
 `response_format`: `pcm` (the default: raw 16-bit, rate in `X-Sample-Rate`), `wav` (sent whole), and `mp3`
 (constant bitrate, ~96 kbit/s), `opus` (Ogg) and `flac`, which are streamed as they are encoded (a streamed flac carries
-no length). OpenAI's default is mp3; `aac` is not offered. `speed` other than 1.0 is a 400 (no time-stretch that keeps
-the pitch in good quality). `cfg_value` has no effect with the distilled LocDiT (the default), only with `--dit none`.
+no length). OpenAI's default is mp3. With `ffmpeg` on the server's PATH (the Docker image has it) also `aac` (ADTS,
+streamed as it is encoded), and `speed` 0.25-4 for every format, by ffmpeg's `atempo`: the pitch stays, streamed too.
+Through ffmpeg the first audio comes ~50 ms later (its process starts); speed 1.0 never runs it. Without ffmpeg, `aac`
+and a speed other than 1.0 are a 400. `cfg_value` has no effect with the distilled LocDiT (the default), only with
+`--dit none`.
 
 ## Production
 
