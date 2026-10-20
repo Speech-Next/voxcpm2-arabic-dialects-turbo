@@ -7,7 +7,7 @@ import multiprocessing as mp
 import os
 import threading
 
-from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, _channel
+from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, _Channel
 
 
 class _NonBlockingReaderLoop(asyncio.SelectorEventLoop):
@@ -19,7 +19,7 @@ class _NonBlockingReaderLoop(asyncio.SelectorEventLoop):
 
 
 def test_a_message_larger_than_the_pipe_arrives_whole():
-    ch = _channel(mp.get_context("spawn"))
+    ch = _Channel(mp.get_context("spawn"))
     got = []
     srv = AsyncVoxCPM2Server.__new__(AsyncVoxCPM2Server)  # (only the reading side: no engine)
     srv.queue_out, srv._convert, srv._handle = ch, (lambda res: res), got.append

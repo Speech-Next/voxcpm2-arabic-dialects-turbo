@@ -3,7 +3,6 @@ import contextlib
 import io
 import itertools
 import os
-import threading
 import time
 from collections import deque
 
@@ -33,27 +32,18 @@ Waveform = NDArray[np.float32]
 # followed by more (0 = once per event-loop pass). The engine registers a burst's first commands while the client is
 # still building the rest: 200 requests took ~3 ms to submit and ~5 ms to register, one after the other.
 _FLUSH_EVERY = int(os.environ.get("NANOVLLM_SUBMIT_FLUSH_EVERY", "48") or 0)
-
-# NANOVLLM_CLIENT_TOKENIZE (default 1): the client tokenizes a batch of requests' texts (the engine's own tokenizer,
-# sent with init_ok) as it sends them, and the engine registers them with those ids. Registering a burst is serial
-# work in the engine process, which first audio waits for: tokenizing was ~21 of its ~58 us per request (200 at once:
-# ~4.5 of ~12 ms), while the client built 48 requests in ~1 ms and then waited. The two processes now share the work
-# (200 at once: registered ~1.5 ms sooner). Same ids and offsets: the same library and tokenizer; texts the engine
-# tokenizes differently (CJK: the wrapper's character split) and single requests are left to it.
-_CLIENT_TOKENIZE = os.environ.get("NANOVLLM_CLIENT_TOKENIZE", "1") != "0"
-# NANOVLLM_SUBMIT_FLUSH_FIRST=k (default 16): a burst's first flush comes after k commands (then every
-# NANOVLLM_SUBMIT_FLUSH_EVERY): the engine starts registering while the client builds and tokenizes the rest
-_FLUSH_FIRST = int(os.environ.get("NANOVLLM_SUBMIT_FLUSH_FIRST", "16") or 0)
-# NANOVLLM_EMIT_BLOCK (default 1): a prefill step's first audio (equal-length chunks, one per stream) goes through the
-# shared ring as one block and one message item; the client splits it into the streams' chunks. Per-chunk writes,
-# items and reads for 200 streams were ~0.8 ms in the engine and ~0.8 ms in the client, before the first audio's
-# dispatch; one block saves ~0.5 ms of it.
-_EMIT_BLOCK = os.environ.get("NANOVLLM_EMIT_BLOCK", "1") != "0"
+# A burst's first flush comes after this many commands (then every _FLUSH_EVERY): the engine starts registering
+# while the client builds and tokenizes the rest
+_FLUSH_FIRST = 16
 
 
+# A prefill step's first audio (equal-length chunks, one per stream) goes through the shared ring as one block and
+# one message item; the client splits it into the streams' chunks. Per-chunk writes, items and reads for 200 streams
+# were ~0.8 ms in the engine and ~0.8 ms in the client, before the first audio's dispatch; one block saves ~0.5 ms of
+# it.
 def _block_item(ring, seq_ids, waves) -> dict | None:
-    """Equal-length chunks of several streams written to the ring as one block: the message item (NANOVLLM_EMIT_BLOCK),
-    or None (no ring, one stream, or chunks that differ)."""
+    """Equal-length chunks of several streams written to the ring as one block: the message item, or None (no ring,
+    one stream, or chunks that differ)."""
     if ring is None or len(waves) < 2 or not isinstance(waves[0], np.ndarray) or not waves[0].size:
         return None
     shape, dtype = waves[0].shape, waves[0].dtype
@@ -65,14 +55,20 @@ def _block_item(ring, seq_ids, waves) -> dict | None:
             "dtype": block.dtype.str, "shape": block.shape}
 
 
+# The client tokenizes a batch of requests' texts (the engine's own tokenizer, sent with init_ok) as it sends them,
+# and the engine registers them with those ids. Registering a burst is serial work in the engine process, which first
+# audio waits for: tokenizing was ~21 of its ~58 us per request (200 at once: ~4.5 of ~12 ms), while the client built
+# 48 requests in ~1 ms and then waited. The two processes now share the work (200 at once: registered ~1.5 ms
+# sooner). Same ids and offsets: the same library and tokenizer; texts the engine tokenizes differently (CJK: the
+# wrapper's character split) and single requests are left to it.
 class _TokenizerSync:
-    """The engine's tokenizer as its client has it (NANOVLLM_CLIENT_TOKENIZE). The tokenizer can change after start
-    (registering a tagged adapter installs one that reads its dialect tags as single tokens): the client then gets
-    the new one (message "tokenizer", with a new version), and ids tokenized with another version are not used."""
+    """The engine's tokenizer as its client has it. The tokenizer can change after start (registering a tagged
+    adapter installs one that reads its dialect tags as single tokens): the client then gets the new one (message
+    "tokenizer", with a new version), and ids tokenized with another version are not used."""
 
     def __init__(self, llm) -> None:
         self.llm, self.version = llm, 0
-        self.backend = self._current() if _CLIENT_TOKENIZE and hasattr(llm, "pretokenize") else None
+        self.backend = self._current() if hasattr(llm, "pretokenize") else None
 
     def _current(self):
         return getattr(getattr(getattr(self.llm, "tokenizer", None), "tokenizer", None), "_tokenizer", None)
@@ -82,7 +78,7 @@ class _TokenizerSync:
 
     def changed(self) -> dict | None:
         """The message for the client when the engine's tokenizer was replaced since the last call, else None."""
-        if self.backend is None:  # (no client tokenizing: off, or no fast tokenizer at start)
+        if self.backend is None:  # (no client tokenizing: no fast tokenizer at start)
             return None
         b = self._current()
         if b is self.backend:
@@ -348,6 +344,20 @@ def _get_by(queue_in, t_end: float):
                 return None
 
 
+# Admission window when the engine is idle: keep collecting requests while they are still arriving
+# (gaps < _QUEUE_GAP_MS) until one prefill group is waiting, for at most _QUEUE_COALESCE_MS.
+# A burst sent over HTTP reaches the engine over several milliseconds; starting the first prefill step on its
+# first few requests would make everybody else wait for that small step. An isolated request waits one gap.
+_QUEUE_COALESCE_MS = 10.0
+_QUEUE_GAP_MS = 1.0
+# A client's turn that ends with at least _QUEUE_BATCH_GO requests in the window ends the window at once: the client
+# sends what it was handed in one event-loop turn (in chunks marked "more", then the rest), so a burst that
+# arrived whole does not wait a further gap for stragglers. While the client promises more, the window waits
+# past the gap and the deadline, up to _QUEUE_MORE_MS.
+_QUEUE_BATCH_GO = 64
+_QUEUE_MORE_MS = 20.0
+
+
 def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
     import signal
 
@@ -355,26 +365,6 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
     # The fast tokenizer's worker pool (rayon) defaults to one thread per CPU: on this 96-CPU host a chunk of 48
     # texts took 0.9 ms hot / 1.9 ms after idle with 96 workers, 0.4 / 1.0 ms with 16 (set before the pool starts).
     os.environ.setdefault("RAYON_NUM_THREADS", "16")
-    # Admission window when the engine is idle: keep collecting requests while they are still arriving
-    # (gaps < NANOVLLM_QUEUE_GAP_MS) until one prefill group is waiting, for at most NANOVLLM_QUEUE_COALESCE_MS.
-    # A burst sent over HTTP reaches the engine over several milliseconds; starting the first prefill step on its
-    # first few requests would make everybody else wait for that small step. An isolated request waits one gap.
-    try:
-        coalesce_ms = float(os.environ.get("NANOVLLM_QUEUE_COALESCE_MS", "10"))
-    except ValueError:
-        coalesce_ms = 10.0
-    if coalesce_ms > 0:
-        coalesce_ms = min(coalesce_ms, 50.0)
-    try:
-        gap_ms = float(os.environ.get("NANOVLLM_QUEUE_GAP_MS", "1"))
-    except ValueError:
-        gap_ms = 1.0
-    # A client's turn that ends with at least this many requests in the window ends the window at once: the client
-    # sends what it was handed in one event-loop turn (in chunks marked "more", then the rest), so a burst that
-    # arrived whole does not wait a further gap for stragglers. While the client promises more, the window waits
-    # past the gap and the deadline, up to NANOVLLM_QUEUE_MORE_MS.
-    batch_go = int(os.environ.get("NANOVLLM_QUEUE_BATCH_GO", "64"))
-    more_ms = float(os.environ.get("NANOVLLM_QUEUE_MORE_MS", "20"))
 
     try:
         srv = VoxCPM2ServerImpl(*args, **kwargs)
@@ -382,28 +372,25 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
         queue_out.put({"type": "init_error", "error": traceback.format_exc()})
         return
     else:
-        ring = None
-        if os.environ.get("NANOVLLM_SHM_AUDIO", "1") != "0":
-            try:
-                ring = _AudioRing(size=int(float(os.environ.get("NANOVLLM_SHM_AUDIO_MB", "128")) * 2**20))
-                import atexit
+        try:
+            ring = _AudioRing(size=128 << 20)
+            import atexit
 
-                atexit.register(ring.close)
-            except Exception:  # no shared memory: chunks travel pickled
-                ring = None
+            atexit.register(ring.close)
+        except Exception:  # no shared memory: chunks travel pickled
+            ring = None
         tok_sync = _TokenizerSync(getattr(srv, "llm", None))
         queue_out.put({"type": "init_ok", "shm": ring.shm.name if ring is not None else None,
                        **tok_sync.init_fields()})
-        if os.environ.get("NANOVLLM_GC_FREEZE", "1") != "0":
-            # the model's objects live in a frozen generation and generation 0 collects less often: full
-            # collections over them otherwise land inside steps (tens of ms in a burst)
-            import gc
+        # the model's objects live in a frozen generation and generation 0 collects less often: full
+        # collections over them otherwise land inside steps (tens of ms in a burst)
+        import gc
 
-            gc.collect()
-            gc.freeze()
-            # no automatic collection at all: generation-0 collections landed inside the registration of a burst
-            # (4.7 -> 8-10 ms every other burst of 200); the loop collects young objects when no request waits
-            gc.disable()
+        gc.collect()
+        gc.freeze()
+        # no automatic collection at all: generation-0 collections landed inside the registration of a burst
+        # (4.7 -> 8-10 ms every other burst of 200); the loop collects young objects when no request waits
+        gc.disable()
 
     states = {"is_stoped": False}
 
@@ -421,21 +408,11 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
         except Exception:
             return {"type": "error", "id": opid, "error": traceback.format_exc()}
 
-    # NANOVLLM_CPROFILE=<file>: cProfile of the first steps and of the registrations, dumped at exit
-    _cprof, _cprof_left = None, [0]
-    if os.environ.get("NANOVLLM_CPROFILE"):
-        import cProfile
-
-        _cprof, _cprof_left = cProfile.Profile(), [int(os.environ.get("NANOVLLM_CPROFILE_STEPS", "400"))]
-        import atexit
-
-        atexit.register(lambda: _cprof.dump_stats(os.environ["NANOVLLM_CPROFILE"]))
-
     # Commands received but not yet executed. A burst arrives as one "batch"; only the first
-    # FIRST_CHUNK requests are registered before the next step starts, the rest are registered by
+    # first_chunk requests are registered before the next step starts, the rest are registered by
     # the runner's overlap hook while the GPU computes that step.
     deferred: deque = deque()
-    first_chunk = int(os.environ.get("NANOVLLM_FIRST_CHUNK", "96"))
+    first_chunk = 96
 
     reg_parts = [0.0, 0.0, 0.0]  # the last registration's ms: pretokenize, add_request calls, responses out
 
@@ -451,7 +428,7 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
                 text = _request_text(cmd)
                 if text is not None:
                     texts.append(text)
-                    tok = tok_sync.accept(cmd.pop("tok", None))  # tokenized by the client (NANOVLLM_CLIENT_TOKENIZE)
+                    tok = tok_sync.accept(cmd.pop("tok", None))  # tokenized by the client
                     if tok is not None:
                         done[text] = tok
             if texts:
@@ -500,11 +477,7 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
             deferred.extend(cmd["cmds"])
             # register now only what the next prefill step can take; a burst that arrives in several batches
             # (HTTP) would otherwise register every batch's first chunk before the first step starts
-            if _cprof is not None:
-                _cprof.enable()
             run_deferred(min(first_chunk, max(1, group - n_waiting())))
-            if _cprof is not None:
-                _cprof.disable()
             if _profile.StepProfile.enabled:
                 _profile.log(kind="batch_recv", t=t_recv, n=len(cmd["cmds"]), register_ms=(time.perf_counter() - t_recv) * 1000,
                              pretok_ms=reg_parts[0], add_ms=reg_parts[1], resp_ms=reg_parts[2],
@@ -514,10 +487,9 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
         put(tok_sync.changed())  # (e.g. a tagged adapter's registration replaced it; ahead of the response)
         return res
 
-    # NANOVLLM_DEFER_EMIT (default 1): a step's audio is written out (shared-memory ring, queue) during the next
-    # step's GPU work (overlap_hook) instead of between the two steps, when the GPU had nothing to do (#31: ~2.5 ms
-    # of 200 streams); it is sent at once when no step follows
-    defer_emit = os.environ.get("NANOVLLM_DEFER_EMIT", "1") != "0"
+    # A step's audio is written out (shared-memory ring, queue) during the next step's GPU work (overlap_hook)
+    # instead of between the two steps, when the GPU had nothing to do (#31: ~2.5 ms of 200 streams); it is sent at
+    # once when no step follows
     pending: list = []  # the last step's (stream id, its audio or None: the stream's end)
 
     def flush_pending() -> None:
@@ -553,7 +525,7 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
     def emit_hook(seq_ids, waves) -> None:
         """Audio that leaves before its step ends (the first half of a prefill step's patch)."""
         t_in = time.perf_counter()
-        block = _block_item(ring, seq_ids, waves) if _EMIT_BLOCK else None
+        block = _block_item(ring, seq_ids, waves)
         items = [block] if block is not None else [stream_item(i, w) for i, w in zip(seq_ids, waves)]
         queue_out.put({"type": "batch", "items": items})
         if _profile.StepProfile.enabled:
@@ -596,24 +568,24 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
             window.update(n=0, end=False)
             put(handle(cmd))
 
-        if coalesce_ms > 0:
-            t_open = time.perf_counter()
-            deadline, hard = t_open + coalesce_ms / 1000.0, t_open + max(coalesce_ms, more_ms) / 1000.0
-            while not states["is_stoped"] and n_waiting() + len(deferred) < group \
-                    and not (window["end"] and window["n"] >= batch_go):
-                more = not window["end"]
-                remaining = (hard if more else deadline) - time.perf_counter()
-                if remaining <= 0:
+        t_open = time.perf_counter()
+        deadline = t_open + _QUEUE_COALESCE_MS / 1000.0
+        hard = t_open + max(_QUEUE_COALESCE_MS, _QUEUE_MORE_MS) / 1000.0
+        while not states["is_stoped"] and n_waiting() + len(deferred) < group \
+                and not (window["end"] and window["n"] >= _QUEUE_BATCH_GO):
+            more = not window["end"]
+            remaining = (hard if more else deadline) - time.perf_counter()
+            if remaining <= 0:
+                break
+            try:
+                cmd = queue_in.get_nowait()
+            except Empty:  # idle until the next request: prepare the step for the ones registered so far
+                gap_end = time.perf_counter() + _QUEUE_GAP_MS / 1000.0  # the gap counts from here, as before
+                prepare()
+                cmd = _get_by(queue_in, hard if more else min(deadline, gap_end))
+                if cmd is None:
                     break
-                try:
-                    cmd = queue_in.get_nowait()
-                except Empty:  # idle until the next request: prepare the step for the ones registered so far
-                    gap_end = time.perf_counter() + gap_ms / 1000.0  # the gap counts from here, as before
-                    prepare()
-                    cmd = _get_by(queue_in, hard if more else min(deadline, gap_end))
-                    if cmd is None:
-                        break
-                put(handle(cmd))
+            put(handle(cmd))
 
         if srv.is_finished():
             run_deferred(first_chunk)
@@ -628,15 +600,7 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
                 break
 
             t_step = time.perf_counter()
-            if _cprof is not None and _cprof_left[0] > 0:  # NANOVLLM_CPROFILE=<file>: the first steps' host time
-                _cprof.enable()
-                output = srv.step()
-                _cprof.disable()
-                _cprof_left[0] -= 1
-                if _cprof_left[0] == 0:
-                    _cprof.dump_stats(os.environ["NANOVLLM_CPROFILE"])
-            else:
-                output = srv.step()
+            output = srv.step()
             t_put = time.perf_counter()
             flush_pending()  # (a step without the hook: nothing ran)
             for seq in output:
@@ -645,7 +609,7 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
                 if seq.is_finished and not getattr(seq.custom_payload, "chained", False):  # head start continues
                     pending.append((seq.seq_id, None))
             _profile.host_mark("emit_build")
-            if not defer_emit or srv.is_finished() or states["is_stoped"]:  # no step follows to carry it
+            if srv.is_finished() or states["is_stoped"]:  # no step follows to carry it
                 flush_pending()
             _profile.host_mark("emit_put")
             collect_if_idle()
@@ -712,16 +676,11 @@ class _AudioRing:
             self.shm.unlink()
 
 
-_BRIDGE_POLL_S = float(os.environ.get("NANOVLLM_BRIDGE_POLL_S", "0.1"))  # idle wake-up of the receiving thread
+_WATCH_ENGINE_S = 0.1  # how often the client checks that the engine process is alive
 # NANOVLLM_BUSY_POLL_S=s (default 30): the client's event loop does not block for s seconds after its last request or
 # engine message (the engine's main loop spins the same way): a burst's submission and its first audio's dispatch run
 # at full clock
 _BUSY_POLL_S = float(os.environ.get("NANOVLLM_BUSY_POLL_S", "30") or 0)
-
-
-def _channel(ctx):
-    """_Channel for a multiprocessing context; the context's own Queue otherwise (e.g. threads in tests)."""
-    return _Channel(ctx) if hasattr(ctx, "SimpleQueue") else ctx.Queue()
 
 
 class _Channel:
@@ -767,8 +726,8 @@ class AsyncVoxCPM2Server:
         if len(kwargs) > 0:
             raise ValueError(f"Unknown kwargs: {kwargs}")
         ctx = mp.get_context("spawn")
-        self.queue_in = _channel(ctx)
-        self.queue_out = _channel(ctx)
+        self.queue_in = _Channel(ctx)
+        self.queue_out = _Channel(ctx)
         self.process = ctx.Process(
             target=main_loop,
             args=(
@@ -795,34 +754,20 @@ class AsyncVoxCPM2Server:
         self.op_table: dict[str, asyncio.Future[Any]] = {}
         self._pending_cmds: list[dict[str, Any]] = []
         self.stream_table: dict[str, asyncio.Queue[Waveform | None]] = {}
-        self._queue_out_async: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self._queue_out_stop = threading.Event()
         self._last_activity = time.perf_counter()
         self._wake = asyncio.Event()
         self._spin_task = asyncio.create_task(self._keep_warm()) if _BUSY_POLL_S > 0 else None
-        # The engine's output is read in the event loop's own thread when the channel exposes its pipe: a receiving
-        # thread hands every message over through call_soon_threadsafe and must take the GIL from the loop thread
-        # first (a burst's first audio waited 23 ms behind a busy loop thread). NANOVLLM_CLIENT_READER=thread: the
-        # receiving thread.
-        reader = getattr(getattr(self.queue_out, "_q", None), "_reader", None)
-        if reader is not None and os.environ.get("NANOVLLM_CLIENT_READER", "loop") != "thread":
-            self._attach_reader(loop, reader)
-            self.recv_task: asyncio.Task = asyncio.create_task(self._watch_engine())
-            return
-        self._queue_out_thread = threading.Thread(
-            target=self._queue_out_bridge,
-            args=(loop,),
-            name="voxcpm2-queue-out",
-            daemon=True,
-        )
-        self._queue_out_thread.start()
-        self.recv_task = asyncio.create_task(self.recv_queue())
+        # The engine's output is read in the event loop's own thread: a receiving thread hands every message over
+        # through call_soon_threadsafe and must take the GIL from the loop thread first (a burst's first audio
+        # waited 23 ms behind a busy loop thread).
+        self._attach_reader(loop, self.queue_out._q._reader)
+        self.recv_task: asyncio.Task = asyncio.create_task(self._watch_engine())
 
     _reader = None
     _ring = None
-    _tokenizer = None  # the engine's tokenizer (init_ok, "tokenizer" messages), NANOVLLM_CLIENT_TOKENIZE
+    _tokenizer = None  # the engine's tokenizer (init_ok, "tokenizer" messages), the client tokenizes with it
     _tok_version = 0  # its version: the engine uses only ids tokenized with its current one
-    _first_flush = True  # the next flush is a burst's first (NANOVLLM_SUBMIT_FLUSH_FIRST)
+    _first_flush = True  # the next flush is a burst's first (_FLUSH_FIRST)
     _more_sent = False  # this event-loop turn sent commands marked "more": its end must reach the engine
     _spin_task = None
     _wake = None
@@ -849,8 +794,8 @@ class AsyncVoxCPM2Server:
         self._reader = reader
         loop.add_reader(reader.fileno(), self._on_readable)
         # get() reads a whole message. uvloop makes the descriptor non-blocking: a message larger than the pipe's
-        # buffer (the engine's tokenizer, NANOVLLM_CLIENT_TOKENIZE) then failed half-read (BlockingIOError), the
-        # reader was dropped and the engine blocked on its write for good (#31: ws_server hung at start, 2 in 4)
+        # buffer (the engine's tokenizer) then failed half-read (BlockingIOError), the reader was dropped and the
+        # engine blocked on its write for good (#31: ws_server hung at start, 2 in 4)
         os.set_blocking(reader.fileno(), True)
 
     def _on_readable(self) -> None:
@@ -878,7 +823,7 @@ class AsyncVoxCPM2Server:
     async def _watch_engine(self) -> None:
         try:
             while True:
-                await asyncio.sleep(_BRIDGE_POLL_S)
+                await asyncio.sleep(_WATCH_ENGINE_S)
                 proc = getattr(self, "process", None)
                 if proc is not None and proc.exitcode is not None:  # the engine died: fail everything waiting
                     self._handle({"type": "engine_dead", "exitcode": proc.exitcode})
@@ -900,7 +845,7 @@ class AsyncVoxCPM2Server:
                     except RuntimeError as e:  # overwritten: the stream fails (and is cancelled), no wrong audio
                         data = e
                     items[k] = {"type": "stream", "id": item["id"], "data": data}
-                elif item.get("type") == "stream_block":  # (NANOVLLM_EMIT_BLOCK) one chunk per stream, one row each
+                elif item.get("type") == "stream_block":  # one chunk per stream, one row each
                     blocks = True
             if blocks:
                 out = []
@@ -919,35 +864,6 @@ class AsyncVoxCPM2Server:
             if res.get("type") == "stream_shm":
                 res = items[0]
         return res
-
-    def _queue_out_bridge(self, loop: asyncio.AbstractEventLoop) -> None:
-        while not self._queue_out_stop.is_set():
-            try:
-                res = self.queue_out.get(timeout=_BRIDGE_POLL_S)
-            except Empty:
-                proc = getattr(self, "process", None)
-                if proc is not None and proc.exitcode is not None:  # the engine died: fail everything waiting
-                    try:
-                        loop.call_soon_threadsafe(self._queue_out_async.put_nowait,
-                                                  {"type": "engine_dead", "exitcode": proc.exitcode})
-                    except RuntimeError:
-                        pass
-                    return
-                continue
-            except (EOFError, OSError, ValueError):
-                return
-            res = self._convert(res)
-            try:
-                loop.call_soon_threadsafe(self._queue_out_async.put_nowait, res)
-            except RuntimeError:
-                return
-
-    async def recv_queue(self) -> None:
-        try:
-            while True:
-                self._handle(await self._queue_out_async.get())
-        except asyncio.CancelledError:
-            return
 
     def _handle(self, res: dict[str, Any]) -> None:
         if self._spin_task is not None:
@@ -993,9 +909,9 @@ class AsyncVoxCPM2Server:
             # else: future was cancelled (wait_for timeout etc) — skip set_result silently
 
     def _set_tokenizer(self, spec: str | None, version: int) -> None:
-        """The engine's tokenizer (its JSON) for NANOVLLM_CLIENT_TOKENIZE; None: the engine tokenizes."""
+        """The engine's tokenizer (its JSON), with which the client tokenizes requests; None: the engine tokenizes."""
         self._tokenizer, self._tok_version = None, version
-        if spec and _CLIENT_TOKENIZE:
+        if spec:
             try:
                 from tokenizers import Tokenizer
 
@@ -1007,9 +923,8 @@ class AsyncVoxCPM2Server:
                 pass
 
     def _tokenize(self, cmds: list[dict[str, Any]]) -> None:
-        """The add_request commands' tokenizer version, ids and character offsets ("tok"), in one batched call
-        (NANOVLLM_CLIENT_TOKENIZE); texts with CJK characters are left to the engine (its wrapper splits
-        multi-character Chinese tokens)."""
+        """The add_request commands' tokenizer version, ids and character offsets ("tok"), in one batched call;
+        texts with CJK characters are left to the engine (its wrapper splits multi-character Chinese tokens)."""
         from nanovllm_voxcpm.models.voxcpm2.engine import _CJK
 
         todo = [(c, t) for c in cmds for t in (_request_text(c),) if t is not None and not _CJK.search(t)]
@@ -1032,7 +947,7 @@ class AsyncVoxCPM2Server:
             self.queue_in.put_nowait(cmds[0])
         elif cmds or (self._more_sent and not more):
             # (no commands: the turn's last early flush took them all; the empty batch ends the engine's admission
-            # window, which otherwise waits NANOVLLM_QUEUE_MORE_MS for the rest of a turn that has ended)
+            # window, which otherwise waits _QUEUE_MORE_MS for the rest of a turn that has ended)
             if self._tokenizer is not None:  # (a single command registers at once: the engine tokenizes it)
                 self._tokenize(cmds)
             t_tok = time.perf_counter()
@@ -1056,8 +971,8 @@ class AsyncVoxCPM2Server:
         fut: asyncio.Future[Any] = loop.create_future()
         self.op_table[op_id] = fut
         # queue_in is unbounded (maxsize=0); put_nowait() is instant and does not
-        # consume a thread pool slot. asyncio.to_thread() here starves recv_queue
-        # under high concurrent load. Commands submitted in the same event-loop
+        # consume a thread pool slot. asyncio.to_thread() here starves the engine
+        # output's reading under high concurrent load. Commands submitted in the same event-loop
         # tick (e.g. a burst of requests) travel as one message.
         if not self._pending_cmds:
             loop.call_soon(self._flush_submits)
@@ -1112,10 +1027,6 @@ class AsyncVoxCPM2Server:
         if self._reader is not None:
             with contextlib.suppress(Exception):
                 asyncio.get_running_loop().remove_reader(self._reader.fileno())
-        self._queue_out_stop.set()
-        thread = getattr(self, "_queue_out_thread", None)
-        if thread is not None:
-            thread.join(timeout=1.0)
         if graceful_stop and self.process.is_alive():
             await asyncio.to_thread(self.process.join, 5.0)
         if self.process.is_alive():
