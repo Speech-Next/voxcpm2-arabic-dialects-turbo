@@ -34,4 +34,6 @@ def test_small_m_shrink_matches_torch(M, K, slices):
         for m in range(M):
             if (lid := int(mapping[m])) >= 0:
                 ref[s, m] = scaling * (a[s][lid].float() @ x[m].float())
-    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+    # split-K (K = 6144) adds its partial sums into the bf16 output with atomics, in no fixed order, each add rounded
+    # to bf16: the error varies run to run, up to 0.032 over 0.02 |ref| in 1,200 runs (2e-2 failed now and then)
+    torch.testing.assert_close(out.float(), ref, atol=6e-2 if K > 2048 else 2e-2, rtol=2e-2)
