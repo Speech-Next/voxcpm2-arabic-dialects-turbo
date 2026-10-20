@@ -297,7 +297,7 @@ _DOTTED = re.compile(rf"(?<![\d.,])\d+(?:\.\d+){{2,}}{_END}")
 _ERA = re.compile(rf"(?<![\d.,])(\d{{4}})\s?(ه|م)(?![{_AR}])")
 _CODES = "|".join(k for k in _CURRENCIES if k.isalpha() and k.isascii())
 _CUR = (rf"(?<![A-Za-z{_AR}])(?:{_alternatives(k for k in _CURRENCIES if not (k.isalpha() and k.isascii()))}"
-        rf"|(?i:{_CODES})(?![A-Za-z]))")  # codes in any case (aed100), not inside a word
+        rf"|(?ai:{_CODES})(?![A-Za-z]))")  # codes in any ASCII case (aed100), not inside a word
 _CUR_BEFORE = re.compile(rf"({_CUR})\s?{_AMT}{_END}")
 _CUR_AFTER = re.compile(rf"{_AMT}\s?({_CUR})(?![{_AR}])")
 _PCT_AFTER = re.compile(rf"{_AMT}\s?%")

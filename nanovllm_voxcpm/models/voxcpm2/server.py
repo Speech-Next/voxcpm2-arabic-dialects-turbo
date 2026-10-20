@@ -358,10 +358,28 @@ _QUEUE_BATCH_GO = 64
 _QUEUE_MORE_MS = 20.0
 
 
+def _engine_exception(res: dict[str, Any]) -> Exception:
+    """An engine command's error as its caller's exception: a ValueError (the request's own fault: unknown voice,
+    too long, ...) as itself with its message; anything else a RuntimeError without the engine's traceback (the engine
+    printed it), so that no server passes a traceback on to its clients."""
+    if res.get("kind") == "ValueError":
+        return ValueError(res.get("message", ""))
+    if "kind" not in res:  # (an engine without the fields)
+        return RuntimeError(res.get("error", "engine error"))
+    return RuntimeError(f"engine error ({res['kind']}): {res.get('message', '')}")
+
+
 def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
     import signal
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # Only the ends this process uses stay open: with the others closed, the death of the process that started it (also
+    # by SIGKILL: the OOM killer, a container's stop timeout) closes both pipes, and the next read (EOFError) or write
+    # (BrokenPipeError) ends this one. Holding every end, it blocked on them for good and kept the GPU.
+    if isinstance(queue_in, _Channel):
+        queue_in._q._writer.close()
+    if isinstance(queue_out, _Channel):
+        queue_out._q._reader.close()
     # The fast tokenizer's worker pool (rayon) defaults to one thread per CPU: on this 96-CPU host a chunk of 48
     # texts took 0.9 ms hot / 1.9 ms after idle with 96 workers, 0.4 / 1.0 ms with 16 (set before the pool starts).
     os.environ.setdefault("RAYON_NUM_THREADS", "16")
@@ -405,8 +423,11 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
                 return {"type": "response", "id": opid, "data": None}
             ret = getattr(srv, method_name)(*args, **kwargs)
             return {"type": "response", "id": opid, "data": ret}
-        except Exception:
-            return {"type": "error", "id": opid, "error": traceback.format_exc()}
+        except Exception as e:
+            if not isinstance(e, ValueError):  # (a ValueError is the request's fault: its message says it all)
+                traceback.print_exc()
+            return {"type": "error", "id": opid, "error": traceback.format_exc(), "kind": type(e).__name__,
+                    "message": str(e)}
 
     # Commands received but not yet executed. A burst arrives as one "batch"; only the first
     # first_chunk requests are registered before the next step starts, the rest are registered by
@@ -755,6 +776,7 @@ class AsyncVoxCPM2Server:
         self._pending_cmds: list[dict[str, Any]] = []
         self.stream_table: dict[str, asyncio.Queue[Waveform | None]] = {}
         self._last_activity = time.perf_counter()
+        self.dead = asyncio.Event()  # set once the engine process has died (stop() aside): every request fails
         self._wake = asyncio.Event()
         self._spin_task = asyncio.create_task(self._keep_warm()) if _BUSY_POLL_S > 0 else None
         # The engine's output is read in the event loop's own thread: a receiving thread hands every message over
@@ -765,6 +787,7 @@ class AsyncVoxCPM2Server:
 
     _reader = None
     _ring = None
+    dead = None  # (instances built without __init__)
     _tokenizer = None  # the engine's tokenizer (init_ok, "tokenizer" messages), the client tokenizes with it
     _tok_version = 0  # its version: the engine uses only ids tokenized with its current one
     _first_flush = True  # the next flush is a burst's first (_FLUSH_FIRST)
@@ -883,6 +906,8 @@ class AsyncVoxCPM2Server:
         if res.get("type") == "engine_dead":
             err = RuntimeError(f"VoxCPM2 engine process exited (code {res['exitcode']})")
             self._engine_error = err
+            if self.dead is not None:
+                self.dead.set()
             if not self._init_fut.done():
                 self._init_fut.set_exception(err)
             for fut in list(self.op_table.values()):
@@ -905,7 +930,7 @@ class AsyncVoxCPM2Server:
                 if res["type"] == "response":
                     fut.set_result(res["data"] if "data" in res else None)
                 else:
-                    fut.set_exception(RuntimeError(res["error"]))
+                    fut.set_exception(_engine_exception(res))
             # else: future was cancelled (wait_for timeout etc) — skip set_result silently
 
     def _set_tokenizer(self, spec: str | None, version: int) -> None:
@@ -1101,9 +1126,11 @@ class AsyncVoxCPM2Server:
                     break
                 yield data
         finally:
-            if not is_normal_exit:
-                await self.submit("cancel", seq_id)
-            del self.stream_table[seq_id]
+            try:
+                if not is_normal_exit:
+                    await self.submit("cancel", seq_id)
+            finally:  # (a second cancellation here: the cancel command is sent all the same)
+                self.stream_table.pop(seq_id, None)
 
 
 class AsyncVoxCPM2ServerPool:
@@ -1143,6 +1170,23 @@ class AsyncVoxCPM2ServerPool:
 
     async def wait_for_ready(self):
         await asyncio.gather(*[server.wait_for_ready() for server in self.servers])
+
+    @property
+    def alive(self) -> bool:
+        """No engine process has died (stop() aside)."""
+        return not any(server.dead is not None and server.dead.is_set() for server in self.servers)
+
+    async def wait_dead(self) -> None:
+        """Returns once an engine process has died (stop() aside): every request fails from then on, and a server
+        should exit (non-zero) for its supervisor to start it again."""
+        waits = [asyncio.ensure_future(server.dead.wait()) for server in self.servers if server.dead is not None]
+        if not waits:
+            await asyncio.Future()  # (never)
+        try:
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for w in waits:
+                w.cancel()
 
     async def stop(self):
         await asyncio.gather(*[server.stop() for server in self.servers])

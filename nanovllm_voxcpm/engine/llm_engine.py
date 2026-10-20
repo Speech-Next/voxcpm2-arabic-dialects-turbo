@@ -151,7 +151,9 @@ class LLMEngineBase:
         self.scheduler.add(seq, front=front)
 
     def cancel_sequence(self, seq_id: str):
-        if self._step_depth:
+        # mid-step: after the step. Admitted to the next prefill step ahead of it (prepare_prefill) with full blocks
+        # it published to the prefix cache: after that step too, which writes their KV (holds_unwritten_blocks)
+        if self._step_depth or self.scheduler.holds_unwritten_blocks(seq_id):
             if self._deferred_cancels is None:
                 self._deferred_cancels = deque()
             self._deferred_cancels.append(seq_id)

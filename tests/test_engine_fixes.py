@@ -1314,3 +1314,59 @@ def test_head_and_stage_splits_are_unchanged_by_the_shared_scan():
                     assert got == want, (t, prompt, voice, mode, limit)
                     n += want is not None
         assert n > 1000  # (most of them split)
+
+
+def test_a_cancel_in_the_admission_window_waits_for_the_step():
+    # prepare_prefill admits a request ahead of its step and publishes its full blocks to the prefix cache; cancelled
+    # then, those blocks were freed with their KV never computed and found by the next request with the same prefix
+    cfg = SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=4096, num_kvcache_blocks=16, kvcache_block_size=256,
+                          model_config=SimpleNamespace(turbo=SimpleNamespace()))
+    eng = object.__new__(LLMEngineBase)
+    eng.scheduler = sch = Scheduler(cfg)
+    tokens = list(range(1000, 1300))  # a full block and the rest: the first block is published
+    r1 = Sequence("r1", tokens, 256)
+    sch.add(r1)
+    assert sch.admit() == [r1] and sch.holds_unwritten_blocks("r1")
+    eng.cancel_sequence("r1")  # the client gone in the admission window
+    assert "r1" in sch._id_to_seq, "cancelled before its step computed the KV of its published block"
+    seqs, is_prefill = sch.schedule()
+    assert seqs == [r1] and is_prefill
+    with eng.stepping():  # (the step: r1's prefill computes its blocks' KV)
+        pass
+    assert "r1" not in sch._id_to_seq and not sch.running  # cancelled right after it
+    r2 = Sequence("r2", tokens, 256)
+    sch.add(r2)
+    assert sch.schedule()[0] == [r2] and r2.num_cached_tokens == 256  # a cache hit now holds computed KV
+
+
+def test_only_the_last_patch_audio_is_kept():
+    # each patch's audio is a row of its step's page-locked buffer: kept for the whole stream, every step's buffer
+    # stayed alive as long as any of its streams
+    from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine, VoxCPM2SeqPayload
+
+    eng = object.__new__(VoxCPM2Engine)
+    eng.n_decode_pad_frames, eng.feat_dim, eng.lead_silence_patches = 12, 4, -1
+    eng.scheduler = SimpleNamespace(last_step=(False, 0, 0))
+    seq = SimpleNamespace(custom_payload=VoxCPM2SeqPayload(feats=[], text_tokens=[], feat_masks=[],
+                                                           generated_waveforms=[], temperature=1.0, cfg_value=2.0),
+                          append_token=lambda t: None, stoped=False)
+    for k in range(3):
+        eng.postprocess_seq(seq, {"stop_flag": 0, "latents": np.zeros((2, 4), np.float32),
+                                  "waveforms": np.full(8, k, np.int16)}, False)
+    waves = seq.custom_payload.generated_waveforms
+    assert len(waves) == 3 and waves[:2] == [None, None] and int(waves[-1][0]) == 2
+
+
+def test_text_ids_past_the_vocabulary_are_the_requests_fault():
+    # "<|fim_suffix|>" typed in a text: the tokenizer's added special token 73449, past the model's 73448 embedding
+    # rows; its lookup was a device-side assert that ended the engine process and every stream with it
+    from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
+
+    eng = object.__new__(VoxCPM2Engine)
+    eng.vocab_size, eng.head_tokens = 10, 0
+    names = SimpleNamespace(convert_ids_to_tokens=lambda ids: [f"<t{i}>" for i in ids])
+    eng.tokenizer = SimpleNamespace(tokenizer=names)
+    eng._text_ids = lambda prompt_text, target_text: [1, 12, 2, 10]
+    with pytest.raises(ValueError, match="cannot read: <t10>, <t12>"):
+        eng.add_request("a", "text", head_start=False)
+    eng._check_ids([0, 9])  # (in range)

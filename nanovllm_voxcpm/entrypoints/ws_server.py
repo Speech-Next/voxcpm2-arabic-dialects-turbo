@@ -28,15 +28,24 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
   engine's client (RoutedDialectTTS) in this one, the audio crossing over socket pairs. At 200 streams the client's
   event loop is busy 10-20 ms after every engine step (a patch of every stream at once), and a paced chunk due
   meanwhile went out that much late: a stall where the server had the audio.
+- Production: ``--api-key`` (or VOXCPM_API_KEY): the handshake needs ``Authorization: Bearer <key>`` or
+  ``?api_key=<key>``; ``--max-streams`` answers an utterance beyond that many at once with an error (one A10: 150);
+  ``--max-text-chars`` bounds a text; an unknown dialect is refused at the handshake; an utterance's error leaves its
+  connection open for the next. ``GET /health`` on the same port answers 200 while the server runs; when the engine
+  process dies the server exits with code 1, for its supervisor to start it again.
 """
 
 import argparse
 import asyncio
 import base64
+import contextlib
+import hmac
 import json
+import math
 import os
 import signal
 import struct
+import sys
 import time
 import zlib
 from collections.abc import AsyncIterator, Callable
@@ -47,6 +56,7 @@ import numpy as np
 from nanovllm_voxcpm.streaming import ChunkPacer, ChunkStream, StreamSender
 
 PATH = "/api/tts/stream"
+QUEUED_TEXTS = 64  # a connection's texts waiting for their turn; more wait in the socket (backpressure)
 
 
 def ws_frame(opcode: int, payload: bytes) -> bytes:
@@ -129,17 +139,58 @@ def local_feed(tts) -> Feed:
     return feed
 
 
+def message(e: BaseException) -> str:
+    """An error as its client reads it: the message, no traceback or exception repr."""
+    return str(e) or type(e).__name__
+
+
 class Server:
     """The connections. voices: the registered voice names; feed(req, yields, stream): fills an utterance's
-    ChunkStream with its PCM16 and returns what stops it."""
+    ChunkStream with its PCM16 and returns what stops it; dialects: the names a connection may ask for (None: not
+    checked here)."""
 
-    def __init__(self, voices, feed: Feed, args):
-        self.voices, self.feed, self.args = voices, feed, args
+    def __init__(self, voices, feed: Feed, args, dialects=None):
+        self.voices, self.feed, self.args, self.dialects = voices, feed, args, dialects
         self.log = open(args.log, "a") if args.log else None
         self.conn = 0
         # paced chunks of every connection from one task (StreamSender), written to the transports as whole frames
         self.sender = StreamSender(0.0) if args.pace else None
         self.utterances = 0
+        self.active = 0  # utterances in progress (--max-streams)
+
+    def process_request(self, connection, request):
+        """Before a handshake: GET /health answered here (this process runs only while the engine's does); with
+        --api-key, a client without it (``Authorization: Bearer <key>`` or ``?api_key=<key>``, browsers) gets 401."""
+        from http import HTTPStatus
+
+        u = urlparse(request.path)
+        if u.path == "/health":
+            return connection.respond(HTTPStatus.OK, "ok\n")
+        key = getattr(self.args, "api_key", None)
+        if key:
+            bearer = request.headers.get("Authorization", "").encode()
+            query = parse_qs(u.query).get("api_key", [""])[0].encode()
+            if not (hmac.compare_digest(bearer, f"Bearer {key}".encode()) or hmac.compare_digest(query, key.encode())):
+                return connection.respond(HTTPStatus.UNAUTHORIZED, "missing or wrong API key\n")
+        return None
+
+    def control(self, cfg: dict, obj: dict) -> dict:
+        """A control message applied to its connection's settings (all or nothing): the reply."""
+        voice = obj.get("voice")
+        if voice is not None and (not isinstance(voice, str) or voice not in self.voices):
+            return {"type": "config_error", "message": f"voice {voice!r}"}
+        cfg_value = obj.get("cfg_value")
+        if cfg_value is not None:
+            try:
+                cfg_value = float(cfg_value)
+            except (TypeError, ValueError):
+                cfg_value = math.nan
+            if not 0.0 <= cfg_value <= 10.0:  # (NaN fails it too)
+                return {"type": "config_error", "message": f"cfg_value {obj['cfg_value']!r}: a number from 0 to 10"}
+            cfg["cfg_value"] = cfg_value
+        if "voice" in obj:  # (null: the model's own voice)
+            cfg["voice"] = voice
+        return {"type": "config_updated"}
 
     def pacer(self, n: int, rate: int) -> ChunkPacer:
         a = self.args
@@ -163,16 +214,26 @@ class Server:
             n = int(q.get("chunk_size", 4096))
         except ValueError:
             rate = n = 0
-        if not 8000 <= rate <= 48000 or n <= 0 or n % 2:
-            await ws.send(json.dumps({"type": "error", "message": "audio_format pcm_<8000-48000>, chunk_size even"}))
+        transport, segmenting = q.get("transport", "bytes"), q.get("segmenting", "false").lower()
+        # (chunks under ~8 ms of audio streamed slower than real time; a huge one held the whole utterance back)
+        if (not 8000 <= rate <= 48000 or n % 2 or not 0.02 <= n / (2 * rate) <= 10.0
+                or transport not in ("bytes", "json_base64") or segmenting not in ("true", "false")):
+            await ws.send(json.dumps({"type": "error", "message": "audio_format pcm_<8000-48000>, chunk_size even "
+                                      "and 20 ms to 10 s of audio, transport bytes or json_base64, segmenting true "
+                                      "or false"}))
             await ws.close()
             return
-        cfg = dict(rate=rate, chunk_size=n, transport=q.get("transport", "bytes"),
-                   segmenting=q.get("segmenting", "false").lower() == "true",
-                   dialect=q.get("dialect", self.args.dialect), voice=self.args.default_voice, cfg_value=2.0)
+        dialect = q.get("dialect", self.args.dialect)
+        if self.dialects is not None and dialect not in self.dialects:
+            await ws.send(json.dumps({"type": "error", "message": f"unknown dialect {dialect!r}; dialects: "
+                                                                  f"{', '.join(sorted(self.dialects))}"}))
+            await ws.close()
+            return
+        cfg = dict(rate=rate, chunk_size=n, transport=transport, segmenting=segmenting == "true",
+                   dialect=dialect, voice=self.args.default_voice, cfg_value=2.0)
         self.conn += 1
         conn = self.conn
-        texts: asyncio.Queue = asyncio.Queue()
+        texts: asyncio.Queue = asyncio.Queue(QUEUED_TEXTS)
 
         async def reader():
             try:
@@ -184,31 +245,46 @@ class Server:
                     except json.JSONDecodeError:
                         obj = None
                     if isinstance(obj, dict) and obj.get("type") == "control":
-                        if obj.get("voice") is not None and obj["voice"] not in self.voices:
-                            await ws.send(json.dumps({"type": "config_error", "message": f"voice {obj['voice']!r}"}))
-                            continue
-                        cfg["voice"] = obj.get("voice", cfg["voice"])
-                        if obj.get("cfg_value") is not None:
-                            cfg["cfg_value"] = float(obj["cfg_value"])
-                        await ws.send(json.dumps({"type": "config_updated"}))
+                        await ws.send(json.dumps(self.control(cfg, obj)))
+                        continue
+                    if isinstance(obj, dict):  # (another protocol message, e.g. a ping: not a text to speak)
+                        await ws.send(json.dumps({"type": "error", "message": f"unknown message {obj.get('type')!r}"}))
                         continue
                     await texts.put((time.perf_counter(), msg))
-            finally:
-                await texts.put(None)
+            finally:  # (a full queue: the texts in it end the loop, their sends failing on the closed connection)
+                with contextlib.suppress(asyncio.QueueFull):
+                    texts.put_nowait(None)
 
         rd = asyncio.create_task(reader())
         try:
             while (item := await texts.get()) is not None:
-                await self.utterance(ws, conn, cfg, *item)
-        except Exception as e:  # noqa: BLE001 - the client hears why
-            try:
-                await ws.send(json.dumps({"type": "error", "message": repr(e)}))
-            except Exception:  # noqa: BLE001
-                pass
+                try:
+                    await self.utterance(ws, conn, cfg, *item)
+                except Exception as e:  # noqa: BLE001 - the client hears why; its next text is still spoken
+                    try:
+                        await ws.send(json.dumps({"type": "error", "message": message(e)}))
+                    except Exception:  # noqa: BLE001 - the client is gone
+                        break
         finally:
             rd.cancel()
 
     async def utterance(self, ws, conn, cfg, t_recv, text):
+        """One text spoken (speak_text), within --max-text-chars and --max-streams."""
+        if not text.strip():
+            raise ValueError("text is empty")
+        limit = getattr(self.args, "max_text_chars", 0)
+        if limit and len(text) > limit:
+            raise ValueError(f"text: at most {limit} characters (--max-text-chars)")
+        most = getattr(self.args, "max_streams", 0)
+        if most and self.active >= most:
+            raise ValueError(f"busy: {self.active} utterances in progress (--max-streams), try again")
+        self.active += 1
+        try:
+            await self.speak_text(ws, conn, cfg, t_recv, text)
+        finally:
+            self.active -= 1
+
+    async def speak_text(self, ws, conn, cfg, t_recv, text):
         n, rate, b64 = cfg["chunk_size"], cfg["rate"], cfg["transport"] == "json_base64"
         await ws.send(json.dumps({"type": "start", "sample_rate": rate}))
         pacer = self.pacer(n, rate)
@@ -290,7 +366,7 @@ async def serve_engine(tts, reader: asyncio.StreamReader, writers, log=None) -> 
         except asyncio.CancelledError:
             pass
         except Exception as e:  # noqa: BLE001 - the client hears why
-            writer.write(frame(ERROR, utt, repr(e).encode()))
+            writer.write(frame(ERROR, utt, message(e).encode()))
         finally:
             jobs.pop(utt, None)
 
@@ -411,8 +487,12 @@ async def load_tts(args):
 async def serve_ws(server: Server, args, until: asyncio.Future, on_listening: Callable[[], None]):
     from websockets.asyncio.server import serve
 
-    async with serve(server.handler, args.host, args.port, max_size=None, compression=None, ping_interval=None,
-                     max_queue=None) as ws_server:
+    # client messages are texts and control messages: at most 1 MiB each (else close 1009), 16 frames buffered
+    # (then TCP backpressure); a ping every --ping-interval s finds clients gone without a close (else their engine
+    # requests ran to the end)
+    ping = getattr(args, "ping_interval", 0) or None
+    async with serve(server.handler, args.host, args.port, max_size=1 << 20, compression=None, ping_interval=ping,
+                     ping_timeout=ping, max_queue=16, process_request=server.process_request) as ws_server:
         on_listening()
         await until
         ws_server.close()
@@ -435,23 +515,32 @@ def stop_signal() -> asyncio.Future:
     return stop
 
 
-async def main_engine(args, socks, front_pid: int):
-    """This process: the engine's client, serving the connections' process."""
+async def main_engine(args, socks, front_pid: int) -> int:
+    """This process: the engine's client, serving the connections' process. Returns the exit code: 1 when the
+    engine process died (every utterance would fail: the supervisor starts the server again)."""
     conns = [await asyncio.open_connection(sock=s) for s in socks]
     reader, writer = conns[0]
     stop = stop_signal()
     try:
         tts = await load_tts(args)
         async with tts:
-            writer.write(frame(READY, 0, json.dumps({"voices": sorted(tts.voices)}).encode()))
+            writer.write(frame(READY, 0, json.dumps({"voices": sorted(tts.voices),
+                                                     "dialects": sorted(tts.dialects)}).encode()))
             kind, _, _ = await read_frame(reader)  # LISTENING
             if kind != LISTENING:
                 raise RuntimeError("the connections' process did not start")
             announce(args)
             log = open(args.log + ".engine", "a", buffering=1) if args.log else None
             engine = asyncio.create_task(serve_engine(tts, reader, [w for _, w in conns], log))
-            await asyncio.wait([stop, engine], return_when=asyncio.FIRST_COMPLETED)
+            dead = asyncio.ensure_future(tts.server.wait_dead())
+            await asyncio.wait([stop, engine, dead], return_when=asyncio.FIRST_COMPLETED)
             engine.cancel()
+            died = dead.done()
+            dead.cancel()
+            if died:
+                print("[ws_server] the engine process died: exiting (code 1)", flush=True)
+                return 1
+            return 0
     finally:
         try:
             os.kill(front_pid, signal.SIGTERM)
@@ -469,7 +558,7 @@ async def main_front(args, socks):
     info = await link.ready  # once the engine is up
     if info is None:
         return
-    server = Server(set(info["voices"]), link.start, args)
+    server = Server(set(info["voices"]), link.start, args, set(info["dialects"]) if info.get("dialects") else None)
     stop = stop_signal()
     until = asyncio.ensure_future(asyncio.wait([stop, link.closed], return_when=asyncio.FIRST_COMPLETED))
     await serve_ws(server, args, until, lambda: link.send(LISTENING))
@@ -509,6 +598,15 @@ def cli():
                                                                     "step of 200 streams is ~1 MB of audio)")
     ap.add_argument("--log", default=None, help="jsonl, one line per utterance: the engine's yields and the sends")
     ap.add_argument("--ready", default=None, help="a file written once the server accepts connections")
+    ap.add_argument("--api-key", default=os.environ.get("VOXCPM_API_KEY"),
+                    help="the handshake needs 'Authorization: Bearer <key>' or ?api_key=<key> (default: "
+                         "$VOXCPM_API_KEY; none: open to whoever reaches the port)")
+    ap.add_argument("--max-streams", type=int, default=0, help="utterances at once; more get an error (0: no limit; "
+                                                                "one A10: 150)")
+    ap.add_argument("--max-text-chars", type=int, default=4096, help="longest text of an utterance")
+    ap.add_argument("--ping-interval", type=float, default=20.0,
+                    help="seconds between keepalive pings (a client that does not answer in as long is closed, and "
+                         "its utterance's engine request ends; 0: off)")
     args = ap.parse_args()
     if args.default_voice is None and args.voice:
         args.default_voice = args.voice[0].partition("=")[0]
@@ -537,7 +635,9 @@ def cli():
             os._exit(0)
     for _, b in pairs:
         b.close()
-    asyncio.run(main_engine(args, [a for a, _ in pairs], pid), loop_factory=factory)
+    if not args.api_key:
+        print(f"[ws_server] no --api-key: whoever reaches {args.host}:{args.port} can use it", flush=True)
+    sys.exit(asyncio.run(main_engine(args, [a for a, _ in pairs], pid), loop_factory=factory))
 
 
 if __name__ == "__main__":
