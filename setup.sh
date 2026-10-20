@@ -10,7 +10,7 @@ if ! command -v uv >/dev/null; then
 fi
 uv venv --python 3.12 .venv
 . .venv/bin/activate
-uv pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+uv pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 uv pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 uv pip install ninja -e ".[server]"
 python -m voxcpm_kernels.cuda_ext

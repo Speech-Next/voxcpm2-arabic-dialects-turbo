@@ -15,7 +15,7 @@ Bit-identity: --hashes FILE stores the SHA-256 of every request's whole audio (p
 checks a run against such a file (the same requests and seeds: every round of a level must match the reference's
 first round). Record on main, compare on the branch, e.g.:
 
-    cd /workspace/voxcpm2-arabic-dialects-turbo   # main checkout (the editable install imports it)
+    cd <main checkout>   # the editable install imports it
     NANOVLLM_BUSY_POLL_S=30 .venv/bin/python <worktree>/examples/profile_burst.py --levels 1,8,64,200 --hashes main.json
     NANOVLLM_BUSY_POLL_S=30 PYTHONPATH=<worktree> .venv/bin/python <worktree>/examples/profile_burst.py \
         --levels 1,8,64,200 --compare main.json
@@ -211,7 +211,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--levels", default="200", help="requests sent at once, per level")
     ap.add_argument("--rounds", type=int, default=5, help="measured bursts per level")
-    ap.add_argument("--voices", default="VoxCPM-Kernel/Arabic-Dialects-and-Hindi-Voice-Samples")
+    ap.add_argument("--voices", default="VoxCPM-Kernel/Arabic-Hindi-Reference-Voices")
     ap.add_argument("--model", default=None)
     ap.add_argument("--dit", default=None, help="'' for the model's own LocDiT")
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)

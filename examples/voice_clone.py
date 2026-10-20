@@ -20,7 +20,7 @@ from nanovllm_voxcpm.dialect_tts import DEFAULT_DIT, DEFAULT_MODEL
 
 
 async def main(args):
-    dit = None if args.dit_cache else args.dit
+    dit = None if args.dit_cache or args.dit == "none" else args.dit
     kw = dict(dit_cache=args.dit_cache, max_concurrency=16)
     tts = await (DialectTTS.load(args.model, dit, **kw) if args.no_route
                  else RoutedDialectTTS.load(args.model, args.tagged_model, dit, **kw))
@@ -41,7 +41,7 @@ if __name__ == "__main__":
     ap.add_argument("--out", default="out.wav")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--tagged-model", default=DEFAULT_TAGGED_MODEL)
-    ap.add_argument("--dit", default=DEFAULT_DIT)
+    ap.add_argument("--dit", default=DEFAULT_DIT, help="'none': the model's own LocDiT")
     ap.add_argument("--dit-cache", choices=["light", "medium"])
     ap.add_argument("--no-route", action="store_true", help="the unrouted engine (the model's adapters only)")
     asyncio.run(main(ap.parse_args()))
