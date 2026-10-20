@@ -432,6 +432,14 @@ class FusedCpm4Layer:
             if self.rope is not None and attn.head_dim == 128:
                 self.q8["qkv"] = rope_weights(self.q8["qkv"], attn.head_dim)
         self.qkv_rope = self.q8 is not None and self.rope is not None and attn.head_dim == 128
+        # Attention biases (attention_bias; no shipped model has them): o_proj's int8 GEMM fuses the residual and adds
+        # no bias (the adapters' segmented one would drop it), nor does the adapters' segmented qkv GEMM with RoPE
+        # (the base model's qkv_rope_gemm adds it): refused here rather than a silently wrong output
+        lora = getattr(attn.qkv_proj, "supports_lora", False) and getattr(attn.o_proj, "supports_lora", False)
+        if self.q8 is not None and (attn.o_proj.bias is not None
+                                    or (lora and self.qkv_rope and attn.qkv_proj.bias is not None)):
+            raise NotImplementedError(f"{name or 'layer'}: int8 layers with an attention bias are not supported "
+                                      "(o_proj's, or q/k/v's with LoRA adapters); run it in bf16")
         # LoRA adapters merged into int8 q/k/v/o weights, one per slot ([0] = the base model): a batch mixing
         # adapters runs segmented GEMMs (rows grouped by adapter) and no LoRA kernels. refresh_lora(slot) rebuilds a
         # slot when the runner loads an adapter into it.
