@@ -61,7 +61,7 @@ def test_least_recently_used_go_first_and_large_ones_are_not_kept():
     cache.put(5, chunks(1, size=17))  # larger than a quarter of the cache
     assert 5 not in cache.entries
     cache.put(0, chunks(1, v=9.0, size=16))  # the first generation stays
-    assert cache.entries[0][0][0] == np.float32(0.1)
+    assert cache.get(0)[0][0] == np.float32(0.1)
 
     big, calls = AudioCache(4 * 64), []  # too long to keep: played through, not kept
     out = asyncio.run(collect(big.through("long", engine(chunks(5, size=16), calls))))
@@ -87,3 +87,18 @@ def test_a_kept_sentence_plays_its_first_second_at_once_then_at_most_speed():
     assert 0.2 < total < 0.6  # the second second at 4 x: 0.25 s
     _, fast = asyncio.run(timed(None))
     assert fast < 0.05 and len(calls) == 1
+
+
+def test_the_engines_pcm16_kept_in_half_the_memory_played_back_bitwise():
+    """DialectTTS.stream gives the engine's int16 audio as float32 (x 1/32768): kept as that int16, half the memory,
+    played back as the very same float32."""
+    cache, calls = AudioCache(1 << 20), []
+    pcm = [np.random.default_rng(k).integers(-32768, 32767, 480).astype(np.int16) for k in range(3)]
+    floats = [np.multiply(c, np.float32(1 / 32768), dtype=np.float32) for c in pcm]
+    first = asyncio.run(collect(cache.through("k", engine(floats, calls))))
+    again = asyncio.run(collect(cache.through("k", engine([], calls))))
+    assert cache.bytes == 3 * 480 * 2  # int16
+    assert all(a.dtype == np.float32 and a.tobytes() == b.tobytes() for a, b in zip(again, first))
+    full = [np.full(4, 1.0, np.float32)]  # 1.0 is no int16 / 32768: kept as float32
+    asyncio.run(collect(cache.through("one", engine(full, calls))))
+    assert cache.get("one")[0].dtype == np.float32 and cache.get("one")[0][0] == 1.0
