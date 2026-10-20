@@ -66,3 +66,24 @@ def test_least_recently_used_go_first_and_large_ones_are_not_kept():
     big, calls = AudioCache(4 * 64), []  # too long to keep: played through, not kept
     out = asyncio.run(collect(big.through("long", engine(chunks(5, size=16), calls))))
     assert len(out) == 5 and big.stats()["entries"] == 0
+
+
+def test_a_kept_sentence_plays_its_first_second_at_once_then_at_most_speed():
+    """150 kept sentences at once, all their audio in one go, held the event loop that serves the engine and paces
+    the streams: after LEAD_S, at most ``speed`` x real time (the event loop served between the chunks)."""
+    import time
+
+    cache, calls = AudioCache(1 << 20, sample_rate=1000), []
+    asyncio.run(collect(cache.through("k", engine(chunks(20, size=100), calls))))  # 2 s of audio, kept
+
+    async def timed(speed):
+        t0, at = time.perf_counter(), []
+        async for _ in cache.through("k", engine([], calls), speed=speed):
+            at.append(time.perf_counter() - t0)
+        return at, time.perf_counter() - t0
+
+    at, total = asyncio.run(timed(4.0))
+    assert at[9] < 0.05  # the first second at once
+    assert 0.2 < total < 0.6  # the second second at 4 x: 0.25 s
+    _, fast = asyncio.run(timed(None))
+    assert fast < 0.05 and len(calls) == 1

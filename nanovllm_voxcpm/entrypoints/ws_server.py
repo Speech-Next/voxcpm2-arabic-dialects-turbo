@@ -123,7 +123,8 @@ async def speak(tts, req: dict, yields: list | None = None, cache: AudioCache | 
                               chunk_ms=req["chunk_ms"], pace=req.get("pace"))
 
         key = (part, req["dialect"], req["voice"], req["cfg_value"])
-        async for c in generate() if cache is None else cache.through(key, generate):
+        # (a kept sentence at most 4 x real time: the pacer sends it at 1 x; 150 at once in one go held the loops)
+        async for c in generate() if cache is None else cache.through(key, generate, speed=4.0):
             t = time.perf_counter()
             out = pcm16(rs.resample_chunk(c, last=False) if rs is not None else c)
             if yields is not None:
@@ -668,7 +669,8 @@ async def main_engine(args, socks, front_pid: int) -> int:
                 raise RuntimeError("the connections' process did not start")
             announce(args)
             log = open(args.log + ".engine", "a", buffering=1) if args.log else None
-            cache = AudioCache(int(args.audio_cache_mb * 2**20)) if getattr(args, "audio_cache_mb", 0) > 0 else None
+            mb = getattr(args, "audio_cache_mb", 0)
+            cache = AudioCache(int(mb * 2**20), tts.sample_rate) if mb > 0 else None
             engine = asyncio.create_task(serve_engine(tts, reader, [w for _, w in conns], log, cache))
             if args.hang_timeout and hasattr(tts.server, "watch_hangs"):  # (warmed up: no more kernels to compile)
                 tts.server.watch_hangs(args.hang_timeout)

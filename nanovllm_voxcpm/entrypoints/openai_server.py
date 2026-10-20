@@ -450,6 +450,8 @@ def build_app(args: argparse.Namespace):
         state["pool"] = pool
         info = await pool.get_model_info()
         state["sample_rate"] = int(info["sample_rate"])
+        if state["cache"] is not None:
+            state["cache"].sample_rate = state["sample_rate"]  # (its kept sentences' pace)
         state["encoder_rate"] = int(info.get("encoder_sample_rate", 16000))
         if args.voice_dir:  # voices registered in earlier runs: latents are on disk, no re-encoding
             for meta, latents in load_voices(args.voice_dir):
@@ -669,7 +671,10 @@ def build_app(args: argparse.Namespace):
                     **vk,
                 )
 
-            gen = generate() if cache is None else cache.through((base, part, seed), generate)
+            # (a kept sentence streamed at most 4 x real time, not all at once: the loop serves the engine too; a
+            # whole response as fast as it comes)
+            gen = (generate() if cache is None else
+                   cache.through((base, part, seed), generate, speed=4.0 if req.stream else None))
             try:
                 async for chunk in gen:
                     yield chunk
