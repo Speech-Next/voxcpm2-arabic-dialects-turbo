@@ -50,7 +50,7 @@ naturalness, 1-5.
 
 ## Install
 
-Linux, an NVIDIA GPU (Ampere or newer) and the CUDA toolkit (`nvcc`).
+Linux, an NVIDIA GPU (Ampere or newer) and the CUDA toolkit (`nvcc`); or the Docker image ([Docker](#docker)).
 
 ```bash
 git clone https://github.com/Speech-Next/voxcpm2-arabic-dialects-turbo && cd voxcpm2-arabic-dialects-turbo
@@ -183,6 +183,46 @@ time (a whole HTTP response at once). Requests for the same sentence that
 run at the same time each generate, and the first one to finish is kept. `voxcpm_audio_cache_hits_total`,
 `voxcpm_audio_cache_misses_total` (sentences), `voxcpm_audio_cache_bytes` and `voxcpm_audio_cache_entries` are in
 `/metrics`. Benchmark the engine with `--audio-cache-mb 0`: a benchmark that repeats its sentences measures the cache.
+
+## Docker
+
+```bash
+cp .env.example .env                 # HF_TOKEN (the gated models), VOXCPM_API_KEY, COMPOSE_PROFILES
+docker compose build                 # torch, flash-attn, ffmpeg and the CUDA kernels for CUDA_ARCH (8.6: A10)
+docker compose --profile http up -d  # the HTTP server on :8092; --profile ws: the WebSocket server on :8093
+docker compose logs -f http          # "ready" ~3 min after the first start (models download, Triton compiles)
+```
+
+Without compose:
+
+```bash
+docker build -t voxcpm2-turbo --build-arg CUDA_ARCH=8.6 .
+docker run -d --gpus '"device=0"' --shm-size=1g --stop-timeout 30 -p 8092:8092 -e HF_TOKEN -e VOXCPM_API_KEY \
+  -v voxcpm-cache:/cache -v voxcpm-voices:/voices voxcpm2-turbo http --max-streams 150 --voice-dir /voices
+```
+
+- **The image:**
+  - Based on CUDA 12.8 devel, the same steps as `setup.sh`: Python 3.12, torch 2.8.0, flash-attn, plus ffmpeg.
+  - It runs as a non-root user under tini.
+  - Its command is `http` or `ws`, followed by that server's options. It listens on `0.0.0.0:$PORT` (8092) unless `--host` or `--port` are given; set `PORT`, not `--port`, so that the HEALTHCHECK follows. Any other command runs as given, e.g. `bash`.
+- **Volumes:**
+  - `/cache`: `HF_HOME` with the models, plus `TRITON_CACHE_DIR` and `TORCHINDUCTOR_CACHE_DIR` with the compiled Triton kernels and `torch.compile` graphs. A restart downloads and compiles nothing, so later starts take ~1 minute.
+  - `/voices`: the HTTP server's `--voice-dir`.
+  - After the first download, `-e HF_HUB_OFFLINE=1` keeps a start off the Hub.
+- **GPU:**
+  - The CUDA kernels are built at `docker build` for `--build-arg CUDA_ARCH`, a list such as `8.6,8.9,9.0` (A10, L4 / RTX 4090, H100). There is no GPU at build time, so `voxcpm_kernels.cuda_ext` builds for `VOXCPM_CUDA_ARCH`; a start then loads its GPU's build without nvcc.
+  - Another GPU builds its own at its first start, ~2 min (nvcc is in the image).
+  - One GPU per container: an A10 holds one engine. `docker-compose.yml` has a commented second replica on a second GPU.
+- **Shared memory:** the engine streams audio through 128 MiB of shared memory, so `--shm-size=1g`. Docker's default of 64 MiB is too small.
+- **Stop:** `docker stop` waits 10 s by default. The servers drain for `--shutdown-timeout` (10 s) and then stop the engine, so give them 30 s (`--stop-timeout 30`, compose `stop_grace_period: 30s`).
+- **Health:** the image's HEALTHCHECK polls `/health`, with a start period of 15 min for the first start's downloads.
+- **Kubernetes:**
+  - one GPU per pod (`nvidia.com/gpu: 1`);
+  - `readinessProbe` and `livenessProbe` on `GET /health`, with a `startupProbe` long enough for the first start;
+  - `terminationGracePeriodSeconds` ≥ 30;
+  - `/dev/shm` as an `emptyDir` with `medium: Memory` (`sizeLimit: 1Gi`);
+  - `/cache` on a PersistentVolumeClaim;
+  - `HF_TOKEN` and `VOXCPM_API_KEY` from a Secret.
 
 ## Examples
 
