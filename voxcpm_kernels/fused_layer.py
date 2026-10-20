@@ -84,7 +84,7 @@ def _res_epilogue(acc, rm, rn, a_scale, b_scale_ptr, res_ptr, c_ptr, M, N):
     tl.store(c_ptr + offs, out.to(c_ptr.dtype.element_ty), mask=cm)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _w8a8_gemm_res(
     a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, res_ptr,
     M, N, K,
@@ -152,7 +152,7 @@ def _gemm(q, s, lin: W8A8Linear, out_dtype, residual=None):
 # tiled pass reduces those partials to the per-row scale and quantizes h for the down GEMM. Versus gate_up ->
 # bf16 [M, 2I] -> a silu*mul+quant pass, the [M, 2I] round trip becomes [M, I], and the quant pass needs no row
 # reduction.
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _w8a8_gemm_swiglu(
     a_ptr, b_ptr, h_ptr, amax_ptr, a_scale_ptr, b_scale_ptr,
     M, N, K, NT,
@@ -191,7 +191,7 @@ def _w8a8_gemm_swiglu(
     tl.store(amax_ptr + rows * NT + pid_n, tl.max(tl.abs(h.to(tl.float32)), axis=1), mask=rm < M)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _quant_rows_partials(h_ptr, amax_ptr, q_ptr, scale_ptr, M, I, NT,
                          NT_P2: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr):
     r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
@@ -239,7 +239,7 @@ def swiglu_gemm_quant(q, s, lin: W8A8Linear, out_dtype):
 # comes out of the GEMM as adjacent columns (2j, 2j+1); the epilogue splits them, rotates q/k heads in fp32 (one
 # bf16 rounding instead of two) and stores the halves back at j and j + head_dim/2, so the qkv layout in memory is
 # unchanged. The separate in-place RoPE pass over q|k goes away.
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _w8a8_gemm_qkv_rope(
     a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, bias_ptr, pos_ptr, cos_ptr, sin_ptr, add_ptr,
     M, N, K, n_rope_heads,

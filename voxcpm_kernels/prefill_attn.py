@@ -55,7 +55,7 @@ def _attend_group(q_ptr, k_ptr, v_ptr, bt_ptr, b, q0, nq, nk, qb, g, q_stride, b
     return acc / tl.maximum(l_i, 1e-30)[:, None]
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["bt_stride"])
 def _paged_prefill_attn(
     q_ptr, k_ptr, v_ptr, bt_ptr, cu_q_ptr, cu_k_ptr, o_ptr, scale_ptr, inv_smooth_ptr,
     q_stride, bt_stride, sm_scale,

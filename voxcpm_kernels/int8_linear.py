@@ -43,7 +43,7 @@ def quantize_rows(x: torch.Tensor, inv_smooth: torch.Tensor | None = None):
     return q, scale
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _w8a8_gemm(
     a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, bias_ptr,
     M, N, K,

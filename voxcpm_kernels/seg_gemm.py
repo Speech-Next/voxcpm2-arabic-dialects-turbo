@@ -125,7 +125,7 @@ def _tile_order(pid, NUM_N, NUM_T, GROUP_T: tl.constexpr):
     return first + (pid % group) % gt, (pid % group) // gt
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M", "NUM_T"])
 def _seg_w8a8_gemm(
     a_ptr, w_ptr, c_ptr, a_scale_ptr, w_scale_ptr, bias_ptr, tiles_ptr, remap_ptr,
     M, N, K, NUM_N, NUM_T,
@@ -162,7 +162,7 @@ def _seg_w8a8_gemm(
     tl.store(c_ptr + rm.to(tl.int64)[:, None] * N + rn[None, :], out.to(c_ptr.dtype.element_ty), mask=cm)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M", "NUM_T"])
 def _seg_w8a8_gemm_res(
     a_ptr, w_ptr, c_ptr, a_scale_ptr, w_scale_ptr, res_ptr, tiles_ptr, remap_ptr,
     M, N, K, NUM_N, NUM_T,
@@ -200,7 +200,7 @@ def _seg_w8a8_gemm_res(
     tl.store(c_ptr + offs, out.to(c_ptr.dtype.element_ty), mask=cm)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M", "NUM_T"])
 def _seg_w8a8_gemm_qkv_rope(
     a_ptr, w_ptr, c_ptr, a_scale_ptr, w_scale_ptr, pos_ptr, cos_ptr, sin_ptr, tiles_ptr,
     M, N, K, NUM_N, NUM_T, n_rope_heads,
@@ -244,7 +244,7 @@ def _seg_w8a8_gemm_qkv_rope(
     tl.store(c_ptr + offs + HALF, x2.to(c_ptr.dtype.element_ty), mask=rmask[:, None])
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M", "NUM_T"])
 def _seg_w8a8_gemm_swiglu(
     a_ptr, w_ptr, h_ptr, amax_ptr, a_scale_ptr, w_scale_ptr, tiles_ptr, remap_ptr,
     M, N, K, NUM_N, NUM_T,
