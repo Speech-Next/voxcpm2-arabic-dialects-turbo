@@ -130,6 +130,11 @@ curl http://127.0.0.1:8092/v1/audio/speech -H 'Content-Type: application/json' \
   -d '{"input": "هلا والله", "voice": "ahmed", "dialect": "najdi", "response_format": "wav"}' -o out.wav
 ```
 
+`response_format`: `pcm` (the default: raw 16-bit, rate in `X-Sample-Rate`), `wav` (sent whole), and `mp3`
+(constant bitrate, ~96 kbit/s), `opus` (Ogg) and `flac`, which are streamed as they are encoded (a streamed flac carries
+no length). OpenAI's default is mp3; `aac` is not offered. `speed` other than 1.0 is a 400 (no time-stretch that keeps
+the pitch in good quality). `cfg_value` has no effect with the distilled LocDiT (the default), only with `--dit none`.
+
 ## Production
 
 | | WebSocket server | HTTP server |
