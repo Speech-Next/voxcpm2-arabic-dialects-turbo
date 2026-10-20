@@ -161,10 +161,14 @@ class ChunkStream:
         self._target = math.inf  # when the taking side wakes up anyway
         self._failed: BaseException | None = None
         self.last_due: float | None = None  # when the chunk last taken out was due
+        self.first_push: float | None = None  # when its first audio came (the server's time to first audio)
         self._sender: "tuple[StreamSender, int] | None" = None  # sent by a StreamSender instead of async for
 
     def push(self, data: bytes, t: float | None = None) -> None:
-        self.pacer.push(data, self.clock() if t is None else t)
+        t = self.clock() if t is None else t
+        if self.first_push is None and data:
+            self.first_push = t
+        self.pacer.push(data, t)
         if self._sender is not None:
             self._sender[0]._update(self._sender[1])
             return

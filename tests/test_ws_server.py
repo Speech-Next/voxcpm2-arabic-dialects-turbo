@@ -515,3 +515,75 @@ def test_sigterm_drains_and_exits_in_time(tmp_path):
         p.kill()
     assert msgs[-1] == "end_of_audio" and sum(m for m in msgs if isinstance(m, int)) == 20 * PATCH // 3 * 2
     assert code == 1001 and took < 3.0 and p.returncode == 0
+
+
+def metric_values(text: str) -> dict[str, float]:
+    """Prometheus text: {'name{labels}': value}."""
+    return {k: float(v) for k, v in (line.rsplit(" ", 1) for line in text.splitlines() if line and line[0] != "#")}
+
+
+def test_metrics_and_logs(caplog):
+    # every utterance's outcome counted, its audio timed and measured; /metrics on the same port, behind the API key;
+    # a line logged per connection opened and closed and per utterance not spoken
+    import logging
+    import urllib.error
+    import urllib.request
+
+    caplog.set_level(logging.INFO, logger="ws_server")
+    tts = PickyTTS(patches=2)
+    srv = Server(set(tts.voices), local_feed(tts), args(api_key="k"))
+
+    async def main():
+        from websockets.asyncio.server import serve
+
+        await exchange(srv, texts=["ok", "bad", "..."], headers={"Authorization": "Bearer k"})
+        async with serve(srv.handler, "127.0.0.1", 0, process_request=srv.process_request) as s:
+            url = f"http://127.0.0.1:{s.sockets[0].getsockname()[1]}/metrics"
+
+            def get(headers):
+                try:
+                    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=5) as r:
+                        return r.status, r.headers["Content-Type"], r.read().decode()
+                except urllib.error.HTTPError as e:
+                    return e.code, None, ""
+
+            return await asyncio.to_thread(get, {}), await asyncio.to_thread(get, {"Authorization": "Bearer k"})
+
+    (no_key, _, _), (status, ctype, text) = asyncio.run(main())
+    assert no_key == 401 and status == 200 and ctype == "text/plain; version=0.0.4; charset=utf-8"
+    m = metric_values(text)
+    assert m['voxcpm_requests_total{outcome="ok"}'] == 1 and m['voxcpm_requests_total{outcome="client_error"}'] == 2
+    assert m["voxcpm_connections_total"] == 1 and m["voxcpm_connections"] == 0 and m["voxcpm_active_streams"] == 0
+    assert m["voxcpm_first_audio_seconds_count"] == 1 and m["voxcpm_first_chunk_seconds_count"] == 1
+    assert m["voxcpm_audio_seconds_total"] == pytest.approx(2 * PATCH / 48000, abs=0.01)  # (16 kHz PCM16 sent)
+    assert m["voxcpm_engine_alive"] == 1
+    logged = [r.getMessage() for r in caplog.records if r.name == "ws_server"]
+    assert any(msg.startswith("conn 1 open: 127.0.0.1:") for msg in logged)
+    assert "conn 1: utterance refused: Request may exceed max_model_len" in logged
+    assert "conn 1: utterance refused: text has nothing to speak (only punctuation, symbols or emoji)" in logged
+    assert any(msg.startswith("conn 1 closed: ") and msg.endswith("1 utterances spoken, 2 failed") for msg in logged)
+
+
+def test_an_engine_value_error_is_one_across_the_link():
+    # the request's fault (e.g. a text too long for the model) crosses the two processes' link as a ValueError: the
+    # client hears the same message, and the connections' process counts it as the request's fault
+    import socket
+
+    tts = PickyTTS(patches=1)
+
+    async def main():
+        a, b = socket.socketpair()
+        reader, writer = await asyncio.open_connection(sock=a)
+        engine = asyncio.create_task(serve_engine(tts, reader, writer))
+        tb, link = await asyncio.get_running_loop().create_connection(EngineLink, sock=b)
+        srv = Server({"default"}, link.start, args())
+        msgs = await exchange(srv, texts=["bad", "x"])
+        tb.close()
+        await asyncio.wait_for(engine, 2)
+        return msgs, metric_values(srv.metrics.render())
+
+    msgs, m = asyncio.run(main())
+    assert [x["message"] for x in msgs if isinstance(x, dict) and x["type"] == "error"] == [
+        "Request may exceed max_model_len"]
+    assert m['voxcpm_requests_total{outcome="client_error"}'] == 1 and m['voxcpm_requests_total{outcome="ok"}'] == 1
+    assert m['voxcpm_requests_total{outcome="server_error"}'] == 0

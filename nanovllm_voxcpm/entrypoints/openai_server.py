@@ -58,6 +58,10 @@ input with nothing to speak (punctuation, symbols or emoji only) is a 400. A spe
 ends its engine request. /health is 503 once the engine process has died or hung (``--hang-timeout``: nothing from it
 for that long while requests wait), and the server then exits with code 1, for its supervisor to start it again. On
 SIGTERM the requests in progress get ``--shutdown-timeout`` seconds to end. A voice in use is not deleted (409).
+A line is logged per speech request that fails or is refused and per voice registered or deleted (``--log-level``),
+by a thread of its own (telemetry). ``GET /metrics`` (behind the API key, as a bearer token): Prometheus' text format,
+speech requests by outcome and in progress, time to first audio (from the request to the engine's first audio),
+seconds of audio sent, the engine alive.
 """
 
 import argparse
@@ -66,6 +70,7 @@ import contextlib
 import hmac
 import io
 import json
+import logging
 import os
 import re
 import signal
@@ -85,10 +90,12 @@ from nanovllm_voxcpm.dialect_routing import (DEFAULT_ROUTES, DEFAULT_TAGGED_MODE
                                              resolve_tagged, route_table, routed_lora_config, used_adapters)
 from nanovllm_voxcpm.dialect_tts import (DEFAULT_DIT, DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters,
                                          read_as, resolve, speakable, turbo_config, use_model_calibration)
+from nanovllm_voxcpm.entrypoints.telemetry import CONTENT_TYPE, ServerMetrics, setup_logging
 
 CLONE_MODES = ("prompt_ref", "ref", "prompt")
 VOICE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # voice names are also file names in --voice-dir
 MAX_JSON_BODY = 1 << 20  # a speech request's body, bytes
+logger = logging.getLogger("openai_server")
 
 # sentence ends: Latin / Arabic-script punctuation followed by whitespace (Arabic ؟ ؛ and the Urdu full stop ۔),
 # CJK punctuation anywhere; clause ends: commas (Arabic ، included)
@@ -280,6 +287,14 @@ def encode_audio(fmt: str, pcm: bytes, sample_rate: int) -> bytes:
     return enc.whole()
 
 
+def brief(detail) -> str:
+    """An error response's detail as a log line (pydantic's errors: where and what; their input is left out)."""
+    if isinstance(detail, list):
+        return "; ".join(f"{'.'.join(map(str, d.get('loc', ())))}: {d.get('msg')}" for d in detail[:3]
+                         if isinstance(d, dict))
+    return str(detail)[:300]
+
+
 def build_app(args: argparse.Namespace):
     # active: speech requests in progress (--max-streams); registering: voice names being uploaded; voice_users: speech
     # requests in progress per voice (no DELETE meanwhile); dead: the engine process died; on_engine_dead: what stops
@@ -456,7 +471,7 @@ def build_app(args: argparse.Namespace):
         async def watch_engine() -> None:
             await pool.wait_dead()
             state["dead"] = True
-            print("[server] the engine process died: shutting down (exit code 1)", flush=True)
+            logger.error("the engine process died: shutting down (exit code 1)")
             state["on_engine_dead"]()
 
         watcher = asyncio.create_task(watch_engine()) if hasattr(pool, "wait_dead") else None
@@ -465,12 +480,15 @@ def build_app(args: argparse.Namespace):
         finally:
             if watcher is not None:
                 watcher.cancel()
+            logger.info("shutting down: the engine stops")
             await pool.stop()
 
     app = FastAPI(title="VoxCPM2 (nanovllm-voxcpm-turbo)", lifespan=lifespan)
 
     def engine_alive() -> bool:
         return not state["dead"] and getattr(state.get("pool"), "alive", True)
+
+    metrics = ServerMetrics("speech request", lambda: state["active"], engine_alive)
 
     @app.get("/health")
     async def health():
@@ -498,19 +516,25 @@ def build_app(args: argparse.Namespace):
         consent: str | None = Form(None),
         normalize: bool = Form(True),
     ):
-        if not VOICE_NAME.match(name):
-            raise HTTPException(400, "voice name: 1-64 characters from A-Z a-z 0-9 . _ -")
-        if name in state["voices"] or name in state["registering"]:
-            raise HTTPException(409, f"voice '{name}' exists; DELETE /v1/audio/voices/{name} first")
-        limit = int(args.max_voice_mb * (1 << 20))
-        if (audio_sample.size or 0) > limit:
-            raise HTTPException(413, f"audio_sample: at most {args.max_voice_mb:g} MB (--max-voice-mb)")
-        audio_format = os.path.splitext(audio_sample.filename or "")[1].lstrip(".") or "wav"
-        state["registering"].add(name)
         try:
-            return await register(name, await audio_sample.read(), audio_format, ref_text, normalize, upload=True)
-        finally:
-            state["registering"].discard(name)
+            if not VOICE_NAME.match(name):
+                raise HTTPException(400, "voice name: 1-64 characters from A-Z a-z 0-9 . _ -")
+            if name in state["voices"] or name in state["registering"]:
+                raise HTTPException(409, f"voice '{name}' exists; DELETE /v1/audio/voices/{name} first")
+            limit = int(args.max_voice_mb * (1 << 20))
+            if (audio_sample.size or 0) > limit:
+                raise HTTPException(413, f"audio_sample: at most {args.max_voice_mb:g} MB (--max-voice-mb)")
+            audio_format = os.path.splitext(audio_sample.filename or "")[1].lstrip(".") or "wav"
+            state["registering"].add(name)
+            try:
+                out = await register(name, await audio_sample.read(), audio_format, ref_text, normalize, upload=True)
+            finally:
+                state["registering"].discard(name)
+        except HTTPException as e:
+            logger.info("voice %r not registered: %d %s", name[:64], e.status_code, brief(e.detail))
+            raise
+        logger.info("voice %r registered", name)
+        return out
 
     @app.get("/v1/audio/voices")
     async def list_voices():
@@ -521,6 +545,7 @@ def build_app(args: argparse.Namespace):
         if name not in state["voices"]:
             raise HTTPException(404, f"voice '{name}' not found")
         if state["voice_users"].get(name):  # (its next sentence would fail, and its response stop after a 200)
+            logger.info("voice %r not deleted: in use by %d speech requests (409)", name, state["voice_users"][name])
             raise HTTPException(409, f"voice '{name}' is in use by {state['voice_users'][name]} speech requests; "
                                      "try again once they end")
         del state["voices"][name]
@@ -529,6 +554,7 @@ def build_app(args: argparse.Namespace):
             await state["tags"].drop_voice(state["pool"], name)
         if args.voice_dir:
             delete_voice_files(args.voice_dir, name)
+        logger.info("voice %r deleted", name)
         return {"deleted": name}
 
     def voice_kwargs(req: SpeechRequest) -> dict:
@@ -648,15 +674,18 @@ def build_app(args: argparse.Namespace):
         delays when later requests reach the engine; this path reads the body, validates it with pydantic's
         JSON parser and streams the PCM chunks itself. The response runs against the client's disconnect, which
         cancels it and so its engine request: uvicorn's send() returns quietly once the client is gone, and the
-        engine generated the rest of the audio for no one."""
+        engine generated the rest of the audio for no one. Its outcome is counted (metrics)."""
+        t0 = time.perf_counter()
         body = b""
         while True:
             msg = await receive()
             if msg["type"] == "http.disconnect":
+                metrics.requests.inc("cancelled")
                 return
             body += msg.get("body", b"")
             if len(body) > MAX_JSON_BODY:
-                return await send_json(send, 413, {"detail": f"request body over {MAX_JSON_BODY} bytes"})
+                metrics.requests.inc(await refuse(send, 413, f"request body over {MAX_JSON_BODY} bytes"))
+                return
             if not msg.get("more_body"):
                 break
 
@@ -664,18 +693,43 @@ def build_app(args: argparse.Namespace):
             while (await receive())["type"] != "http.disconnect":
                 pass
 
-        job, gone = asyncio.ensure_future(respond(body, send)), asyncio.ensure_future(disconnected())
+        job, gone = asyncio.ensure_future(respond(body, send, t0)), asyncio.ensure_future(disconnected())
         try:
             await asyncio.wait((job, gone), return_when=asyncio.FIRST_COMPLETED)
         finally:
             gone.cancel()
             if not job.done():
                 job.cancel()  # (the client is gone: closing its generator cancels the engine request)
-            with contextlib.suppress(asyncio.CancelledError):
-                await job
+            try:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await job
+            finally:  # (an exception: uvicorn logs it)
+                metrics.requests.inc("cancelled" if not job.done() or job.cancelled() else
+                                     "server_error" if job.exception() is not None else job.result())
 
-    async def respond(body: bytes, send) -> None:
-        """A speech request's response, once its body is read (speech)."""
+    async def refuse(send, status: int, detail, outcome: str | None = None) -> str:
+        """A speech request's error response, sent and logged: its outcome (metrics)."""
+        await send_json(send, status, {"detail": detail})
+        (logger.info if status < 500 else logger.warning)("speech request refused (%d): %s", status, brief(detail))
+        return outcome or ("client_error" if status < 500 else "server_error")
+
+    async def metered(gen, t0: float):
+        """A speech request's audio chunks, counted (metrics): the first one's time, the seconds of them all."""
+        first, samples = True, 0
+        try:
+            async for chunk in gen:
+                if first:
+                    metrics.first_audio.observe(time.perf_counter() - t0)
+                    first = False
+                samples += chunk.size
+                yield chunk
+        finally:
+            metrics.audio.inc(by=samples / state["sample_rate"])
+            await gen.aclose()
+
+    async def respond(body: bytes, send, t0: float) -> str:
+        """A speech request's response, once its body is read (speech): its outcome (metrics)."""
+        busy = False
         try:
             req = SpeechRequest.model_validate_json(body)
             if req.response_format not in AUDIO_FORMATS:
@@ -688,18 +742,18 @@ def build_app(args: argparse.Namespace):
             if not engine_alive():
                 raise HTTPException(503, "the engine process died; the server restarts")
             if args.max_streams and state["active"] >= args.max_streams:
+                busy = True
                 raise HTTPException(503, f"busy: {state['active']} speech requests in progress (--max-streams)")
         except ValidationError as e:
-            return await send_json(send, 422, {"detail": e.errors(include_url=False, include_input=False,
-                                                                  include_context=False)})
+            return await refuse(send, 422, e.errors(include_url=False, include_input=False, include_context=False))
         except HTTPException as e:
-            return await send_json(send, e.status_code, {"detail": e.detail})
+            return await refuse(send, e.status_code, e.detail, "busy" if busy else None)
         state["active"] += 1
         users = state["voice_users"]
         if req.voice is not None:
             users[req.voice] = users.get(req.voice, 0) + 1
         try:
-            await respond_audio(req, send)
+            return await respond_audio(req, send, t0) or "ok"
         finally:
             state["active"] -= 1
             if req.voice is not None:
@@ -707,9 +761,10 @@ def build_app(args: argparse.Namespace):
                 if not users[req.voice]:
                     del users[req.voice]
 
-    async def respond_audio(req: SpeechRequest, send) -> None:
+    async def respond_audio(req: SpeechRequest, send, t0: float) -> str | None:
+        """The audio, or an error response (its outcome; None: the audio went out)."""
         try:
-            gen = request_audio(req)
+            gen = metered(request_audio(req), t0)
             try:
                 first = await gen.__anext__()  # errors (e.g. a prompt too long) become HTTP errors
             except StopAsyncIteration:
@@ -721,7 +776,7 @@ def build_app(args: argparse.Namespace):
                     raise
                 raise HTTPException(503, "the engine process died; the server restarts") from e
         except HTTPException as e:
-            return await send_json(send, e.status_code, {"detail": e.detail})
+            return await refuse(send, e.status_code, e.detail)
         enc = None
         try:
             sr = str(state["sample_rate"]).encode()
@@ -765,11 +820,24 @@ def build_app(args: argparse.Namespace):
         got = next((v for k, v in scope.get("headers", ()) if k == b"authorization"), b"")
         return hmac.compare_digest(got, key)
 
+    async def send_metrics(send):
+        body = metrics.render().encode()
+        await send({"type": "http.response.start", "status": 200, "headers": [
+            (b"content-type", CONTENT_TYPE.encode()), (b"content-length", str(len(body)).encode())]})
+        await send({"type": "http.response.body", "body": body})
+
     async def asgi(scope, receive, send):
         if scope["type"] == "http" and not authorized(scope):
+            client = scope.get("client") or ("?", 0)
+            logger.info("%s %s from %s:%s refused: missing or wrong API key (401)", scope["method"],
+                        scope["path"][:100], *client[:2])
+            if scope["path"] == "/v1/audio/speech":
+                metrics.requests.inc("client_error")
             return await send_json(send, 401, {"detail": "missing or wrong API key (Authorization: Bearer <key>)"})
         if scope["type"] == "http" and scope["method"] == "POST" and scope["path"] == "/v1/audio/speech":
             return await speech(scope, receive, send)
+        if scope["type"] == "http" and scope["method"] == "GET" and scope["path"] == "/metrics":
+            return await send_metrics(send)  # (behind the API key, as every endpoint but /health)
         return await app(scope, receive, send)
 
     asgi.state = state  # (main: the engine's death ends the server, which then exits non-zero)
@@ -821,14 +889,21 @@ def main():
                          "hung: the server exits with code 1 (0: not watched)")
     ap.add_argument("--shutdown-timeout", type=float, default=10.0,
                     help="on SIGTERM, speech requests in progress get this many seconds to end, then they are cut")
+    ap.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"],
+                    help="info: a line per speech request refused or failed and per voice registered or deleted; "
+                         "warning: failures only")
     args = ap.parse_args()
     os.environ.setdefault("NANOVLLM_SUBMIT_FLUSH_EVERY", "4")  # requests reach the engine as a steady stream
+    listener = setup_logging("openai_server", args.log_level)
     app = build_app(args)
     server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port, loop="uvloop", http="httptools",
                                            backlog=4096, timeout_keep_alive=30, log_level="warning",
                                            timeout_graceful_shutdown=args.shutdown_timeout))
     app.state["on_engine_dead"] = lambda: setattr(server, "should_exit", True)
-    server.run()
+    try:
+        server.run()
+    finally:
+        listener.stop()
     if app.state["dead"]:  # (exit code 1: a supervisor starts the server again)
         sys.exit(1)
 
