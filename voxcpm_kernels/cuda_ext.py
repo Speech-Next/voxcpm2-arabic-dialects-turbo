@@ -1,8 +1,8 @@
 """CUDA C++ kernels of voxcpm_kernels (cuda/*.cu), compiled on first use with torch.utils.cpp_extension.
 
-The build is cached (TORCH_EXTENSIONS_DIR, default ~/.cache/torch_extensions), so only the first import on a machine
-pays the nvcc time. Needs nvcc and ninja; ``available()`` is False when the build fails, and callers fall back to the
-Triton kernels.
+The build is cached (TORCH_EXTENSIONS_DIR, default ~/.cache/torch_extensions): setup.sh builds both kernels
+(``python -m voxcpm_kernels.cuda_ext``), so the first start does not wait for nvcc. Needs nvcc and ninja;
+``available()`` is False when the build fails, and callers fall back to the Triton kernels.
 """
 
 import functools
@@ -42,3 +42,12 @@ def available(name: str) -> bool:
         last = (str(e).strip().splitlines() or [type(e).__name__])[-1]
         print(f"[voxcpm_kernels] CUDA extension {name!r} unavailable: {last[:200]}")
         return False
+
+
+if __name__ == "__main__":  # setup.sh: every kernel built now, side by side, instead of on the first start
+    from concurrent.futures import ProcessPoolExecutor
+
+    names = sorted(f[:-3] for f in os.listdir(_DIR) if f.endswith(".cu"))
+    with ProcessPoolExecutor(len(names)) as pool:
+        for name, ok in zip(names, pool.map(available, names)):
+            print(f"[voxcpm_kernels] {name}: " + ("built" if ok else "not built, the Triton kernels are used"))

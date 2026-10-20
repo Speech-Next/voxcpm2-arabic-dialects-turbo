@@ -54,12 +54,13 @@ Linux, an NVIDIA GPU (Ampere or newer) and the CUDA toolkit (`nvcc`).
 
 ```bash
 git clone https://github.com/Speech-Next/voxcpm2-arabic-dialects-turbo && cd voxcpm2-arabic-dialects-turbo
-./setup.sh                  # Python 3.12 env, torch, flash-attn, this package with the servers
+./setup.sh                  # Python 3.12 env, torch, flash-attn, this package with the servers, its CUDA kernels
 source .venv/bin/activate
 hf auth login               # only for the gated benchmark voices
 ```
 
-Models download on first use. The first start takes 1-2 minutes (kernels compile, CUDA graphs are captured).
+`setup.sh` builds the two CUDA kernels (nvcc, ~1.5 minutes). Models download on first use. The first start takes
+~3 minutes (the Triton kernels compile, CUDA graphs are captured), later starts ~1 minute.
 
 ## Python
 
