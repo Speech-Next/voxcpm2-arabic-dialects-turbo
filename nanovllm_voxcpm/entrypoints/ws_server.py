@@ -24,7 +24,7 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
   chunk (124.4 ms with 4096-byte chunks of 16 kHz): the event loops of both sides (the client's too) delayed
   chunks by up to ~10 ms at 150-200 streams. The engine is told the chunk's length (stream's chunk_ms) so that its
   deadlines allow for what the server holds back; the pace runs 1/0.9 as fast as real time.
-- Two processes (default; --procs 1: one): the connections and their pacers run in a process of their own, the
+- Two processes: the connections and their pacers run in a process of their own, the
   engine's client (RoutedDialectTTS) in this one, the audio crossing over socket pairs. At 200 streams the client's
   event loop is busy 10-20 ms after every engine step (a patch of every stream at once), and a paced chunk due
   meanwhile went out that much late: a stall where the server had the audio.
@@ -47,7 +47,6 @@ import numpy as np
 from nanovllm_voxcpm.streaming import ChunkPacer, ChunkStream, StreamSender
 
 PATH = "/api/tts/stream"
-FRAME_S = 0.04  # the AudioVAE's frame: a stream's audio is a whole number of them
 
 
 def ws_frame(opcode: int, payload: bytes) -> bytes:
@@ -139,21 +138,17 @@ class Server:
         self.log = open(args.log, "a") if args.log else None
         self.conn = 0
         # paced chunks of every connection from one task (StreamSender), written to the transports as whole frames
-        self.sender = (StreamSender(getattr(args, "send_window_ms", 0.0) / 1000)
-                       if args.pace and getattr(args, "batch_sends", True) else None)
+        self.sender = StreamSender(0.0) if args.pace else None
         self.utterances = 0
 
-    def pacer(self, n: int, rate: int, chars: int) -> ChunkPacer:
+    def pacer(self, n: int, rate: int) -> ChunkPacer:
         a = self.args
         if not a.pace:  # each chunk the moment it is complete
             return ChunkPacer(n, 2 * rate, alpha=0.0, reserve_ms=None)
-        expect = a.expect_per_char * chars if a.expect_per_char > 0 else None
-        unit = max(2, round(FRAME_S * rate) * 2)  # the engine's audio comes in 40 ms frames
         self.utterances += 1  # each its own phase in [0, --pace-spread-ms) (golden-ratio sequence)
         phase = getattr(a, "pace_spread_ms", 0.0) * ((self.utterances * 0.6180339887) % 1.0)
         return ChunkPacer(n, 2 * rate, a.pace_alpha, a.pace_reserve_ms if a.pace_reserve_ms >= 0 else None,
-                          expect_s=expect, margin_ms=a.pace_margin_ms, unit_bytes=unit, alpha_last=a.pace_alpha_last,
-                          phase_ms=phase, min_gap_ms=getattr(a, "pace_min_gap_ms", 0.0),
+                          alpha_last=a.pace_alpha_last, phase_ms=phase, min_gap_ms=getattr(a, "pace_min_gap_ms", 0.0),
                           start_ms=getattr(a, "pace_start_ms", 0.0))
 
     async def handler(self, ws):
@@ -216,7 +211,7 @@ class Server:
     async def utterance(self, ws, conn, cfg, t_recv, text):
         n, rate, b64 = cfg["chunk_size"], cfg["rate"], cfg["transport"] == "json_base64"
         await ws.send(json.dumps({"type": "start", "sample_rate": rate}))
-        pacer = self.pacer(n, rate, len(text))
+        pacer = self.pacer(n, rate)
         # the engine runs the same pacer (chunk_ms, pace: its deadlines are the pacer's)
         req = dict(text=text, dialect=cfg["dialect"], voice=cfg["voice"], cfg_value=cfg["cfg_value"], rate=rate,
                    chunk_ms=n / (2 * rate) * 1000, pace=pacer_settings(pacer), segmenting=cfg["segmenting"])
@@ -396,23 +391,6 @@ class EngineLink(asyncio.Protocol):
         return stop
 
 
-async def lag_monitor(path: str, every: float = 0.002):
-    """The event loop's lag (a 2 ms sleep's overshoot), one jsonl line a second: p50, p99, max (ms)."""
-    with open(path, "a") as f:
-        lags, t_line = [], time.perf_counter()
-        while True:
-            t = time.perf_counter()
-            await asyncio.sleep(every)
-            now = time.perf_counter()
-            lags.append((now - t - every) * 1000)
-            if now - t_line >= 1.0:
-                lags.sort()
-                f.write(json.dumps({"t": now, "p50": lags[len(lags) // 2], "p99": lags[int(len(lags) * 0.99)],
-                                    "max": lags[-1], "n": len(lags)}) + "\n")
-                f.flush()
-                lags, t_line = [], now
-
-
 async def load_tts(args):
     from nanovllm_voxcpm import RoutedDialectTTS
 
@@ -420,7 +398,7 @@ async def load_tts(args):
                                 max_concurrency=args.max_concurrency, kv_blocks=args.kv_blocks).items()
           if v is not None}
     if args.dit is not None:
-        kw["dit"] = args.dit or None
+        kw["dit"] = None if args.dit in ("", "none") else args.dit
     tts = await RoutedDialectTTS.load(**kw)
     for spec in args.voice:
         name, _, path = spec.partition("=")
@@ -432,14 +410,11 @@ async def load_tts(args):
 async def serve_ws(server: Server, args, until: asyncio.Future, on_listening: Callable[[], None]):
     from websockets.asyncio.server import serve
 
-    lag = asyncio.create_task(lag_monitor(args.lag_log)) if args.lag_log else None
     async with serve(server.handler, args.host, args.port, max_size=None, compression=None, ping_interval=None,
                      max_queue=None) as ws_server:
         on_listening()
         await until
         ws_server.close()
-    if lag is not None:
-        lag.cancel()
 
 
 def announce(args):
@@ -448,7 +423,6 @@ def announce(args):
             f.write(str(os.getpid()))
     print(f"[ws_server] ws://{args.host}:{args.port}{PATH} ready (pacing "
           f"{'alpha %.2f, reserve %g ms' % (args.pace_alpha, args.pace_reserve_ms) if args.pace else 'off'}, "
-          f"{args.procs} process{'es' if args.procs > 1 else ''}"
           f"{', uvloop' if 'uvloop' in type(asyncio.get_running_loop()).__module__ else ''})", flush=True)
 
 
@@ -460,16 +434,8 @@ def stop_signal() -> asyncio.Future:
     return stop
 
 
-async def main_one(args):
-    """--procs 1: the connections on the engine client's event loop."""
-    tts = await load_tts(args)
-    async with tts:
-        server = Server(set(tts.voices), local_feed(tts), args)
-        await serve_ws(server, args, stop_signal(), lambda: announce(args))
-
-
 async def main_engine(args, socks, front_pid: int):
-    """--procs 2, this process: the engine's client, serving the connections' process."""
+    """This process: the engine's client, serving the connections' process."""
     conns = [await asyncio.open_connection(sock=s) for s in socks]
     reader, writer = conns[0]
     stop = stop_signal()
@@ -481,13 +447,10 @@ async def main_engine(args, socks, front_pid: int):
             if kind != LISTENING:
                 raise RuntimeError("the connections' process did not start")
             announce(args)
-            lag = asyncio.create_task(lag_monitor(args.lag_log + ".engine")) if args.lag_log else None
             log = open(args.log + ".engine", "a", buffering=1) if args.log else None
             engine = asyncio.create_task(serve_engine(tts, reader, [w for _, w in conns], log))
             await asyncio.wait([stop, engine], return_when=asyncio.FIRST_COMPLETED)
             engine.cancel()
-            if lag is not None:
-                lag.cancel()
     finally:
         try:
             os.kill(front_pid, signal.SIGTERM)
@@ -497,7 +460,7 @@ async def main_engine(args, socks, front_pid: int):
 
 
 async def main_front(args, socks):
-    """--procs 2, the connections' process."""
+    """The connections' process."""
     loop = asyncio.get_running_loop()
     _, link = await loop.create_connection(EngineLink, sock=socks[0])
     for s in socks[1:]:
@@ -517,7 +480,7 @@ def cli():
     ap.add_argument("--port", type=int, default=8092)
     ap.add_argument("--model", default=None, help="the adapters model (default: RoutedDialectTTS's)")
     ap.add_argument("--tagged-model", default=None)
-    ap.add_argument("--dit", default=None, help="distilled LocDiT (default: RoutedDialectTTS's; '' = the original)")
+    ap.add_argument("--dit", default=None, help="distilled LocDiT (default: RoutedDialectTTS's; none: the model's own)")
     ap.add_argument("--head-tokens", type=int, default=None)
     ap.add_argument("--max-concurrency", type=int, default=None)
     ap.add_argument("--kv-blocks", type=int, default=None)
@@ -532,45 +495,28 @@ def cli():
                          "audio has the longest to come")
     ap.add_argument("--pace-reserve-ms", type=float, default=1000.0, help="audio queued beyond this goes out at "
                                                                           "once (-1: never)")
-    ap.add_argument("--pace-margin-ms", type=float, default=4.0)
-    ap.add_argument("--expect-per-char", type=float, default=0.0,
-                    help="> 0: an utterance lasts at least this x its characters (s): a slower pace's ratio for "
-                         "short ones keeps their gaps under their shorter average chunk (ChunkPacer.ratio_for)")
-    ap.add_argument("--send-window-ms", type=float, default=0.0, help="paced chunks due within this go out together")
     ap.add_argument("--pace-spread-ms", type=float, default=10.0,
                     help="the chunk after the first (or a late one) goes out up to this much sooner, a different "
                          "amount per utterance: streams that start together do not send on the same instants")
     ap.add_argument("--pace-start-ms", type=float, default=150.0,
                     help="the first chunk this long after it is complete (later chunks and the engine's deadlines "
-                         "with it): more time for the engine, as much later first audio at the client (150: no stalls up "
-                         "to 150 streams at once on one A10, #31)")
+                         "with it): more time for the engine, as much later first audio at the client (150: no "
+                         "stalls up to 150 streams at once on one A10, #31)")
     ap.add_argument("--pace-min-gap-ms", type=float, default=8.0,
                     help="chunks sent ahead of the pace (above the reserve, the rest at the end) at least this far apart")
-    ap.add_argument("--per-stream-sends", dest="batch_sends", action="store_false",
-                    help="each connection sends its own paced chunks (default: one task sends every due chunk)")
-    ap.add_argument("--procs", type=int, choices=(1, 2), default=2,
-                    help="2: the connections in a process of their own (default), 1: on the engine client's loop")
-    ap.add_argument("--link-sockets", type=int, default=8, help="--procs 2: socket pairs between the two processes (an "
-                                                                    "engine step of 200 streams is ~1 MB of audio)")
-    ap.add_argument("--no-uvloop", dest="uvloop", action="store_false", help="asyncio's own event loop even when "
-                                                                              "uvloop is installed")
+    ap.add_argument("--link-sockets", type=int, default=8, help="socket pairs between the two processes (an engine "
+                                                                    "step of 200 streams is ~1 MB of audio)")
     ap.add_argument("--log", default=None, help="jsonl, one line per utterance: the engine's yields and the sends")
-    ap.add_argument("--lag-log", default=None, help="jsonl: the event loop's lag once a second")
     ap.add_argument("--ready", default=None, help="a file written once the server accepts connections")
     args = ap.parse_args()
     if args.default_voice is None and args.voice:
         args.default_voice = args.voice[0].partition("=")[0]
-    factory = None
-    if args.uvloop:
-        try:  # a faster event loop: at 200 streams the loop's delays decide whether a paced chunk is late
-            import uvloop
+    try:  # a faster event loop: at 150-200 streams the loop's delays decide whether a paced chunk is late
+        import uvloop
 
-            factory = uvloop.new_event_loop
-        except ImportError:
-            pass
-    if args.procs == 1:
-        asyncio.run(main_one(args), loop_factory=factory)
-        return
+        factory = uvloop.new_event_loop
+    except ImportError:
+        factory = None
     import socket
 
     pairs = [socket.socketpair() for _ in range(args.link_sockets)]

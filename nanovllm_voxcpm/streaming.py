@@ -23,10 +23,9 @@ Policy (times from the stream's own audio, so that the pace does not drift):
 - when the stream has ended, what is left goes out at once.
 
 ``alpha`` < 1: a gap is a stall when it is longer than the request's average chunk (its audio over its number of
-chunks: below a whole chunk's audio by the shorter last one, most for short utterances). ``expect_s``, a lower bound
-of the utterance's audio (e.g. from its text), lowers the pace's ratio for short ones so that a gap stays
-``margin_ms`` (the event loop's delays) under the shortest such average (``unit_bytes``: the audio's granularity). The pace then runs 1 / ratio as fast as real
-time: a stream needs that much audio ahead of its first chunk to never leave the server empty (``dry_at``).
+chunks: below a whole chunk's audio by the shorter last one, most for short utterances). The pace runs 1 / alpha as
+fast as real time: a stream needs that much audio ahead of its first chunk to never leave the server empty
+(``dry_at``).
 """
 
 from __future__ import annotations
@@ -46,16 +45,15 @@ class ChunkPacer:
     that ``push``, ``finish`` and ``pop`` agree on; ``due`` is never earlier than the times they were given."""
 
     def __init__(self, chunk_bytes: int = 4096, bytes_per_s: float = 32000.0, alpha: float = 0.95,
-                 reserve_ms: float | None = 1000.0, expect_s: float | None = None, margin_ms: float = 4.0,
-                 unit_bytes: int = 1, alpha_last: float | None = None, phase_ms: float = 0.0,
+                 reserve_ms: float | None = 1000.0, alpha_last: float | None = None,
+                 phase_ms: float = 0.0,
                  min_gap_ms: float = 0.0, start_ms: float = 0.0):
         if chunk_bytes <= 0 or bytes_per_s <= 0 or not 0 <= alpha <= 1:
             raise ValueError("chunk_bytes and bytes_per_s must be positive, 0 <= alpha <= 1 (0: no pace)")
         self.chunk_bytes = chunk_bytes
         self.bytes_per_s = float(bytes_per_s)
-        cap = 1.0 if expect_s is None else self.ratio_for(expect_s, chunk_bytes, bytes_per_s, margin_ms, unit_bytes)
-        self.alpha = min(alpha, cap)
-        self.alpha_last = self.alpha if alpha_last is None else min(alpha_last, cap)
+        self.alpha = alpha
+        self.alpha_last = alpha if alpha_last is None else alpha_last
         self.reserve = None if reserve_ms is None else int(reserve_ms / 1000 * bytes_per_s)
         self._buf = bytearray()
         self._base = 0  # stream offset of _buf[0]
@@ -75,17 +73,6 @@ class ChunkPacer:
         # connections' event loop and the client's for 6-7 ms, and other streams' paced chunks came late
         self.min_gap = min_gap_ms / 1000
         self.start = start_ms / 1000  # the first chunk this long after it is complete
-
-    @staticmethod
-    def ratio_for(expect_s: float, chunk_bytes: int = 4096, bytes_per_s: float = 32000.0, margin_ms: float = 4.0,
-                  unit_bytes: int = 1) -> float:
-        """The pace's ratio that keeps every gap ``margin_ms`` under the average chunk (its audio over the number of
-        chunks) of any utterance at least ``expect_s`` long whose length is a multiple of ``unit_bytes`` (1: any; the
-        engine's audio comes in 40 ms frames). At least 0.5."""
-        chunk_s = chunk_bytes / bytes_per_s
-        first = max(1, -(-int(expect_s * bytes_per_s) // unit_bytes)) * unit_bytes
-        worst = min(n / -(-n // chunk_bytes) for n in range(first, first + 8 * chunk_bytes + 1, unit_bytes))
-        return max(0.5, (worst / bytes_per_s - margin_ms / 1000) / chunk_s)
 
     def push(self, data: bytes, t: float) -> None:
         if self._ended is not None:

@@ -116,20 +116,6 @@ def test_the_grid_does_not_drift_when_pops_come_late():
     assert planned == pytest.approx([0.95 * CS * k for k in range(6)])
 
 
-def test_ratio_for_short_utterances_keeps_gaps_under_the_shortest_average():
-    for expect_s in (0.5, 1.0, 2.3, 7.0):
-        for unit in (1, 1280):
-            r = ChunkPacer.ratio_for(expect_s, margin_ms=4.0, unit_bytes=unit)
-            first = -(-int(expect_s * 32000) // unit) * unit
-            for n_bytes in range(first, first + 12 * C, unit if unit > 1 else 97):  # any length from expect_s on
-                n = -(-n_bytes // C)
-                assert r * CS + 0.004 <= n_bytes / 32000 / n + 1e-9
-    # whole 40 ms frames allow a faster pace than any length
-    assert ChunkPacer.ratio_for(2.3, unit_bytes=1280) >= ChunkPacer.ratio_for(2.3)
-    assert ChunkPacer(alpha=0.95, expect_s=2.3).alpha == pytest.approx(ChunkPacer.ratio_for(2.3))
-    assert ChunkPacer(alpha=0.9, expect_s=60).alpha == 0.9
-
-
 def test_dry_at():
     p = ChunkPacer(C, 32000, alpha=0.95, reserve_ms=None)
     assert p.dry_at() is None

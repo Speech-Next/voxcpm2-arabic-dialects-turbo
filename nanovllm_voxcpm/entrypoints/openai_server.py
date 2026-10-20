@@ -1,9 +1,9 @@
 """OpenAI-compatible streaming TTS server for VoxCPM2, built around voice cloning.
 
-    python -m nanovllm_voxcpm.entrypoints.openai_server --model <model dir or repo id> \
-        --dit <distilled LocDiT, path or repo:file> --voice-dir /path/to/voices --port 8092
+    python -m nanovllm_voxcpm.entrypoints.openai_server [--voice-dir /path/to/voices] [--port 8092]
 
-(or NANOVLLM_VOXCPM2_TURBO='{...}' for a configuration of its own). A model with an ``adapters/`` directory serves its
+The defaults are the library's: the dialect model, routed, with the distilled 3-step LocDiT and int8 layers
+(--dit none: the model's own LocDiT, 10 steps). A model with an ``adapters/`` directory serves its
 adapters (see LoRA below).
 
 Endpoints (request shapes follow vLLM-Omni's, so one client can drive both servers):
