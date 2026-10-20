@@ -146,15 +146,14 @@ class RegisteredVoice:
 class VoxCPM2Engine(LLMEngineBase):
     # turbo caches; class defaults = off (also for instances built without __init__)
     ref_prefix_cache_enabled = False
+    ref_prefix_cache_size = 64  # voices whose reference-prefix KV block is kept
     locenc_cache_enabled = False
     head_tokens, head_patches, head_min_rest = 0, 3, 8  # head start off
     lead_silence_patches = -1  # leading silence as generated
-    head_start_limit = 0  # head start for every request long enough
-    head_patches_max, head_margin, step_cap, head_hold = 0, 0.15, 0.0, False  # every head head_patches long
+    head_patches_max, head_margin, step_cap = 0, 0.15, 0.0  # every head head_patches long
     mid_stages, mid_patches_max, stage_kv_reuse = (), 10, False  # no intermediate stage, every stage prefilled whole
     mid_stagger = 0
-    client_chunk = 0.0  # seconds; 0: the player gets every patch whole
-    client_pace, client_pace_last, client_pace_reserve = 0.0, 0.95, 1.0  # unpaced
+    client_pace_last, client_pace_reserve = 0.95, 1.0  # a paced front's (a float client_pace) other settings
     _paced = False  # a request with a paced front was added
     # stream id -> (KV block kept from its finished stage, the token ids it holds KV for, their PreparedAudio)
     _stream_prefix = MappingProxyType({})
@@ -183,30 +182,24 @@ class VoxCPM2Engine(LLMEngineBase):
         self._tag_rows_used = 0
         self._tag_remap: dict[str, dict[int, int]] = {}
         turbo = config.model_config.turbo
-        self.ref_prefix_cache_enabled = turbo.ref_prefix_cache
-        self.ref_prefix_cache_size = turbo.ref_prefix_cache_size
-        self.locenc_cache_enabled = turbo.locenc_cache_size > 0 and turbo.skip_text_locenc
+        self.ref_prefix_cache_enabled = self.locenc_cache_enabled = True
         # ref_key -> (pinned KV block, token_ids it holds KV for, PreparedAudio of their reference), LRU order
         self.ref_prefix_blocks: OrderedDict[int, tuple[int, list, PreparedAudio | None]] = OrderedDict()
         self.voices: dict[str, RegisteredVoice] = {}
-        self.head_tokens, self.head_patches, self.head_min_rest = turbo.head_tokens, turbo.head_patches, turbo.head_min_rest
+        self.head_tokens = turbo.head_tokens
         self.lead_silence_patches = turbo.lead_silence_patches
-        # streams in their head phase (a head generating, its continuation not prefilled yet) -> the tokens their
-        # continuation's prefill will compute: TurboConfig head_start_limit, head_patches_max
-        self.head_start_limit = turbo.head_start_limit
-        self.head_patches_max, self.head_margin = turbo.head_patches_max, turbo.head_margin_ms / 1000
-        self.step_cap, self.head_hold = turbo.step_cap_ms / 1000, turbo.head_hold
+        self.head_patches_max = turbo.head_patches_max
+        self.step_cap = turbo.step_cap_ms / 1000
         mid = turbo.mid_tokens if isinstance(turbo.mid_tokens, (list, tuple)) else [turbo.mid_tokens]
         self.mid_stages = tuple(sorted({int(m) for m in mid if int(m) > self.head_tokens}))
         self.mid_patches_max, self.mid_stagger = turbo.mid_patches_max, turbo.mid_stagger
-        self.client_chunk = turbo.client_chunk_ms / 1000
-        self.client_pace, self.client_pace_last = turbo.client_pace, turbo.client_pace_last
-        self.client_pace_reserve = turbo.client_pace_reserve_ms / 1000
         self.stage_kv_reuse = turbo.stage_kv_reuse
         self._stream_prefix: dict[str, tuple[int, list, PreparedAudio | None]] = {}
+        # streams in their head phase (a head generating, its continuation not prefilled yet) -> the tokens their
+        # continuation's prefill will compute: TurboConfig head_patches_max
         self._head_phase: dict[str, int] = {}
         self._text_lens: dict[str, int] = {}
-        self.step_cost = StepCost()  # the scheduler's time model (step_cap_ms, realtime_margin_ms)
+        self.step_cost = StepCost()  # the scheduler's time model (step_cap_ms)
         vae = config.model_config.audio_vae_config
         rates = vae.decoder_rates if vae is not None else [8, 6, 5, 2, 2, 2]
         out_rate = vae.out_sample_rate if vae is not None else 48000
@@ -233,7 +226,7 @@ class VoxCPM2Engine(LLMEngineBase):
     def stream_buffer(self, seq: Sequence[VoxCPM2SeqPayload]) -> float | None:
         """Seconds of audio still queued at the stream's player (started at its first patch, waiting when empty);
         negative: the player has been waiting that long. None: nothing streamed yet. A client that gets the audio in
-        chunks (add_request's client_chunk_ms, else TurboConfig.client_chunk_ms): less what the front holds back
+        chunks (add_request's client_chunk_ms): less what the front holds back
         (what it has streamed beyond its last whole chunk)."""
         p = seq.custom_payload
         if p.pacer is not None:  # a paced front: until it needs a chunk not produced yet (pace_sync keeps it)
@@ -244,7 +237,7 @@ class VoxCPM2Engine(LLMEngineBase):
         return p.play_end - max(held, 0.0) - time.perf_counter()
 
     def _pace(self, p: VoxCPM2SeqPayload, now: float, pcm: bytes = None) -> None:
-        """A patch reaches the paced front (TurboConfig.client_pace): its 160 ms into the stream's ChunkPacer (16 kHz
+        """A patch reaches the paced front (add_request's client_pace): its 160 ms into the stream's ChunkPacer (16 kHz
         PCM16, as ws_server; the pacer counts audio, not samples), then the chunks due sent."""
         if p.pacer is None:
             from nanovllm_voxcpm.streaming import ChunkPacer
@@ -599,15 +592,14 @@ class VoxCPM2Engine(LLMEngineBase):
         text_tokens: the ids of prompt_text + target_text when the caller has them (head start, pretokenize()).
         resume: a head start's continuation (internal): it keeps the head's stream and is queued first.
         client_chunk_ms: the request's client gets its audio in chunks of this many ms, the rest held back until the
-        next chunk (e.g. 128: 4096 bytes of 16 kHz PCM16); the engine's deadlines allow for it. None:
-        TurboConfig.client_chunk_ms; 0: every patch reaches the client whole. client_pace: its front paces the chunks,
-        alpha (TurboConfig.client_pace, the default; client_pace_last and _reserve_ms the rest) or the front's own
-        ChunkPacer settings (a dict: alpha, alpha_last, reserve_ms, phase_ms, min_gap_ms); 0: not paced.
+        next chunk (e.g. 128: 4096 bytes of 16 kHz PCM16); the engine's deadlines allow for it. None or 0: every
+        patch reaches the client whole. client_pace: its front paces the chunks, alpha (client_pace_last and
+        client_pace_reserve the rest) or the front's own ChunkPacer settings (a dict: alpha, alpha_last, reserve_ms,
+        phase_ms, min_gap_ms); None or 0: not paced.
         Returns the queued sequence (the head, with head start)."""
         if max_generate_length < 1:
             raise ValueError(f"max_generate_length must be >= 1, got {max_generate_length}")
-        if (head_start is not False and self.head_tokens > 0 and max_generate_length > self.head_patches
-                and not (self.head_start_limit and len(self._head_phase) >= self.head_start_limit)):
+        if head_start is not False and self.head_tokens > 0 and max_generate_length > self.head_patches:
             split = self._split_head(prompt_text, target_text, voice, clone_mode)
             if split is not None:
                 head_ids, full_ids = split
@@ -638,7 +630,7 @@ class VoxCPM2Engine(LLMEngineBase):
                         last = len(mid[0])
                 if stages:
                     chain["mid_ids"] = stages
-                if self.head_patches_max > self.head_patches or self.head_start_limit or "mid_ids" in chain:
+                if self.head_patches_max > self.head_patches or "mid_ids" in chain:
                     cont = self._continuation_tokens(full_ids, prompt_text, prompt_latents, ref_audio_latents,
                                                      entry, clone_mode)
                     # the whole continuation's prefill before any reuse, and the prompt text's ids (the voice's
@@ -651,9 +643,9 @@ class VoxCPM2Engine(LLMEngineBase):
                                                             len(head_ids)))
                 chain["stage_len"] = len(head_ids)  # the text the head holds (its continuation may reuse its KV)
                 if self.head_patches_max > self.head_patches and self.step_cost is not None:
-                    pace = self.client_pace if client_pace is None else client_pace
+                    pace = 0.0 if client_pace is None else client_pace
                     pace = float(pace.get("alpha", 0.0)) if isinstance(pace, dict) else pace
-                    chunked = (self.client_chunk if client_chunk_ms is None else client_chunk_ms) > 0
+                    chunked = (client_chunk_ms or 0) > 0
                     patches = min(self._plan_head(cont, pace if chunked else 0.0), max_generate_length - 1)
                 head = self.add_request(seq_id, target_text, prompt_text, prompt_latents, ref_audio_latents,
                                         patches, temperature, cfg_value, lora_name, seed, voice, clone_mode,
@@ -752,9 +744,8 @@ class VoxCPM2Engine(LLMEngineBase):
             lora_name=lora_name,
             adapter_id=adapter_id,
         )
-        seq.custom_payload.client_chunk = (self.client_chunk if client_chunk_ms is None
-                                           else max(float(client_chunk_ms), 0.0) / 1000)
-        cp = self.client_pace if client_pace is None else client_pace
+        seq.custom_payload.client_chunk = max(float(client_chunk_ms or 0), 0.0) / 1000
+        cp = 0.0 if client_pace is None else client_pace
         if isinstance(cp, dict):  # the front's own pacer settings: the engine runs the very same pacer
             seq.custom_payload.pace_kw = {k: v for k, v in cp.items() if v is not None or k == "reserve_ms"}
             cp = cp.get("alpha", 0.0)
@@ -1029,35 +1020,6 @@ class VoxCPM2Engine(LLMEngineBase):
     def _phase_pop(self, sid: str) -> None:
         self._head_sum -= self._head_phase.pop(sid, 0)
 
-    def head_fits(self, seq: Sequence[VoxCPM2SeqPayload]) -> bool:
-        """The scheduler's admission test for a new request (TurboConfig.head_hold): False for a head that even
-        head_patches_max patches would not cover (the continuation prefill ahead of it is too long), or while a burst's
-        continuations are being prefilled: it waits, and the requests behind it too. Always True for the first stream
-        in its head phase."""
-        if (not self.head_hold or not self._head_phase or seq.custom_payload.chain is None or self.step_cost is None
-                or self.head_patches_max <= self.head_patches):
-            return True
-        _, b, c = self.step_cost.prefill.coef
-        queued = 0.0  # the continuations waiting for their prefill (ahead of the new requests)
-        for s in self.scheduler.waiting:
-            if not s.has_stream:
-                break
-            queued += b + c * self._head_phase.get(s.seq_id, 0)
-        if queued > self.head_margin:  # a burst's continuations are being prefilled: its heads would wait in it
-            return False
-        plan = self._head_plan()
-        if plan(b * len(self._head_phase) + c * self._head_sum, 0)[1]:
-            return True  # all of it would be covered (the usual case: no need to find its place)
-        backlog, own = 0.0, None
-        for sid, tokens in self._head_phase.items():
-            if sid == seq.seq_id:
-                own = tokens
-                break
-            backlog += b + c * tokens
-        if own is None or backlog == 0.0:
-            return True
-        return plan(backlog, own)[1]
-
     def _in_time(self, seq: Sequence[VoxCPM2SeqPayload], tokens: int) -> bool:
         """At the end of a head (TurboConfig.mid_tokens): would its next stage (``tokens`` to prefill) be
         prefilled before its player runs out of the audio it has, with head_margin to spare, after the next prefill
@@ -1158,7 +1120,7 @@ class VoxCPM2Engine(LLMEngineBase):
     def step(self):
         _profile.host_begin()
         with self.stepping():  # a cancel during the step runs after it: it also reaches a continuation queued here
-            if self.client_pace > 0 or self._paced:  # the paced fronts' sends up to now (their grids, deadlines)
+            if self._paced:  # the paced fronts' sends up to now (their grids, deadlines)
                 now = time.perf_counter()
                 for q in (self.scheduler.running, self.scheduler.waiting):
                     for seq in q:

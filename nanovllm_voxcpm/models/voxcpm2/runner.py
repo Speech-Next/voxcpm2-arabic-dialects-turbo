@@ -45,37 +45,6 @@ def _pinned_concat(arrays: list[np.ndarray]) -> torch.Tensor:
     return out
 
 
-# NANOVLLM_KERNEL_TRACE=<file>: a torch.profiler kernel table of prefill steps with at least
-# NANOVLLM_KERNEL_TRACE_MIN_BS sequences (default 128), the first NANOVLLM_KERNEL_TRACE_SKIP (default 2) skipped;
-# NANOVLLM_KERNEL_TRACE_COUNT (default 1) steps, the k-th (k > 0) to <file>.<k>
-_TRACE_PATH = os.environ.get("NANOVLLM_KERNEL_TRACE")
-_trace_seen = [0]
-
-
-def _kernel_trace(is_prefill: bool, bs: int, tokens: int = 0):
-    if not _TRACE_PATH or not is_prefill or bs < int(os.environ.get("NANOVLLM_KERNEL_TRACE_MIN_BS", "128")):
-        return None
-    if tokens > int(os.environ.get("NANOVLLM_KERNEL_TRACE_MAX_TOKENS", "1000000000")):  # e.g. heads only
-        return None
-    _trace_seen[0] += 1
-    skip = int(os.environ.get("NANOVLLM_KERNEL_TRACE_SKIP", "2"))
-    count = int(os.environ.get("NANOVLLM_KERNEL_TRACE_COUNT", "1"))
-    if _trace_seen[0] <= skip or _trace_seen[0] > skip + count:
-        return None
-    from torch.profiler import ProfilerActivity, profile
-
-    return profile(activities=[ProfilerActivity.CUDA])
-
-
-def _dump_kernel_trace(trace, bs: int) -> None:
-    k = _trace_seen[0] - int(os.environ.get("NANOVLLM_KERNEL_TRACE_SKIP", "2")) - 1
-    path = _TRACE_PATH if k == 0 else f"{_TRACE_PATH}.{k}"
-    with open(path, "w") as f:
-        f.write(f"prefill step, {bs} rows\n")
-        f.write(trace.key_averages().table(sort_by="cuda_time_total", row_limit=60, max_name_column_width=70))
-    trace.export_chrome_trace(path + ".json")
-
-
 @dataclass
 class VoxCPM2Payload:
     # prefill: the uncached tail's ids / masks / LocEnc keys as lists or arrays (the runner converts the whole step's
@@ -93,13 +62,17 @@ class VoxCPM2Payload:
     feat_keys: np.ndarray | list | None = None  # uint64 per position, LocEnc cache keys (0 = not cacheable)
 
 
-# NANOVLLM_FIRST_AUDIO_FRAMES=k: a prefill step's patch is decoded and sent as its first k latent frames (40 ms of
-# audio each), then the rest; 0 = in one piece
-_FIRST_AUDIO_FRAMES = int(os.environ.get("NANOVLLM_FIRST_AUDIO_FRAMES", "1"))
-# NANOVLLM_FIRST_AUDIO_MS=m: with a one-frame first piece, that frame leaves in two parts too, its first m ms (a
-# multiple of 5: the first transposed conv's output phases, stride 8 over a 40 ms frame) and then the rest of it;
-# 0 or 40 = the whole frame at once. Needs the fused VAE kernels.
-_FIRST_AUDIO_MS = float(os.environ.get("NANOVLLM_FIRST_AUDIO_MS", "20"))
+# A prefill step's patch is decoded and sent as its first latent frame (40 ms of audio), then the rest; that frame
+# leaves in two parts too, its first _FIRST_AUDIO_MS (a multiple of 5: the first transposed conv's output phases,
+# stride 8 over a 40 ms frame) and then the rest of it. Needs the fused VAE kernels.
+_FIRST_AUDIO_MS = 20.0
+# W8A8 (voxcpm_kernels, TurboConfig.w8a8): per-token int8 activations x per-channel int8 weights, for calls with at
+# least this many rows (prefill, a full decode batch, DiT, LocEnc); smaller batches stay bf16. At 128+ rows the int8
+# path beats bf16 at the A10's power cap (256-stream decode step 116 -> 110 ms, same quality).
+_W8A8_MIN_ROWS = 128
+# LocEnc embedding cache (rows): prefill embeds of audio patches seen before (a cloned voice's prompt audio) are
+# reused instead of re-running LocEnc; LocEnc encodes each patch independently.
+_LOCENC_CACHE_SIZE = 8192
 
 
 def first_audio_phases(ms: float, frame_ms: float, stride: int) -> int:
@@ -109,12 +82,11 @@ def first_audio_phases(ms: float, frame_ms: float, stride: int) -> int:
         return 0
     r = ms * stride / frame_ms
     if abs(r - round(r)) > 1e-6:
-        raise ValueError(f"NANOVLLM_FIRST_AUDIO_MS={ms:g}: a multiple of {frame_ms / stride:g} ms below {frame_ms:g}")
+        raise ValueError(f"first audio of {ms:g} ms: a multiple of {frame_ms / stride:g} ms below {frame_ms:g}")
     return int(round(r))
 
 
 class VoxCPM2Runner(BaseModelRunner):
-    _fast_noise = False  # turbo.fast_noise (set in __init__)
     _pcm16 = False  # turbo.pcm16_output
     model: VoxCPM2Model
     dit_lora_seq_len_offset = 3
@@ -132,7 +104,6 @@ class VoxCPM2Runner(BaseModelRunner):
         self.feat_dim = config.model_config.feat_dim
         self.patch_size = config.model_config.patch_size
         self.lora_config = config.lora_config
-        self._fast_noise = config.model_config.turbo.fast_noise
         self._pcm16 = config.model_config.turbo.pcm16_output
         super().__init__(config, rank, device_idx, distributed_port, event)
 
@@ -144,14 +115,8 @@ class VoxCPM2Runner(BaseModelRunner):
         """The LocDiT batch per sample: 2 rows (CFG) or 1 (a distilled estimator: every step conditional-only). The
         DiT LoRA token slots (``expand_dit_lora_slots``) are laid out for it, so steps must not mix the two."""
         cfm = self.model.feat_decoder
-        steps = (cfm.cfg_steps, cfm.first_cfg_steps)  # -1: CFG on every step, 0: on none, k: on the first k
-        if steps == (0, 0):
+        if cfm.cfg_steps == 0:  # -1: CFG on every step, 0: on none
             self.cfg_branches = 1
-        elif steps != (-1, -1) and self.lora_config is not None and self.lora_config.enable_dit:
-            raise NotImplementedError(
-                f"LocDiT LoRA needs CFG on every step or on none (cfg_steps, first_cfg_steps = {steps}): "
-                "its token slots are laid out for one DiT batch size"
-            )
 
     def register_lora(self, adapter_id: int, name: str, payload) -> None:
         super().register_lora(adapter_id, name, payload)
@@ -168,7 +133,7 @@ class VoxCPM2Runner(BaseModelRunner):
                 dec = self.model.feat_decoder.estimator.decoder
                 dec.layers = torch.nn.ModuleList(list(dec.layers)[: int(ckpt["dit_layers"])])
             n = load_state_dict_into(self.model, ckpt["state_dict"], prefix="feat_decoder.estimator.")
-            if turbo.dit_t_span is None and "schedule" in ckpt:
+            if "schedule" in ckpt:
                 t_span = [float(ckpt["schedule"][0][0])] + [float(t - dt) for t, dt in ckpt["schedule"]]
                 self.model.feat_decoder.set_t_span(t_span)
             if ckpt.get("mean_mode"):  # a student trained with its step sizes as input (the estimator's dt)
@@ -177,64 +142,45 @@ class VoxCPM2Runner(BaseModelRunner):
         if turbo.dit_first_t_span is not None:
             self.model.feat_decoder.first_t_span_override = torch.tensor(turbo.dit_first_t_span, dtype=torch.float32)
         self._set_cfg_branches()
-        if turbo.fused_layers:
-            from voxcpm_kernels.fused_layer import fuse_cpm4_layers
+        from voxcpm_kernels.fused_layer import fuse_cpm4_layers
 
-            fused, quantized = fuse_cpm4_layers(
-                self.model,
-                quant_prefixes=turbo.w8a8_targets if turbo.w8a8 else [],
-                fuse_prefixes=["base_lm", "residual_lm", "feat_encoder", "feat_decoder"],
-                min_rows=turbo.w8a8_min_rows,
-            )
-            print(f"[turbo] fused {fused} decoder layers ({quantized} W8A8 for rows >= {turbo.w8a8_min_rows})",
-                  flush=True)
-        elif turbo.w8a8:
-            from voxcpm_kernels import quantize_linears
-
-            n = quantize_linears(self.model, turbo.w8a8_targets, min_rows=turbo.w8a8_min_rows)
-            print(f"[turbo] W8A8 on {n} linear layers (rows >= {turbo.w8a8_min_rows})", flush=True)
+        layers = ["base_lm", "residual_lm", "feat_encoder", "feat_decoder"]
+        fused, quantized = fuse_cpm4_layers(
+            self.model, quant_prefixes=layers if turbo.w8a8 else [], fuse_prefixes=layers, min_rows=_W8A8_MIN_ROWS)
+        print(f"[turbo] fused {fused} decoder layers ({quantized} W8A8 for rows >= {_W8A8_MIN_ROWS})", flush=True)
 
         torch.set_default_dtype(torch.float32)
         self.vae = AudioVAEV2(config=model_config.audio_vae_config)
         vae_state_dict = torch.load(os.path.join(model_path, "audiovae.pth"))["state_dict"]
         self.vae.load_state_dict(vae_state_dict)
         self._prepare_vae_decoder_for_inference()
-        if model_config.turbo.vae_kernel:
-            from voxcpm_kernels import SlotStreamingVAEDecoder
+        from voxcpm_kernels import SlotStreamingVAEDecoder
 
-            first_phases = 0
-            if _FIRST_AUDIO_FRAMES == 1 and model_config.turbo.vae_fused:
-                first_phases = first_audio_phases(
-                    _FIRST_AUDIO_MS, 1000.0 * self.vae.decoder_chunk_size / self.vae.out_sample_rate,
-                    self.vae.decoder_rates[0])
-            self.vae_streaming_decoder = SlotStreamingVAEDecoder(
-                self.vae.decoder,
-                max_streams=self._config.max_num_seqs,
-                latent_dim=self.feat_dim,
-                chunk_frames=self.patch_size,
-                fused=model_config.turbo.vae_fused,
-                # the first audio of a prefill step's patch and the rest of it, graphed too
-                extra_chunk_frames=(_FIRST_AUDIO_FRAMES, self.patch_size - _FIRST_AUDIO_FRAMES)
-                if 0 < _FIRST_AUDIO_FRAMES < self.patch_size else (),
-                first_phases=first_phases,
-            )
-        else:
-            self.vae_streaming_decoder = self.vae.streaming_decoder(self._config.max_num_seqs)
+        self.vae_streaming_decoder = SlotStreamingVAEDecoder(
+            self.vae.decoder,
+            max_streams=self._config.max_num_seqs,
+            latent_dim=self.feat_dim,
+            chunk_frames=self.patch_size,
+            fused=True,
+            # the first audio of a prefill step's patch and the rest of it, graphed too
+            extra_chunk_frames=(1, self.patch_size - 1),
+            first_phases=first_audio_phases(
+                _FIRST_AUDIO_MS, 1000.0 * self.vae.decoder_chunk_size / self.vae.out_sample_rate,
+                self.vae.decoder_rates[0]),
+        )
         self.vae_streaming_decoder.warmup(self.feat_dim, self.patch_size)
         torch.set_default_dtype(torch.bfloat16)
 
         # LocEnc embedding cache: rows [0, size) keyed by patch hash (LRU), then scratch rows for uncached patches
-        self._enc_cache = None
-        if turbo.locenc_cache_size > 0 and turbo.skip_text_locenc:
-            # one step's distinct patches must fit without evicting each other
-            self._enc_cache_size = max(turbo.locenc_cache_size, self._config.max_num_batched_tokens)
-            self._enc_rows: OrderedDict[int, int] = OrderedDict()
-            self._enc_cache = torch.zeros(
-                self._enc_cache_size + self._config.max_num_batched_tokens,
-                model_config.lm_config.hidden_size,
-                dtype=torch.bfloat16,
-                device="cuda",
-            )
+        # one step's distinct patches must fit without evicting each other
+        self._enc_cache_size = max(_LOCENC_CACHE_SIZE, self._config.max_num_batched_tokens)
+        self._enc_rows: OrderedDict[int, int] = OrderedDict()
+        self._enc_cache = torch.zeros(
+            self._enc_cache_size + self._config.max_num_batched_tokens,
+            model_config.lm_config.hidden_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
 
     def _prepare_vae_decoder_for_inference(self) -> None:
         """Fold weight norm and cast only the inference decoder to FP16."""
@@ -356,15 +302,7 @@ class VoxCPM2Runner(BaseModelRunner):
         """first_patch: a prefill step whose sequences all start their stream (the engine's step: no resumed stream,
         no decode riding along); its LocDiT solves with the first patch's settings."""
         self._first_patch = first_patch
-        trace = _kernel_trace(is_prefill, len(seqs), sum(len(t.custom_payload.text_tokens) for t in seqs)
-                              if _TRACE_PATH and is_prefill else 0)
-        if trace is None:
-            return self._run(seqs, is_prefill)
-        with trace:
-            out = self._run(seqs, is_prefill)
-            torch.cuda.synchronize()
-        _dump_kernel_trace(trace, len(seqs))
-        return out
+        return self._run(seqs, is_prefill)
 
     def _noise_seeds(self, seqs: list[RunnerTask[VoxCPM2Payload]]) -> np.ndarray:
         """Every row's noise seed for seeded_randn (& SEED_MASK, int64): derive_step_seed(seed, step) for seeded
@@ -460,10 +398,8 @@ class VoxCPM2Runner(BaseModelRunner):
         finish_enc = None
         if self._prefill_has_audio and getattr(self, "_enc_cache", None) is not None:
             finish_enc = self._stage_locenc_inputs(seqs, pack, feat_mask)
-        seeds = i_seed = None
-        if self._fast_noise:
-            seeds = self._noise_seeds(seqs)
-            i_seed = pack.add(seeds)
+        seeds = self._noise_seeds(seqs)
+        i_seed = pack.add(seeds)
         t_up = time.perf_counter() if prof.enabled else 0.0
         views = pack.upload()
         if prof.enabled:  # (the pinned staging and the one copy, inside the "h2d" stage)
@@ -477,37 +413,17 @@ class VoxCPM2Runner(BaseModelRunner):
         if finish_enc is not None:
             inputs.update(finish_enc(views))
         prof.mark("h2d")
-        return self._with_noise(seqs, inputs, True, prof, seeds, views[i_seed] if i_seed is not None else None)
+        return self._with_noise(seqs, inputs, True, prof, seeds, views[i_seed])
 
     def _with_noise(self, seqs, inputs, is_prefill, prof, seeds=None, seed_t=None):
         """The step's LocDiT noise (seeded per row), then the model."""
-        bsz = len(seqs)
-        if self._fast_noise:
-            from voxcpm_kernels import seeded_randn
+        from voxcpm_kernels import seeded_randn
 
-            if seeds is None:
-                seeds = self._noise_seeds(seqs)
-            if seed_t is None:
-                seed_t = torch.from_numpy(seeds).pin_memory().cuda(non_blocking=True)
-            inputs["z_noise"] = seeded_randn(seeds, (self.feat_dim, self.patch_size), dtype=self.dtype, seed_t=seed_t)
-            return self._run_with_inputs(seqs, inputs, is_prefill, prof)
-        seeded_rows = [
-            (i, int(seq.custom_payload.seed), seq.custom_payload.seed_step)
-            for i, seq in enumerate(seqs)
-            if seq.custom_payload.seed is not None and seq.custom_payload.seed >= 0
-        ]
-        if len(seeded_rows) == bsz:
-            z_noise = torch.empty((bsz, self.feat_dim, self.patch_size), dtype=self.dtype, device="cuda")
-        else:
-            z_noise = torch.randn((bsz, self.feat_dim, self.patch_size), dtype=self.dtype, device="cuda")
-
-        for i, seed_val, seed_step in seeded_rows:
-            generator = torch.Generator(device="cuda").manual_seed(derive_step_seed(seed_val, seed_step))
-            z_noise[i] = torch.randn(
-                (self.feat_dim, self.patch_size), generator=generator, dtype=self.dtype, device="cuda"
-            )
-
-        inputs["z_noise"] = z_noise
+        if seeds is None:
+            seeds = self._noise_seeds(seqs)
+        if seed_t is None:
+            seed_t = torch.from_numpy(seeds).pin_memory().cuda(non_blocking=True)
+        inputs["z_noise"] = seeded_randn(seeds, (self.feat_dim, self.patch_size), dtype=self.dtype, seed_t=seed_t)
         return self._run_with_inputs(seqs, inputs, is_prefill, prof)
 
     def _wave_rows(self, vae_decoded: torch.Tensor) -> list:
@@ -580,15 +496,15 @@ class VoxCPM2Runner(BaseModelRunner):
             ids = [seq.seq_id for seq in seqs]
             z = latents.to(self.vae_dtype).permute(0, 2, 1)
             emit = getattr(self, "emit_hook", None)
-            if is_prefill and emit is not None and has_stream is not None and 0 < _FIRST_AUDIO_FRAMES < self.patch_size:
-                # Time to first audio: a prefill step's patch is decoded in two pieces (the first
-                # NANOVLLM_FIRST_AUDIO_FRAMES frames, then the rest) and the first piece's audio leaves at once
-                # (emit_hook). The VAE is causal and keeps each stream's state, so the pieces are the patch's audio;
-                # one frame (40 ms of audio) costs a quarter of the patch's VAE time before the first audio; with
-                # NANOVLLM_FIRST_AUDIO_MS (default 20) the first audio is half a frame, decoded on its own.
-                half = _FIRST_AUDIO_FRAMES
-                if half == 1 and getattr(dec, "split_phases", 0):
-                    # NANOVLLM_FIRST_AUDIO_MS: the first frame in two parts as well, each sent as soon as it is on the
+            if is_prefill and emit is not None and has_stream is not None:
+                # Time to first audio: a prefill step's patch is decoded in two pieces (the first frame, then the
+                # rest) and the first piece's audio leaves at once (emit_hook). The VAE is causal and keeps each
+                # stream's state, so the pieces are the patch's audio; one frame (40 ms of audio) costs a quarter of
+                # the patch's VAE time before the first audio; with _FIRST_AUDIO_MS (20) the first audio is half a
+                # frame, decoded on its own.
+                half = 1
+                if getattr(dec, "split_phases", 0):
+                    # _FIRST_AUDIO_MS: the first frame in two parts as well, each sent as soon as it is on the
                     # host; the GPU decodes the next part meanwhile (each copy is queued before the next decode)
                     part_a = self._wave_rows_async(
                         dec.decode_first(z[..., :1].contiguous(), ids, initial_contexts, **kw))

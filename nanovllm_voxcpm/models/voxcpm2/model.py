@@ -430,8 +430,7 @@ class UnifiedCFM(nn.Module):
     first_patch = False
     first_t_span_override = None  # the first patch's grid (TurboConfig.dit_first_t_span)
     dit_cache_config = None  # TurboConfig.dit_cache: block caching across the solver's steps (dit_cache.py)
-    cfg_steps = -1
-    first_cfg_steps = -1
+    cfg_steps = -1  # CFG on every step (-1) or on none (0: a distilled estimator, set_t_span)
     t_span_override = None
 
     def __init__(
@@ -449,14 +448,9 @@ class UnifiedCFM(nn.Module):
         self.in_channels = in_channels
         self.patch_size = patch_size
         self.inference_timesteps = inference_timesteps
-        self.first_steps = turbo.first_steps or inference_timesteps
-        self.cfg_steps = turbo.cfg_steps
-        self.first_cfg_steps = turbo.first_cfg_steps
         # Set by the runner while it captures / runs the first-patch (prefill) diffusion.
         self.first_patch = False
         self.t_span_override = None
-        if turbo.dit_t_span is not None:
-            self.set_t_span(turbo.dit_t_span)
         self.mean_mode = mean_mode
         self.estimator = estimator
         self.dit_cache_config = turbo.dit_cache
@@ -465,7 +459,6 @@ class UnifiedCFM(nn.Module):
         """Explicit Euler grid for a distilled estimator: every step evaluated, no CFG."""
         self.t_span_override = torch.tensor(t_span, dtype=torch.float32)
         self.cfg_steps = 0
-        self.first_cfg_steps = 0
 
     def forward(
         self,
@@ -487,8 +480,7 @@ class UnifiedCFM(nn.Module):
         elif self.t_span_override is not None:
             t_span = self.t_span_override.to(device=mu.device, dtype=mu.dtype)
         else:
-            steps = self.first_steps if self.first_patch else self.inference_timesteps
-            t_span = build_cfm_t_span(steps, device=mu.device).to(dtype=mu.dtype)
+            t_span = build_cfm_t_span(self.inference_timesteps, device=mu.device).to(dtype=mu.dtype)
         return self.solve_euler(z, t_span=t_span, mu=mu, cond=cond, cfg_value=cfg_value)
 
     def optimized_scale(self, positive_flat, negative_flat):
@@ -506,7 +498,7 @@ class UnifiedCFM(nn.Module):
         config = EulerSolverConfig(
             in_channels=self.in_channels,
             mean_mode=self.mean_mode,
-            cfg_steps=self.first_cfg_steps if self.first_patch else self.cfg_steps,
+            cfg_steps=self.cfg_steps,
             zero_init_steps=0 if self.t_span_override is not None else -1,
         )
         if not self.dit_cache_config:
@@ -608,9 +600,6 @@ class VoxCPM2Model(nn.Module):
             mean_mode=config.dit_mean_mode,
             turbo=config.turbo,
         )
-        self.skip_text_locenc = config.turbo.skip_text_locenc
-        # True while the runner captures / replays the text-only prefill graph: no LocEnc at all.
-        self.prefill_no_audio = False
 
         self.fsq_layer = ScalarQuantizationLayer(
             config.lm_config.hidden_size,
@@ -689,10 +678,6 @@ class VoxCPM2Model(nn.Module):
     ):
         if feat_embeds_in is not None:  # prefill CUDA graph: LocEnc embeddings computed before the replay
             feat_embeds = feat_embeds_in
-        elif self.prefill_no_audio and get_context().is_prefill:
-            feat_embeds = torch.zeros(
-                feat.size(0), self.config.lm_config.hidden_size, device=feat.device, dtype=feat.dtype
-            )
         elif enc_cache is not None and get_context().is_prefill:
             # LocEnc embedding cache (runner): encode first-seen patches into their rows, then gather every
             # audio position's row
@@ -704,7 +689,7 @@ class VoxCPM2Model(nn.Module):
                 enc_cache[enc_rows[enc_miss]] = self.enc_to_lm_proj(self.feat_encoder(feat[miss_pos]))
             if enc_pos.numel() > 0:
                 feat_embeds[enc_pos] = enc_cache[enc_rows]
-        elif self.skip_text_locenc and get_context().is_prefill:
+        elif get_context().is_prefill:
             # Text positions' LocEnc output is masked out below; encode audio positions only.
             audio_idx = feat_mask.nonzero(as_tuple=True)[0]
             feat_embeds = torch.zeros(
@@ -762,11 +747,10 @@ class VoxCPM2Model(nn.Module):
         self.feat_decoder.first_patch = enabled
 
     def first_patch_differs(self) -> bool:
-        """The first patch's LocDiT solve differs from the others' (dit_first_t_span, first_steps, first_cfg_steps)."""
+        """The first patch's LocDiT solve differs from the others' (dit_first_t_span)."""
         d = self.feat_decoder
-        own_grid = d.first_t_span_override is not None and not (
+        return d.first_t_span_override is not None and not (
             d.t_span_override is not None and torch.equal(d.first_t_span_override, d.t_span_override))
-        return own_grid or d.first_steps != d.inference_timesteps or d.first_cfg_steps != d.cfg_steps
 
     def forward_diffusion(
         self,

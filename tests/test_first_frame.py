@@ -1,4 +1,4 @@
-"""CPU tests of #10 (first audio frame): the NANOVLLM_FIRST_AUDIO_MS -> phase mapping and the one-buffer VAE state."""
+"""CPU tests of #10 (first audio frame): the first-audio ms -> phase mapping and the one-buffer VAE state."""
 
 from types import SimpleNamespace
 
