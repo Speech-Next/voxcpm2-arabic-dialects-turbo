@@ -1391,3 +1391,23 @@ def test_text_ids_past_the_vocabulary_are_the_requests_fault():
     with pytest.raises(ValueError, match="cannot read: <t10>, <t12>"):
         eng.add_request("a", "text", head_start=False)
     eng._check_ids([0, 9])  # (in range)
+
+
+def test_a_text_without_head_start_is_capped_by_its_length():
+    # a text of 16 tokens or fewer (no head start) had only max_generate_length: 600 patches (96 s) of a runaway
+    # (silence, babble); now the continuations' cap, 1.5 patches a token and 20 to spare
+    eng = _voxcpm2_engine(max_model_len=1024)
+    eng._split_head = lambda *args, **kw: None  # (short enough to prefill whole)
+    count = {}
+
+    def make(t, is_prefill):  # "one" stops after 12 patches (a word and its pauses), "run" never
+        k = count[t.seq_id] = count.get(t.seq_id, 0) + 1
+        return {"latents": np.full((PATCH, FEAT), 0.5, np.float32), "stop_flag": int(t.seq_id == "one" and k == 12),
+                "waveforms": np.ones(8, np.float32), "patch_silent": False}
+
+    eng.model_runner.make_output = make
+    run = eng.add_request("run", _words(4), max_generate_length=600)
+    one = eng.add_request("one", _words(1), max_generate_length=600)
+    assert run.custom_payload.chain is None and run.custom_payload.max_generate_length == 4 * 3 // 2 + 20
+    _run(eng, 100)
+    assert len(run.custom_payload.generated_waveforms) == 26 and len(one.custom_payload.generated_waveforms) == 12

@@ -36,6 +36,13 @@ _LEADING_TAG = re.compile(r"<reserved_\d+>")  # a tagged model's dialect tag in 
 _PATCHES_PER_TOKEN = 0.5
 
 
+def _speech_cap(n_ids: int) -> int:
+    """The most patches a text gets (``n_ids``: its ids, the prompt text's too): 1.5 a token (never slower than ~4
+    tokens, characters, a second; over twice #28's speaking rate) and 20 to spare (3.2 s: leading silence, a one-word
+    text's pauses). A model that keeps generating past it (silence, babble) is cut off."""
+    return int(1.5 * n_ids) + 20
+
+
 class _ByteCount:
     """A ChunkPacer's buffer that only counts its bytes (the engine's pacer needs its times, not the audio): the
     same len, +=, slicing and deletion, without copying 5 KB in and 4 KB out per stream and patch (#31)."""
@@ -685,6 +692,8 @@ class VoxCPM2Engine(LLMEngineBase):
         if text_tokens is None:
             text_tokens = self._text_ids(prompt_text, target_text)
         self._check_ids(text_tokens)
+        # a text without head start (16 tokens or fewer) had only max_generate_length (servers: 600 patches, 96 s)
+        max_generate_length = min(max_generate_length, _speech_cap(len(text_tokens)))
         remap = self._tag_remap.get(lora_name) if lora_name is not None and self._tag_remap else None
         if remap:  # a tagged adapter's request: its tags read their trained rows
             text_tokens = [remap.get(t, t) for t in text_tokens]
@@ -1076,9 +1085,7 @@ class VoxCPM2Engine(LLMEngineBase):
         chain, payload = seq.custom_payload.chain, seq.custom_payload
         n = len(payload.generated_waveforms)
         done = chain.get("done", 0) + n  # the stream's patches so far (an intermediate stage: the head's too)
-        # cap: a continuation never speaks slower than ~4 tokens (characters) a second; a model that keeps
-        # generating past that (silence, babble) is cut off
-        rest = min(chain["max_generate_length"] - done, int(1.5 * len(chain["text_ids"])) + 20)
+        rest = min(chain["max_generate_length"] - done, _speech_cap(len(chain["text_ids"])))
         if rest < 1:
             return False
         # Leading silent patches (a sentence often starts with a short pause) are not given as prompt audio: a
