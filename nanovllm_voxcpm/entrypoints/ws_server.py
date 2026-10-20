@@ -16,7 +16,7 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
 - dialect: a name RoutedDialectTTS routes (--dialect: the default). The seed is the text's CRC32 (the same text, the
   same audio).
 - Pacing (default; --no-pace sends each chunk the moment it is complete): streaming.ChunkPacer per utterance, the
-  first chunk at once (--pace-start-ms after it is complete, default 0), the next ones on a grid of --pace-alpha (0.9) x a chunk's audio (--pace-alpha-last, 0.92,
+  first chunk --pace-start-ms (150) after it is complete, the next ones on a grid of --pace-alpha (0.9) x a chunk's audio (--pace-alpha-last, 0.92,
   for the last chunk queued), more than --pace-reserve-ms queued and the rest at the end sooner (at least
   --pace-min-gap-ms, 8, apart: an end flushed at once held both event loops for 6-7 ms at 200 streams); the chunk
   after the first (or a late one) up to --pace-spread-ms sooner, a different amount per utterance. One task sends
@@ -540,9 +540,10 @@ def cli():
     ap.add_argument("--pace-spread-ms", type=float, default=10.0,
                     help="the chunk after the first (or a late one) goes out up to this much sooner, a different "
                          "amount per utterance: streams that start together do not send on the same instants")
-    ap.add_argument("--pace-start-ms", type=float, default=0.0,
+    ap.add_argument("--pace-start-ms", type=float, default=150.0,
                     help="the first chunk this long after it is complete (later chunks and the engine's deadlines "
-                         "with it): more time for the engine, as much later first audio at the client")
+                         "with it): more time for the engine, as much later first audio at the client (150: no stalls up "
+                         "to 150 streams at once on one A10, #31)")
     ap.add_argument("--pace-min-gap-ms", type=float, default=8.0,
                     help="chunks sent ahead of the pace (above the reserve, the rest at the end) at least this far apart")
     ap.add_argument("--per-stream-sends", dest="batch_sends", action="store_false",
