@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from .int8_linear import W8A8Linear, quantize_rows
+from .int8_linear import W8A8Linear, _group_m_order, _int8_dot, quantize_rows
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -96,26 +96,10 @@ def _w8a8_gemm_res(
     SPLIT_EPILOGUE: dequantize, add RES and store the tile in two N-halves. The fp32 tile plus the RES tile no
     longer have to be live at once, so the kernel fits 128 registers (2 CTAs/SM for 128x128 tiles, instead of 154
     registers and 1 CTA/SM)."""
-    pid = tl.program_id(0)
-    num_m = tl.cdiv(M, BLOCK_M)
-    num_n = tl.cdiv(N, BLOCK_N)
-    group = GROUP_M * num_n
-    first_m = (pid // group) * GROUP_M
-    gm = tl.minimum(num_m - first_m, GROUP_M)
-    pid_m = first_m + (pid % group) % gm
-    pid_n = (pid % group) // gm
+    pid_m, pid_n = _group_m_order(tl.program_id(0), M, N, BLOCK_M, BLOCK_N, GROUP_M)
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
-    a = a_ptr + rm.to(tl.int64)[:, None] * K + rk[None, :]
-    b = b_ptr + rn.to(tl.int64)[None, :] * K + rk[:, None]
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        kk = k * BLOCK_K + rk
-        acc += tl.dot(tl.load(a, mask=(rm[:, None] < M) & (kk[None, :] < K), other=0),
-                      tl.load(b, mask=(rn[None, :] < N) & (kk[:, None] < K), other=0))
-        a += BLOCK_K
-        b += BLOCK_K
+    acc = _int8_dot(a_ptr, b_ptr, 0, rm, rn, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K)
     a_scale = tl.load(a_scale_ptr + rm, mask=rm < M, other=0.0)
     if SPLIT_EPILOGUE:
         HN: tl.constexpr = BLOCK_N // 2
@@ -158,26 +142,10 @@ def _w8a8_gemm_swiglu(
     M, N, K, NT,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    num_m = tl.cdiv(M, BLOCK_M)
-    num_n = tl.cdiv(N, BLOCK_N)
-    group = GROUP_M * num_n
-    first_m = (pid // group) * GROUP_M
-    gm = tl.minimum(num_m - first_m, GROUP_M)
-    pid_m = first_m + (pid % group) % gm
-    pid_n = (pid % group) // gm
+    pid_m, pid_n = _group_m_order(tl.program_id(0), M, N, BLOCK_M, BLOCK_N, GROUP_M)
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
-    a = a_ptr + rm.to(tl.int64)[:, None] * K + rk[None, :]
-    b = b_ptr + rn.to(tl.int64)[None, :] * K + rk[:, None]
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        kk = k * BLOCK_K + rk
-        acc += tl.dot(tl.load(a, mask=(rm[:, None] < M) & (kk[None, :] < K), other=0),
-                      tl.load(b, mask=(rn[None, :] < N) & (kk[:, None] < K), other=0))
-        a += BLOCK_K
-        b += BLOCK_K
+    acc = _int8_dot(a_ptr, b_ptr, 0, rm, rn, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K)
     out = acc.to(tl.float32) * tl.load(a_scale_ptr + rm, mask=rm < M, other=0.0)[:, None]
     out = out * tl.load(b_scale_ptr + rn, mask=rn < N, other=0.0)[None, :]
     g, u = tl.split(tl.reshape(out, (BLOCK_M, BLOCK_N // 2, 2)))
@@ -246,26 +214,10 @@ def _w8a8_gemm_qkv_rope(
     HAS_BIAS: tl.constexpr, HAS_ADD: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    num_m = tl.cdiv(M, BLOCK_M)
-    num_n = tl.cdiv(N, BLOCK_N)
-    group = GROUP_M * num_n
-    first_m = (pid // group) * GROUP_M
-    gm = tl.minimum(num_m - first_m, GROUP_M)
-    pid_m = first_m + (pid % group) % gm
-    pid_n = (pid % group) // gm
+    pid_m, pid_n = _group_m_order(tl.program_id(0), M, N, BLOCK_M, BLOCK_N, GROUP_M)
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
-    a = a_ptr + rm.to(tl.int64)[:, None] * K + rk[None, :]
-    b = b_ptr + rn.to(tl.int64)[None, :] * K + rk[:, None]
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        kk = k * BLOCK_K + rk
-        acc += tl.dot(tl.load(a, mask=(rm[:, None] < M) & (kk[None, :] < K), other=0),
-                      tl.load(b, mask=(rn[None, :] < N) & (kk[:, None] < K), other=0))
-        a += BLOCK_K
-        b += BLOCK_K
+    acc = _int8_dot(a_ptr, b_ptr, 0, rm, rn, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K)
     out = acc.to(tl.float32) * tl.load(a_scale_ptr + rm, mask=rm < M, other=0.0)[:, None]
     out = out * tl.load(b_scale_ptr + rn)[None, :]
     if HAS_BIAS:
