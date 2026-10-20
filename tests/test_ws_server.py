@@ -357,3 +357,161 @@ def test_other_json_messages_are_not_spoken_and_the_query_is_checked():
     for query in ("chunk_size=2", "chunk_size=1000000000", "chunk_size=4096&transport=foo",
                   "chunk_size=4096&segmenting=yes"):
         assert asyncio.run(first_message(query))["type"] == "error", query
+
+
+def test_nothing_to_speak_is_an_error_and_the_connection_goes_on():
+    tts = FakeTTS(patches=1)
+    srv = Server(set(tts.voices), local_feed(tts), args())
+    msgs = asyncio.run(exchange(srv, texts=["...", "🙂!", "ok"]))
+    errors = [m["message"] for m in msgs if isinstance(m, dict) and m["type"] == "error"]
+    assert len(errors) == 2 and all("nothing to speak" in e for e in errors)
+    assert kinds(msgs)[-2:] == ["start", "end_of_audio"] and [c[0] for c in tts.calls] == ["ok"]
+
+
+def test_shutdown_drains_the_utterances_in_progress():
+    # SIGTERM: no new utterance or connection; the one in progress ends whole (within --shutdown-timeout), then its
+    # connection closes (1001, going away)
+    from websockets.asyncio.client import connect
+    from websockets.asyncio.server import serve
+
+    tts = FakeTTS(patches=6, burst=1, pause=0.05)
+    srv = Server(set(tts.voices), local_feed(tts), args())
+
+    async def main():
+        async with serve(srv.handler, "127.0.0.1", 0) as s:
+            port = s.sockets[0].getsockname()[1]
+            msgs = []
+            async with connect(f"ws://127.0.0.1:{port}{PATH}") as ws:
+                await ws.send("one")
+                await asyncio.sleep(0.1)  # (speaking)
+                drain = asyncio.ensure_future(srv.drain(s, 5.0))
+                await asyncio.sleep(0)
+                await ws.send("two")
+                try:
+                    async for m in ws:
+                        msgs.append(json.loads(m)["type"] if isinstance(m, str) else len(m))
+                except Exception:  # noqa: BLE001
+                    pass
+            await drain
+            return msgs, ws.close_code
+
+    msgs, code = asyncio.run(main())
+    kinds_ = [m for m in msgs if isinstance(m, str)]
+    assert kinds_ == ["start", "end_of_audio"] and code == 1001  # ("two" not spoken: the client goes elsewhere)
+    assert sum(m for m in msgs if isinstance(m, int)) == 6 * PATCH // 3 * 2
+
+
+def test_shutdown_cuts_what_does_not_end_in_time():
+    from websockets.asyncio.client import connect
+    from websockets.asyncio.server import serve
+
+    tts = FakeTTS(patches=100, burst=1, pause=0.05)  # 5 s of engine time
+    srv = Server(set(tts.voices), local_feed(tts), args())
+    cut = []
+
+    async def main():
+        async with serve(srv.handler, "127.0.0.1", 0) as s:
+            async with connect(f"ws://127.0.0.1:{s.sockets[0].getsockname()[1]}{PATH}") as ws:
+                await ws.send("long")
+                await asyncio.sleep(0.2)
+                t = asyncio.get_running_loop().time()
+                await srv.drain(s, 0.3, lambda: cut.append(True))
+                return asyncio.get_running_loop().time() - t, srv.active
+
+    took, active = asyncio.run(main())
+    assert cut == [True] and 0.3 <= took < 1.0 and active == 1
+
+
+TWO_PROCESSES = '''
+import asyncio, sys
+import numpy as np
+from nanovllm_voxcpm.entrypoints import ws_server
+
+
+class Pool:
+    async def wait_dead(self):
+        await asyncio.Future()
+
+
+class TTS:  # 20 patches, 50 ms apart: 1 s of engine time per utterance
+    sample_rate, voices, dialects, server = 48000, {"default": True}, ["egyptian"], Pool()
+
+    async def stream(self, text, **kw):
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            yield np.zeros(7680, np.float32)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        pass
+
+
+async def load_tts(args):
+    return TTS()
+
+
+ws_server.load_tts = load_tts
+sys.argv = ["ws_server", "--port", sys.argv[1], "--voice", "default=x.wav", "--link-sockets", "2"]
+ws_server.cli()
+'''
+
+
+def test_sigterm_drains_and_exits_in_time(tmp_path):
+    # SIGTERM took 31-41 s, more than Kubernetes' 30 s grace period: now the utterance in progress ends whole, then
+    # both processes exit at once (idle: at once)
+    import os
+    import signal
+    import socket
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    from websockets.asyncio.client import connect
+
+    script = tmp_path / "two.py"
+    script.write_text(TWO_PROCESSES)
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]), "CUDA_VISIBLE_DEVICES": ""}
+
+    def start():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        p = subprocess.Popen([sys.executable, str(script), str(port)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             env=env, text=True)
+        for line in p.stdout:
+            if "ready (pacing" in line:
+                return p, port
+        raise AssertionError("the server did not start")
+
+    def stop(p) -> float:
+        t = time.monotonic()
+        p.send_signal(signal.SIGTERM)
+        p.wait(timeout=30)
+        return time.monotonic() - t
+
+    p, _ = start()
+    try:
+        assert stop(p) < 2.0 and p.returncode == 0
+    finally:
+        p.kill()
+
+    async def speak_then_stop(p, port):
+        msgs = []
+        async with connect(f"ws://127.0.0.1:{port}{PATH}") as ws:
+            await ws.send("one")
+            await ws.recv()  # start
+            stopping = asyncio.ensure_future(asyncio.to_thread(stop, p))
+            async for m in ws:
+                msgs.append(json.loads(m)["type"] if isinstance(m, str) else len(m))
+        return msgs, ws.close_code, await stopping
+
+    p, port = start()
+    try:
+        msgs, code, took = asyncio.run(speak_then_stop(p, port))
+    finally:
+        p.kill()
+    assert msgs[-1] == "end_of_audio" and sum(m for m in msgs if isinstance(m, int)) == 20 * PATCH // 3 * 2
+    assert code == 1001 and took < 3.0 and p.returncode == 0

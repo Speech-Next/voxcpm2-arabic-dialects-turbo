@@ -105,7 +105,7 @@ def server_args(model, **kw):
                 max_num_batched_tokens=2048, gpu_memory_utilization=0.5, voice_dir=None, voices=None,
                 served_model_name="voxcpm2", split_max_chars=200, max_tokens=600, no_route=True, tagged_model=None,
                 host="127.0.0.1", port=8092, api_key=None, max_streams=0, max_input_chars=4096, max_voice_mb=10.0,
-                max_voice_seconds=30.0)
+                max_voice_seconds=30.0, hang_timeout=60.0, shutdown_timeout=10.0)
     return SimpleNamespace(**{**args, **kw})
 
 
@@ -386,3 +386,49 @@ def test_a_body_that_is_not_json_is_a_422(server, tmp_path):
 
     for status, body in asyncio.run(main()):
         assert status == 422 and b"json" in body.lower()
+
+
+def test_nothing_to_speak(server, tmp_path):
+    from nanovllm_voxcpm.dialect_tts import speakable
+
+    assert not any(map(speakable, ("...", "؟!", "🙂 🙂", "ـــ", "—", "")))
+    assert all(map(speakable, ("ok", "مرحبا", "123", "你好")))
+    out = run(serve(server.build_app(server_args(tmp_path)), [{"input": "..."}, {"input": "🙂 !!"}, {"input": "؟!"},
+                                                              {"input": "ok!"}]))
+    assert [status for status, _ in out] == [400, 400, 400, 200]
+    assert b"nothing to speak" in out[0][1]
+    tts = DialectTTS(FakeEngine(), ["najdi"], 48000)
+    with pytest.raises(ValueError, match="nothing to speak"):
+        run(say(tts, "!!! ...", "najdi"))
+
+
+def test_a_voice_in_use_is_not_deleted(server, monkeypatch, tmp_path):
+    # its next sentence would fail, and the response stop after a 200
+    monkeypatch.setattr(nanovllm_voxcpm, "VoxCPM", SlowEngine)
+    (tmp_path / "v.wav").write_bytes(b"wav")
+    voices = tmp_path / "voices.json"
+    voices.write_text(json.dumps([{"id": "v", "wav": str(tmp_path / "v.wav")}]), encoding="utf-8")
+    asgi = server.build_app(server_args(tmp_path, voices=str(voices)))
+
+    async def main():
+        async with running(asgi):
+            speaking = asyncio.ensure_future(request(asgi, "POST", "/v1/audio/speech", speech_body(voice="v")))
+            await asyncio.sleep(0.05)
+            in_use = await request(asgi, "DELETE", "/v1/audio/voices/v")
+            spoken = await speaking
+            return in_use, spoken[0], (await request(asgi, "DELETE", "/v1/audio/voices/v"))[0]
+
+    (status, _, body), spoken, deleted = asyncio.run(main())
+    assert (status, spoken, deleted) == (409, 200, 200) and b"in use" in body
+
+
+def test_the_engine_is_watched_for_hangs_once_warmed_up(server, monkeypatch, tmp_path):
+    class Engine(FakeEngine):
+        watched = None
+
+        def watch_hangs(self, timeout_s):
+            type(self).watched = (timeout_s, len(self.targets))  # (after the warm-up's requests)
+
+    monkeypatch.setattr(nanovllm_voxcpm, "VoxCPM", Engine)
+    run(serve(server.build_app(server_args(tmp_path, hang_timeout=7.0)), []))
+    assert Engine.watched[0] == 7.0 and Engine.watched[1] > 0

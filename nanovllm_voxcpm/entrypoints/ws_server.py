@@ -30,9 +30,12 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
   meanwhile went out that much late: a stall where the server had the audio.
 - Production: ``--api-key`` (or VOXCPM_API_KEY): the handshake needs ``Authorization: Bearer <key>`` or
   ``?api_key=<key>``; ``--max-streams`` answers an utterance beyond that many at once with an error (one A10: 150);
-  ``--max-text-chars`` bounds a text; an unknown dialect is refused at the handshake; an utterance's error leaves its
-  connection open for the next. ``GET /health`` on the same port answers 200 while the server runs; when the engine
-  process dies the server exits with code 1, for its supervisor to start it again.
+  ``--max-text-chars`` bounds a text (and text with nothing to speak, punctuation, symbols or emoji only, is an
+  error); an unknown dialect is refused at the handshake; an utterance's error leaves its connection open for the
+  next. ``GET /health`` on the same port answers 200 while the server runs; when the engine process dies or hangs
+  (``--hang-timeout``) the server exits with code 1, for its supervisor to start it again. On SIGTERM no new
+  connection or utterance is taken, those in progress get ``--shutdown-timeout`` seconds to end, and the connections
+  close with 1001 (going away).
 """
 
 import argparse
@@ -89,9 +92,11 @@ async def speak(tts, req: dict, yields: list | None = None) -> AsyncIterator[byt
     yields: [time, samples from the engine, ms resampling, bytes out] per engine chunk."""
     parts = [req["text"]]
     if req["segmenting"]:
+        from nanovllm_voxcpm.dialect_tts import speakable
         from nanovllm_voxcpm.entrypoints.openai_server import split_text
 
-        parts = split_text(req["text"]) or parts
+        # (a sentence of punctuation or symbols alone has nothing to speak: the model made up sounds for it)
+        parts = [p for p in split_text(req["text"]) if speakable(p)] or parts
     rs = None
     if req["rate"] != tts.sample_rate:
         import soxr
@@ -157,6 +162,7 @@ class Server:
         self.sender = StreamSender(0.0) if args.pace else None
         self.utterances = 0
         self.active = 0  # utterances in progress (--max-streams)
+        self.draining = False  # shutting down: no new connection or utterance (drain)
 
     def process_request(self, connection, request):
         """Before a handshake: GET /health answered here (this process runs only while the engine's does); with
@@ -202,10 +208,25 @@ class Server:
                           alpha_last=a.pace_alpha_last, phase_ms=phase, min_gap_ms=getattr(a, "pace_min_gap_ms", 0.0),
                           start_ms=getattr(a, "pace_start_ms", 0.0))
 
+    async def drain(self, ws_server, timeout: float, cut: Callable[[], None] | None = None) -> None:
+        """Shutdown (SIGTERM): no new connections or utterances; those in progress get ``timeout`` seconds to end,
+        then ``cut`` fails the rest (their streams), and the connections are closed (1001, going away)."""
+        self.draining = True
+        ws_server.server.close()  # (stops listening; the connections stay open)
+        loop = asyncio.get_running_loop()
+        end = loop.time() + timeout
+        while self.active and loop.time() < end:
+            await asyncio.sleep(0.05)
+        if self.active and cut is not None:
+            cut()
+
     async def handler(self, ws):
         u = urlparse(ws.request.path)
         if u.path != PATH:
             await ws.close(1008, "unknown path")
+            return
+        if self.draining:
+            await ws.close(1001, "the server is shutting down")
             return
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         fmt = q.get("audio_format", "pcm_16000")
@@ -265,13 +286,19 @@ class Server:
                         await ws.send(json.dumps({"type": "error", "message": message(e)}))
                     except Exception:  # noqa: BLE001 - the client is gone
                         break
+                if self.draining:  # (its utterance ended: the connection closes; a client reconnects elsewhere)
+                    await ws.close(1001, "the server is shutting down")
+                    break
         finally:
             rd.cancel()
 
     async def utterance(self, ws, conn, cfg, t_recv, text):
         """One text spoken (speak_text), within --max-text-chars and --max-streams."""
-        if not text.strip():
-            raise ValueError("text is empty")
+        from nanovllm_voxcpm.dialect_tts import check_text
+
+        if self.draining:
+            raise ValueError("the server is shutting down")
+        check_text(text)  # (empty, or punctuation / symbols / emoji only: an error, not made-up sounds)
         limit = getattr(self.args, "max_text_chars", 0)
         if limit and len(text) > limit:
             raise ValueError(f"text: at most {limit} characters (--max-text-chars)")
@@ -442,10 +469,14 @@ class EngineLink(asyncio.Protocol):
         elif off < end:
             self.buf += data[off:]
 
-    def connection_lost(self, exc) -> None:
+    def fail_all(self, why: str) -> None:
+        """Every utterance in progress fails (the client hears ``why``)."""
         for stream, _ in self.sinks.values():
-            stream.fail(RuntimeError("the engine's process is gone"))
+            stream.fail(RuntimeError(why))
         self.sinks.clear()
+
+    def connection_lost(self, exc) -> None:
+        self.fail_all("the engine's process is gone")
         for f in (self.ready, self.closed):
             if not f.done():
                 f.set_result(None)
@@ -484,17 +515,20 @@ async def load_tts(args):
     return tts
 
 
-async def serve_ws(server: Server, args, until: asyncio.Future, on_listening: Callable[[], None]):
+async def serve_ws(server: Server, args, until: asyncio.Future, on_listening: Callable[[], None],
+                   cut: Callable[[], None] | None = None):
     from websockets.asyncio.server import serve
 
     # client messages are texts and control messages: at most 1 MiB each (else close 1009), 16 frames buffered
     # (then TCP backpressure); a ping every --ping-interval s finds clients gone without a close (else their engine
-    # requests ran to the end)
+    # requests ran to the end); a client that does not answer the close at shutdown is dropped after 2 s
     ping = getattr(args, "ping_interval", 0) or None
     async with serve(server.handler, args.host, args.port, max_size=1 << 20, compression=None, ping_interval=ping,
-                     ping_timeout=ping, max_queue=16, process_request=server.process_request) as ws_server:
+                     ping_timeout=ping, max_queue=16, close_timeout=2,
+                     process_request=server.process_request) as ws_server:
         on_listening()
         await until
+        await server.drain(ws_server, getattr(args, "shutdown_timeout", 0.0), cut)
         ws_server.close()
 
 
@@ -532,8 +566,17 @@ async def main_engine(args, socks, front_pid: int) -> int:
             announce(args)
             log = open(args.log + ".engine", "a", buffering=1) if args.log else None
             engine = asyncio.create_task(serve_engine(tts, reader, [w for _, w in conns], log))
+            if args.hang_timeout and hasattr(tts.server, "watch_hangs"):  # (warmed up: no more kernels to compile)
+                tts.server.watch_hangs(args.hang_timeout)
             dead = asyncio.ensure_future(tts.server.wait_dead())
             await asyncio.wait([stop, engine, dead], return_when=asyncio.FIRST_COMPLETED)
+            if stop.done() and not dead.done():
+                # SIGTERM: the connections' process drains (its utterances get --shutdown-timeout s to end, the engine
+                # serving them meanwhile) and exits, which ends serve_engine
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(front_pid, signal.SIGTERM)
+                await asyncio.wait([engine, dead], timeout=args.shutdown_timeout + 3,
+                                   return_when=asyncio.FIRST_COMPLETED)
             engine.cancel()
             died = dead.done()
             dead.cancel()
@@ -542,11 +585,24 @@ async def main_engine(args, socks, front_pid: int) -> int:
                 return 1
             return 0
     finally:
-        try:
-            os.kill(front_pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        await asyncio.to_thread(os.waitpid, front_pid, 0)
+        await end_front(front_pid)
+
+
+async def end_front(pid: int, timeout: float = 5.0) -> None:
+    """The connections' process ended (SIGTERM, then SIGKILL after ``timeout`` s) and reaped."""
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    while loop.time() < end:
+        with contextlib.suppress(ChildProcessError):
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                return
+        await asyncio.sleep(0.05)
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    with contextlib.suppress(ChildProcessError):
+        await asyncio.to_thread(os.waitpid, pid, 0)
 
 
 async def main_front(args, socks):
@@ -561,7 +617,8 @@ async def main_front(args, socks):
     server = Server(set(info["voices"]), link.start, args, set(info["dialects"]) if info.get("dialects") else None)
     stop = stop_signal()
     until = asyncio.ensure_future(asyncio.wait([stop, link.closed], return_when=asyncio.FIRST_COMPLETED))
-    await serve_ws(server, args, until, lambda: link.send(LISTENING))
+    await serve_ws(server, args, until, lambda: link.send(LISTENING),
+                   lambda: link.fail_all("the server is shutting down"))
 
 
 def cli():
@@ -607,6 +664,11 @@ def cli():
     ap.add_argument("--ping-interval", type=float, default=20.0,
                     help="seconds between keepalive pings (a client that does not answer in as long is closed, and "
                          "its utterance's engine request ends; 0: off)")
+    ap.add_argument("--hang-timeout", type=float, default=60.0,
+                    help="an engine that sends nothing for this many seconds while utterances wait on it is taken as "
+                         "hung: the server exits with code 1 (0: not watched)")
+    ap.add_argument("--shutdown-timeout", type=float, default=10.0,
+                    help="on SIGTERM, utterances in progress get this many seconds to end, then they are cut")
     args = ap.parse_args()
     if args.default_voice is None and args.voice:
         args.default_voice = args.voice[0].partition("=")[0]

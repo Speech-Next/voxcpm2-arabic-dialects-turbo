@@ -51,8 +51,8 @@ from typing import AsyncIterator
 
 import numpy as np
 
-from nanovllm_voxcpm.dialect_tts import (DEFAULT_DIT, DEFAULT_MODEL, DialectTags, find_adapters, read_as, resolve,
-                                         start_engine)
+from nanovllm_voxcpm.dialect_tts import (DEFAULT_DIT, DEFAULT_MODEL, DialectTags, check_text, find_adapters, read_as,
+                                         resolve, start_engine)
 
 DEFAULT_TAGGED_MODEL = "VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3"
 # dialect (or name) -> adapter
@@ -218,8 +218,7 @@ class RoutedDialectTTS:
         r = self.route(dialect)
         if normalize:
             text = read_as(text, r.dialect)
-        if not text.strip():
-            raise ValueError("text is empty" + (" after normalization" if normalize else ""))
+        check_text(text, normalize)
         kw = {}
         if voice is not None:
             if voice not in self.voices:

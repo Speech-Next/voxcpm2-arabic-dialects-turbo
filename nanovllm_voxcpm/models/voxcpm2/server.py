@@ -3,8 +3,10 @@ import contextlib
 import io
 import itertools
 import os
+import struct
 import time
 from collections import deque
+from multiprocessing.reduction import ForkingPickler
 
 from nanovllm_voxcpm.utils import profile as _profile
 import traceback
@@ -730,6 +732,44 @@ class _Channel:
         return self._q.empty()
 
 
+class _PipeWriter:
+    """The client's end of the engine's command pipe (a _Channel's), written without ever blocking the event loop.
+    Both processes wrote their pipe blocking from one thread: with both pipes full at once (the client's loop busy
+    for a few steps, then a burst of requests flushed before it read the engine's audio: a 48-request batch ~40 KB,
+    a 256-stream step's audio items ~19 KB, a pipe 64 KB), each waited for the other for good. What the pipe does
+    not take now is written, in order, once it is writable again (add_writer), while the loop reads on."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, conn) -> None:
+        self.loop, self.fd, self.buf = loop, conn.fileno(), bytearray()
+        os.set_blocking(self.fd, False)
+
+    def put(self, obj) -> None:
+        data = ForkingPickler.dumps(obj)  # framed as multiprocessing.Connection.send_bytes frames it
+        n = len(data)
+        msg = (struct.pack("!i", n) if n <= 0x7FFFFFFF else struct.pack("!iQ", -1, n)) + data
+        if self.buf:  # (behind what still waits)
+            self.buf += msg
+            return
+        try:
+            k = os.write(self.fd, msg)
+        except BlockingIOError:
+            k = 0
+        if k < len(msg):
+            self.buf += memoryview(msg)[k:]
+            self.loop.add_writer(self.fd, self._drain)
+
+    def _drain(self) -> None:
+        try:
+            k = os.write(self.fd, self.buf)
+        except BlockingIOError:
+            return
+        except OSError:  # the engine is gone (its watch reports it): nothing more to write
+            k = len(self.buf)
+        del self.buf[:k]
+        if not self.buf:
+            self.loop.remove_writer(self.fd)
+
+
 class AsyncVoxCPM2Server:
     def __init__(
         self,
@@ -783,11 +823,18 @@ class AsyncVoxCPM2Server:
         # through call_soon_threadsafe and must take the GIL from the loop thread first (a burst's first audio
         # waited 23 ms behind a busy loop thread).
         self._attach_reader(loop, self.queue_out._q._reader)
+        self._pipe = _PipeWriter(loop, self.queue_in._q._writer)
+        self._last_msg = time.monotonic()  # when the engine's last message arrived (watch_hangs)
+        self._open: set[str] | None = set()  # streams whose end the engine has not sent yet
         self.recv_task: asyncio.Task = asyncio.create_task(self._watch_engine())
 
     _reader = None
     _ring = None
+    _pipe = None
+    _open = None
     dead = None  # (instances built without __init__)
+    # watch_hangs(): an engine that sends nothing for this many seconds while requests wait on it is taken as hung
+    hang_timeout: float | None = None
     _tokenizer = None  # the engine's tokenizer (init_ok, "tokenizer" messages), the client tokenizes with it
     _tok_version = 0  # its version: the engine uses only ids tokenized with its current one
     _first_flush = True  # the next flush is a burst's first (_FLUSH_FIRST)
@@ -845,14 +892,34 @@ class AsyncVoxCPM2Server:
 
     async def _watch_engine(self) -> None:
         try:
+            quiet = time.monotonic()  # the last check without work outstanding
             while True:
                 await asyncio.sleep(_WATCH_ENGINE_S)
                 proc = getattr(self, "process", None)
                 if proc is not None and proc.exitcode is not None:  # the engine died: fail everything waiting
                     self._handle({"type": "engine_dead", "exitcode": proc.exitcode})
                     return
+                now = time.monotonic()
+                if not self.hang_timeout or not (self.op_table or self._open):
+                    quiet = now
+                elif now - max(quiet, self._last_msg) > self.hang_timeout and not self._output_waiting():
+                    # requests wait and the engine has sent nothing for that long (e.g. a CUDA hang): it would
+                    # never answer; it dies here, and every request fails as if it had exited
+                    reason = f"VoxCPM2 engine process hung (nothing for {self.hang_timeout:g} s): killed"
+                    print(f"[engine] {reason}", flush=True)
+                    with contextlib.suppress(Exception):
+                        proc.kill()
+                    self._handle({"type": "engine_dead", "exitcode": None, "reason": reason})
+                    return
         except asyncio.CancelledError:
             return
+
+    def _output_waiting(self) -> bool:
+        """The engine's output pipe holds a message not read yet (or is closed: its exit is reported)."""
+        try:
+            return self._reader is None or self._reader.poll()
+        except (EOFError, OSError, ValueError):
+            return True
 
     def _convert(self, res: dict[str, Any]) -> dict[str, Any]:
         """Attach the engine's audio ring on init_ok; copy chunks sent through the ring out of it, on arrival."""
@@ -889,6 +956,7 @@ class AsyncVoxCPM2Server:
         return res
 
     def _handle(self, res: dict[str, Any]) -> None:
+        self._last_msg = time.monotonic()
         if self._spin_task is not None:
             self._touch()
         if res.get("type") == "init_ok":
@@ -904,7 +972,7 @@ class AsyncVoxCPM2Server:
                 self._init_fut.set_exception(RuntimeError(res.get("error", "unknown init error")))
             return
         if res.get("type") == "engine_dead":
-            err = RuntimeError(f"VoxCPM2 engine process exited (code {res['exitcode']})")
+            err = RuntimeError(res.get("reason") or f"VoxCPM2 engine process exited (code {res['exitcode']})")
             self._engine_error = err
             if self.dead is not None:
                 self.dead.set()
@@ -922,6 +990,8 @@ class AsyncVoxCPM2Server:
 
     def _dispatch(self, res: dict[str, Any]) -> None:
         if res["type"] == "stream":
+            if res["data"] is None and self._open:  # (the stream's end: the engine owes it nothing more)
+                self._open.discard(res["id"])
             if res["id"] in self.stream_table:
                 self.stream_table[res["id"]].put_nowait(res["data"])
         elif res["id"] in self.op_table:
@@ -969,20 +1039,26 @@ class AsyncVoxCPM2Server:
         t = time.perf_counter()
         h0 = _host_sample() if _profile.StepProfile.enabled else None
         if len(cmds) == 1 and not more:
-            self.queue_in.put_nowait(cmds[0])
+            self._send(cmds[0])
         elif cmds or (self._more_sent and not more):
             # (no commands: the turn's last early flush took them all; the empty batch ends the engine's admission
             # window, which otherwise waits _QUEUE_MORE_MS for the rest of a turn that has ended)
             if self._tokenizer is not None:  # (a single command registers at once: the engine tokenizes it)
                 self._tokenize(cmds)
             t_tok = time.perf_counter()
-            self.queue_in.put_nowait({"type": "batch", "cmds": cmds, **({"more": True} if more else {})})
+            self._send({"type": "batch", "cmds": cmds, **({"more": True} if more else {})})
         if cmds or not more:
             self._more_sent = more
         if cmds and _profile.StepProfile.enabled:
             _profile.log(kind="client_flush", t=t, n=len(cmds), put_ms=(time.perf_counter() - t) * 1000,
                          tok_ms=(t_tok - t) * 1000 if len(cmds) > 1 or more else 0.0,
                          **_host_fields(h0, time.perf_counter() - t))
+
+    def _send(self, obj) -> None:
+        if self._pipe is not None:
+            self._pipe.put(obj)
+        else:  # (instances built without __init__)
+            self.queue_in.put_nowait(obj)
 
     _engine_error: BaseException | None = None  # set when the engine process died
 
@@ -1097,6 +1173,8 @@ class AsyncVoxCPM2Server:
     ) -> AsyncGenerator[Waveform, None]:
         seq_id = gen_uuid()
         self.stream_table[seq_id] = asyncio.Queue()
+        if self._open is not None:
+            self._open.add(seq_id)
         is_normal_exit = False
         try:
             await self.submit(
@@ -1131,6 +1209,8 @@ class AsyncVoxCPM2Server:
                     await self.submit("cancel", seq_id)
             finally:  # (a second cancellation here: the cancel command is sent all the same)
                 self.stream_table.pop(seq_id, None)
+                if self._open is not None:
+                    self._open.discard(seq_id)
 
 
 class AsyncVoxCPM2ServerPool:
@@ -1187,6 +1267,13 @@ class AsyncVoxCPM2ServerPool:
         finally:
             for w in waits:
                 w.cancel()
+
+    def watch_hangs(self, timeout_s: float | None) -> None:
+        """From now on (after warm-up: kernels compiling may hold a step for long), an engine that sends nothing for
+        ``timeout_s`` seconds while requests wait on it is taken as hung (e.g. a CUDA hang, which never ends): its
+        process is killed, every request fails and wait_dead() returns. None or 0: not watched."""
+        for server in self.servers:
+            server.hang_timeout = timeout_s or None
 
     async def stop(self):
         await asyncio.gather(*[server.stop() for server in self.servers])
