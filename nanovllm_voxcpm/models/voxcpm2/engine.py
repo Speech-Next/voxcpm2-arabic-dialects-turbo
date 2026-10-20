@@ -226,13 +226,15 @@ class VoxCPM2Engine(LLMEngineBase):
 
     def stream_buffer(self, seq: Sequence[VoxCPM2SeqPayload]) -> float | None:
         """Seconds of audio still queued at the stream's player (started at its first patch, waiting when empty);
-        negative: the player has been waiting that long. None: nothing streamed yet. A client that gets the audio in
-        chunks (add_request's client_chunk_ms): less what the front holds back
-        (what it has streamed beyond its last whole chunk)."""
+        negative: the player has been waiting that long. None: nothing streamed yet, or a front without pacing in
+        muted leading silence (lead_silence_patches): its player waits in silence until the sound begins, a wait no
+        one hears, so the stream holds back no new request (stream_guard_ms; it held one back 24 steps instead of 1
+        behind 30 silent patches). A client that gets the audio in chunks (add_request's client_chunk_ms): less what
+        the front holds back (what it has streamed beyond its last whole chunk)."""
         p = seq.custom_payload
         if p.pacer is not None:  # a paced front: until it needs a chunk not produced yet (pace_sync keeps it)
             return None if p.pace_dry is None else p.pace_dry - time.perf_counter()
-        if p.play_end is None:
+        if p.play_end is None or p.muted:
             return None
         held = math.fmod(p.streamed + 1e-9, p.client_chunk) - 1e-9 if p.client_chunk > 0 else 0.0
         return p.play_end - max(held, 0.0) - time.perf_counter()
@@ -1042,6 +1044,8 @@ class VoxCPM2Engine(LLMEngineBase):
         of every other stream in its head phase (in a burst they all come due about when this one does, as in
         _plan_head)? The continuations' steps also carry every other stream (mix_decode), as _head_plan."""
         buf = self.stream_buffer(seq)
+        if buf is None and seq.custom_payload.muted:  # no sound yet: the stage that sounds soonest
+            buf = 0.0
         if buf is None or self.step_cost is None:
             return True
         a, b, c = self.step_cost.prefill.coef

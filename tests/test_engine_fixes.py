@@ -1072,6 +1072,27 @@ def test_leading_silence_without_head_start():
     assert _streamed(eng, "r") == [True, False, False, True, True, True]
 
 
+def test_muted_leading_silence_holds_back_no_new_request(monkeypatch):
+    """#47: a front without pacing (the HTTP server, the library) gets nothing while its stream's leading silence is
+    muted; stream_guard_ms took that for a player running dry and held every new request back until the sound
+    began (24 steps instead of 1 behind 30 silent patches)."""
+    from nanovllm_voxcpm.models.voxcpm2 import engine as em
+
+    clock = [1000.0]
+    monkeypatch.setattr(em, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
+    eng = _voxcpm2_engine(max_model_len=256)
+    eng.scheduler.stream_guard = 0.1  # turbo_config's 100 ms
+    eng.lead_silence_patches = 2
+    eng.model_runner.make_output = _silent_first(30)
+    a = eng.add_request("a", _words(3), max_generate_length=200, head_start=False)
+    for _ in range(8):  # a's first patches: 2 streamed, then muted (a decode step: 50 ms, a patch: 160 ms)
+        eng.step()
+        clock[0] += 0.05
+    assert a.custom_payload.muted and eng.stream_buffer(a) is None
+    eng.add_request("b", _words(2), max_generate_length=200, head_start=False)
+    assert [s.seq_id for s in eng.step()] == ["b"]  # b's prefill comes next
+
+
 def test_cancel_while_the_head_ends_also_cancels_its_continuation():
     eng = _voxcpm2_engine(max_model_len=128)
     eng.add_request("r1", _words(20), max_generate_length=20)
