@@ -11,28 +11,33 @@ text is brought to that form; the caller keeps the original. ``style`` "msa" rea
 - Joining: a proclitic (ب ل ك و ف, وب ...) or the article (ال، بال، لل ...) joins the number after it (بـ 3000 ->
   بثلاثة آلاف); any other word glued to digits is split off (رقم5 -> رقم خمسة, 100km -> مية كيلومتر, 5G -> خمسة G).
 - Dates d/m/yyyy, d-m-yyyy, d.m.yyyy (also yy with / and -) and yyyy-mm-dd: day, month name, year (12/05/2024 -> اثني
-  عشر مايو ألفين وأربعة وعشرين). The Gregorian names (يناير ... ديسمبر) are those of Egypt, the Gulf and pan-Arab
-  media, understood in the Levant and Iraq too (where أيار-style names are used alongside).
+  عشر مايو ألفين وأربعة وعشرين); a day the month does not have (31/02/2024, 29/02/2023) is no date but its numbers
+  (واحد وثلاثين/اثنين/ألفين وأربعة وعشرين). The Gregorian names (يناير ... ديسمبر) are those of Egypt, the Gulf and
+  pan-Arab media, understood in the Levant and Iraq too (where أيار-style names are used alongside).
 - Clock times h:mm, h:mm:ss (0-24 h), with ص / م / am / pm (also after الساعة N): 9:00 تسعة, 9:15 تسعة وربع, 9:30
   تسعة ونص, otherwise minutes (and seconds) counted: 9:01 تسعة ودقيقة, 9:02 ودقيقتين, 9:05 وخمس دقايق, 9:25 وخمسة
   وعشرين دقيقة.
 - Phone numbers (>= 8 digits) digit by digit: after a +, from a leading 0 (also in groups split by spaces or hyphens),
   or as 3+ hyphen-joined groups (800-123-4567). Other digit groups are separate numbers (100 200 300).
-- Signs: - (or −) before a digit at the start or after a space / bracket is ناقص, + زائد (2010-2015 keeps its hyphen).
+- Signs: - (or −) before a digit at the start or after a space, a bracket, = : < > * / , ; (x=-5) is ناقص, + زائد
+  (2010-2015 keeps its hyphen).
 - Dotted groups: 192.168.1.1, 1.2.3 as numbers joined by نقطة; 1.000.000 as one number.
 - Years with an era: 1445هـ -> ... هجري, 2024م -> ... ميلادي.
 - Currency before or after the amount ($ US$ € £ ₪, USD EUR GBP SAR AED EGP QAR KWD BHD JOD OMR ILS, ر.س د.إ ج.م
   د.ك), the noun counted: 1 دولار واحد, 2 دولارين, 3-10 ثلاثة دولارات, 11+ أحد عشر دولار, 103 مية وثلاثة دولارات;
   1-2 decimals as the subunit (12.50$ -> اثني عشر دولار وخمسين سنت), other decimals with فاصلة (dinars: 1000 fils).
-- Percent after or before the amount (50% / %50).
+- Percent after or before the amount (50% / %50). A % or a currency between the amount and a word or another number
+  is kept apart from it (100%50 -> مية بالمية خمسين).
 - Units after a number, singular: km m cm mm kg g mg l ml km/h °C ° GB MB, كم سم مم كغ كجم مل كم/س.
 - Fractions a/b: 1/2 1/3 2/3 1/4 3/4 by name (نص، ثلث، ثلثين، ربع، ثلاثة أرباع), others "a على b" (24/7).
 - Ordinals 1-100 after the article when it follows a noun of _ORDINAL_NOUNS (الطابق الـ3 -> الطابق الثالث, المرة
   الـ3 -> المرة الثالثة), and القرن N; after other words the article stays on the cardinal (خلال الـ3 أيام -> خلال
   الثلاثة أيام).
-- Everything else: integers as cardinals up to the billions (12 digits), longer digit strings and codes with a leading
-  zero (007) digit by digit; decimals with فاصلة (also .5 and the decimal comma 12,5), the fraction without trailing
-  zeros (12.50 -> اثني عشر فاصلة خمسة), as a number up to 3 digits, longer digit by digit.
+- Everything else: integers as cardinals up to the billions (12 digits), up to the trillions (15 digits) with
+  thousands separators, as whole billions (2000000000000) or as an amount of money; longer digit strings, others of
+  13-15 digits (a 14-digit national ID) and codes with a leading zero (007) digit by digit; decimals with فاصلة (also
+  .5 and the decimal comma 12,5), the fraction without trailing zeros (12.50 -> اثني عشر فاصلة خمسة), as a number up
+  to 3 digits, longer digit by digit.
 - Abbreviations before a name: د. دكتور, أ.د. أستاذ دكتور (not next to a number: 45 د. are minutes).
 - Punctuation as the transcripts write it, spaces collapsed: , ? ; -> ، ؟ ؛ (lahgtna: 20210 ، to 131 , ; 2154 ؟, no
   ? ; 7 ؛, no ;).
@@ -45,6 +50,7 @@ tells them apart), the letter pairs the transcripts keep apart (ى / ي, ة / ه
 
 from __future__ import annotations
 
+import calendar
 import re
 import unicodedata
 
@@ -82,10 +88,11 @@ _TEENS = ["عشرة", "أحد عشر", "اثني عشر", "ثلاثة عشر", "
 _TENS = ["", "", "عشرين", "ثلاثين", "أربعين", "خمسين", "ستين", "سبعين", "ثمانين", "تسعين"]
 _HUNDREDS = ["", "مية", "ميتين", "ثلاثمية", "أربعمية", "خمسمية", "ستمية", "سبعمية", "ثمانمية", "تسعمية"]
 # (one, two, 3-10 plural)
-_SCALES = [(10**9, ("مليار", "مليارين", "مليارات")), (10**6, ("مليون", "مليونين", "ملايين")),
-           (10**3, ("ألف", "ألفين", "آلاف"))]
+_SCALES = [(10**12, ("تريليون", "تريليونين", "تريليونات")), (10**9, ("مليار", "مليارين", "مليارات")),
+           (10**6, ("مليون", "مليونين", "ملايين")), (10**3, ("ألف", "ألفين", "آلاف"))]
 _MSA = {"مية": "مئة", "ميتين": "مئتين", "ثلاثمية": "ثلاثمئة", "أربعمية": "أربعمئة", "خمسمية": "خمسمئة",
         "ستمية": "ستمئة", "سبعمية": "سبعمئة", "ثمانمية": "ثمانمئة", "تسعمية": "تسعمئة"}
+_MONTH_DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 _MONTHS = ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر",
            "ديسمبر"]
 _ORD = ["", "أول", "ثاني", "ثالث", "رابع", "خامس", "سادس", "سابع", "ثامن", "تاسع", "عاشر"]
@@ -209,10 +216,18 @@ def _digits(s: str) -> str:
     return " ".join(_UNITS[int(d)] for d in s if d.isdigit())
 
 
-def _integer(s: str, style: str) -> str:
-    """Digits as said: a cardinal up to the billions; longer strings and codes with a leading zero digit by digit."""
+def _cardinal(s: str, grouped: bool) -> bool:
+    """Whether digits are said as a number: up to the billions (12 digits), up to the trillions (15) when grouped by
+    thousands or whole billions (2000000000000); other 13-15 digit strings (a 14-digit ID) and longer ones are not."""
+    return len(s) <= 12 or (len(s) <= 15 and (grouped or s.endswith("0" * 9)))
+
+
+def _integer(s: str, style: str, grouped: bool = False) -> str:
+    """Digits as said: a cardinal where _cardinal says so; other strings and codes with a leading zero digit by
+    digit."""
+    grouped = grouped or "," in s
     s = s.replace(",", "")
-    if len(s) > 12 or (len(s) > 2 and s[0] == "0") or s == "00":
+    if not _cardinal(s, grouped) or (len(s) > 2 and s[0] == "0") or s == "00":
         return _digits(s)
     return number_words(int(s), style)
 
@@ -235,7 +250,7 @@ def _money(int_part: str, frac: str | None, cur: str, style: str) -> str:
     noun, sub = _CURRENCIES[cur if cur in _CURRENCIES else cur.upper()]
     s = int_part.replace(",", "")
     frac = frac or ""
-    if len(s) > 12:
+    if not _cardinal(s, grouped=True):  # an amount: up to the trillions as a number
         return f"{_decimal(s, frac, style)} {noun[0]}"
     n = int(s)
     if not frac.strip("0"):
@@ -266,6 +281,19 @@ def _clock(h: int, m: int, s: int | None, suffix: str | None, style: str) -> str
     return words
 
 
+def _apart(m: re.Match, words: str) -> str:
+    """``words`` for a match that a %, a currency sign or code starts or ends: a space from a letter or a digit
+    touching that sign (100%50 -> مية بالمية خمسين, 15%و20% -> ... بالمية وعشرين ...), not from a proclitic (و%50)."""
+    s, i, j = m.string, m.start(), m.end()
+    before = after = ""
+    if i and not s[i].isdigit() and s[i - 1].isalnum():
+        word = _LAST_AR.search(s, max(0, i - 8), i)  # longer than a proclitic chain (<= 4 letters)
+        before = "" if word and _CHAIN_FULL.fullmatch(word.group(0)) else " "
+    if j < len(s) and not s[j - 1].isdigit() and s[j].isalnum():
+        after = " "
+    return before + words + after
+
+
 def _alternatives(words) -> str:
     return "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True))
 
@@ -281,6 +309,7 @@ _CHAIN = r"[وف]?[بلك]|[وف]|[وف]?[بك]?ال|[وف]?لل"  # one-letter 
 _PROCLITIC = re.compile(r"([وفبلكا]+)\s+(?=\d)")  # "بـ 3000" (tatweel gone): "ب 3000" -> "ب3000" (_join)
 _CHAIN_FULL = re.compile(_CHAIN)
 _AR_LETTER = re.compile(f"[{_AR}]")
+_LAST_AR = re.compile(f"[{_AR}]+$")
 _AR_GLUED = re.compile(rf"([{_AR}]+)(?=\d)")
 _GLUED_AR = re.compile(rf"(\d)(?=[{_AR}])")
 _GLUED_LATIN = re.compile(r"(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])")
@@ -292,7 +321,7 @@ _TIME = re.compile(rf"(?<![\d:.,])(\d{{1,2}}):(\d{{2}})(?::(\d{{2}}))?(?![\d:]|[
 _HOUR = re.compile(rf"(الساعة\s?)(\d{{1,2}})\s?({_AMPM})(?![A-Za-z{_AR}])")
 _PHONE = re.compile(rf"(?<![\d.,])(?:\+\d[\d\- ]*\d|0\d{{7,}}|0\d{{1,4}}(?:[ \-]\d{{2,4}})+"
                     rf"|\d{{2,4}}(?:-\d{{2,4}}){{2,}}){_END}")  # >= 8 digits: _phone
-_SIGN = re.compile(r"(?:(?<=[\s(\[«\"'])|^)([-+])(?=\d)")
+_SIGN = re.compile(r"(?:(?<=[\s(\[{«\"'=:<>*/×÷,،;؛])|^)([-+])(?=\d)")
 _DOTTED = re.compile(rf"(?<![\d.,])\d+(?:\.\d+){{2,}}{_END}")
 _ERA = re.compile(rf"(?<![\d.,])(\d{{4}})\s?(ه|م)(?![{_AR}])")
 _CODES = "|".join(k for k in _CURRENCIES if k.isalpha() and k.isascii())
@@ -385,11 +414,15 @@ def _amount(m: re.Match, style: str) -> str:
 
 
 def _date(m: re.Match, day: str, month: str, year: str, style: str) -> str:
-    """Day, month name, year; not a date (13/13/2024, 1.2.24): left to the later rules."""
-    d, mo = int(day), int(month)
-    if not (1 <= d <= 31 and 1 <= mo <= 12) or (m.group(2) == "." and len(year) == 2):
+    """Day, month name, year; not a date (13/13/2024, 1.2.24): left to the later rules. A day the month does not have
+    (31/02/2024, 29/02/2023): its numbers here, the / or - kept (the later rules read 31-02-2024 as a phone number);
+    dotted, left to the dotted groups."""
+    d, mo, y, sep = int(day), int(month), int(year), m.group(2)
+    if not (1 <= d <= 31 and 1 <= mo <= 12) or (sep == "." and len(year) == 2):
         return m.group(0)
-    return f"{number_words(d, style)} {_MONTHS[mo - 1]} {number_words(int(year), style)}"
+    if d > _MONTH_DAYS[mo - 1] + (mo == 2 and calendar.isleap(y if len(year) == 4 else 2000 + y)):  # yy: 20yy
+        return m.group(0) if sep == "." else sep.join(_integer(n, style) for n in m.group(0).split(sep))
+    return f"{number_words(d, style)} {_MONTHS[mo - 1]} {number_words(y, style)}"
 
 
 def _time(m: re.Match, style: str) -> str:
@@ -411,7 +444,7 @@ def _phone(m: re.Match, style: str) -> str:
 def _dotted(s: str, style: str) -> str:
     groups = s.split(".")
     if len(groups[0]) <= 3 and all(len(g) == 3 for g in groups[1:]):  # 1.000.000: thousands separators
-        return _integer("".join(groups), style)
+        return _integer("".join(groups), style, grouped=True)
     return " نقطة ".join(_integer(g, style) for g in groups)
 
 
@@ -446,10 +479,10 @@ _NUMBER_RULES = [  # (gate, rule, words(match, style)), in the order of the modu
     (re.compile(r"[-+]\d"), _SIGN, lambda m, s: "ناقص " if m.group(1) == "-" else "زائد "),
     (re.compile(r"\d\.\d+\.\d"), _DOTTED, lambda m, s: _dotted(m.group(0), s)),
     (re.compile(rf"\d{{4}}\s?[هم](?![{_AR}])"), _ERA, _era),
-    (_CUR_GATE, _CUR_BEFORE, lambda m, s: _money(m.group(2), m.group(3) or m.group(4), m.group(1), s)),
-    (_CUR_GATE, _CUR_AFTER, lambda m, s: _money(m.group(1), m.group(2) or m.group(3), m.group(4), s)),
-    ("%", _PCT_AFTER, lambda m, s: f"{_amount(m, s)} {_PERCENT[s]}"),
-    ("%", _PCT_BEFORE, lambda m, s: f"{_amount(m, s)} {_PERCENT[s]}"),
+    (_CUR_GATE, _CUR_BEFORE, lambda m, s: _apart(m, _money(m.group(2), m.group(3) or m.group(4), m.group(1), s))),
+    (_CUR_GATE, _CUR_AFTER, lambda m, s: _apart(m, _money(m.group(1), m.group(2) or m.group(3), m.group(4), s))),
+    ("%", _PCT_AFTER, lambda m, s: _apart(m, f"{_amount(m, s)} {_PERCENT[s]}")),
+    ("%", _PCT_BEFORE, lambda m, s: _apart(m, f"{_amount(m, s)} {_PERCENT[s]}")),
     (re.compile(rf"\d\s?(?:[A-Za-z°]|(?:كم|سم|مم|كغ|كجم|مل)(?![{_AR}]))"), _UNIT,
      lambda m, s: f"{_amount(m, s)} {_styled(_UNIT_WORDS[m.group(4)], s)}"),
     ("/", _FRACTION, lambda m, s: _fraction(int(m.group(1)), int(m.group(2)), s)),
