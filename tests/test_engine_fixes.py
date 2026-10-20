@@ -1403,6 +1403,20 @@ def test_text_ids_past_the_vocabulary_are_the_requests_fault():
     eng._check_ids([0, 9])  # (in range)
 
 
+def test_layers_with_the_same_rope_settings_share_one_table():
+    # each of the 52 rotary layers built its own [32768, 128] fp32 cos and sin: 1.6 GiB of GPU memory, all equal
+    from nanovllm_voxcpm.models.voxcpm2.model import MiniCPMLongRoPE
+    from nanovllm_voxcpm.models.voxcpm2.model_utils import build_rope_cos_sin_cache
+
+    long = [1.0 + i / 8 for i in range(4)]
+    a, b = (MiniCPMLongRoPE(8, 8, 64, 10000.0, [1.0] * 4, long, 32) for _ in range(2))
+    other = MiniCPMLongRoPE(8, 8, 64, 10000.0, [1.0] * 4, [1.0] * 4, 32)
+    assert a.cos_cached is b.cos_cached and a.sin_cached is b.sin_cached
+    assert other.cos_cached is not a.cos_cached and not torch.equal(other.cos_cached, a.cos_cached)
+    cos, sin = build_rope_cos_sin_cache(64, a.inv_freq, a.scaling_factor, a.short_factor, long, 32)
+    assert torch.equal(a.cos_cached, cos) and torch.equal(a.sin_cached, sin)  # the table each layer built itself
+
+
 def test_a_text_without_head_start_is_capped_by_its_length():
     # a text of 16 tokens or fewer (no head start) had only max_generate_length: 600 patches (96 s) of a runaway
     # (silence, babble); now the continuations' cap, 1.5 patches a token and 20 to spare

@@ -1,3 +1,4 @@
+import weakref
 from typing import Optional
 
 import torch
@@ -38,6 +39,9 @@ from nanovllm_voxcpm.utils.context import (
 )
 from nanovllm_voxcpm.utils.distributed import get_tp_world_size
 
+# MiniCPMLongRoPE's cos/sin tables by their settings (freed with the last layer that reads them)
+_ROPE_TABLES: "weakref.WeakValueDictionary[tuple, torch.Tensor]" = weakref.WeakValueDictionary()
+
 
 class MiniCPMLongRoPE(nn.Module):
     def __init__(
@@ -66,15 +70,22 @@ class MiniCPMLongRoPE(nn.Module):
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
-        cos_cache, sin_cache = build_rope_cos_sin_cache(
-            seq_len=seq_len,
-            inv_freq=self.inv_freq.to(device=device),
-            scaling_factor=self.scaling_factor,
-            short_factor=self.short_factor,
-            long_factor=self.long_factor,
-            original_max_position_embeddings=self.original_max_position_embeddings,
-            dtype=dtype,
-        )
+        # one table per setting, shared by every layer that has it: each layer's own copy took 1.6 GiB of GPU
+        # memory (52 layers of [32768, 128] fp32 cos and sin), all of them equal
+        key = (seq_len, self.dim, self.base, self.scaling_factor, tuple(self.short_factor), tuple(self.long_factor),
+               self.original_max_position_embeddings, str(torch.device(device)), dtype)
+        cos_cache, sin_cache = _ROPE_TABLES.get(key + ("cos",)), _ROPE_TABLES.get(key + ("sin",))
+        if cos_cache is None or sin_cache is None:
+            cos_cache, sin_cache = build_rope_cos_sin_cache(
+                seq_len=seq_len,
+                inv_freq=self.inv_freq.to(device=device),
+                scaling_factor=self.scaling_factor,
+                short_factor=self.short_factor,
+                long_factor=self.long_factor,
+                original_max_position_embeddings=self.original_max_position_embeddings,
+                dtype=dtype,
+            )
+            _ROPE_TABLES[key + ("cos",)], _ROPE_TABLES[key + ("sin",)] = cos_cache, sin_cache
         self.register_buffer("cos_cached", cos_cache, persistent=False)
         self.register_buffer("sin_cached", sin_cache, persistent=False)
 
