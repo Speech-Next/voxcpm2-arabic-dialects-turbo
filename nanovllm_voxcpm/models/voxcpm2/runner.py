@@ -186,9 +186,8 @@ class VoxCPM2Runner(BaseModelRunner):
                 fuse_prefixes=["base_lm", "residual_lm", "feat_encoder", "feat_decoder"],
                 min_rows=turbo.w8a8_min_rows,
             )
-            sparse = sum(getattr(getattr(m, "forward", None), "sp24", None) is not None for m in self.model.modules())
-            print(f"[turbo] fused {fused} decoder layers ({quantized} W8A8 for rows >= {turbo.w8a8_min_rows}"
-                  + (f", {sparse} with a 2:4 sparse FFN" if sparse else "") + ")", flush=True)
+            print(f"[turbo] fused {fused} decoder layers ({quantized} W8A8 for rows >= {turbo.w8a8_min_rows})",
+                  flush=True)
         elif turbo.w8a8:
             from voxcpm_kernels import quantize_linears
 

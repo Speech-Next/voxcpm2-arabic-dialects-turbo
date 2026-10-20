@@ -45,7 +45,7 @@ implementations.
 
 Concrete example: VoxCPM
 ------------------------
-``nanovllm_voxcpm/models/voxcpm/engine.py`` implements an audio generation loop
+``nanovllm_voxcpm/models/voxcpm2/engine.py`` implements an audio generation loop
 on top of this base engine:
 
 - ``Sequence.token_ids`` is used as a hashable prefix stream (ints for text token
@@ -335,7 +335,7 @@ class LLMEngineBase:
 
         Concrete example: VoxCPM
         ------------------------
-        See ``nanovllm_voxcpm/models/voxcpm/engine.py``:
+        See ``nanovllm_voxcpm/models/voxcpm2/engine.py``:
 
         - Prefill (``is_prefill=True``):
           ``RunnerTask.num_cached_tokens = seq.num_cached_tokens`` and the engine
@@ -385,7 +385,7 @@ class LLMEngineBase:
 
         Concrete example: VoxCPM
         ------------------------
-        In ``nanovllm_voxcpm/models/voxcpm/engine.py``:
+        In ``nanovllm_voxcpm/models/voxcpm2/engine.py``:
 
         - The runner returns ``latents`` (one patch), ``stop_flag``, and a decoded
           waveform chunk ``waveforms``.

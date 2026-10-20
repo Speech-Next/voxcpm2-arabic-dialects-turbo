@@ -575,10 +575,10 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
         if n > 2_000_000 or (n > 20_000 and not deferred and n_waiting() == 0):  # never unbounded under load
             gc.collect(1)
 
-    # NANOVLLM_BUSY_POLL_S=s: wait for requests spinning (not blocked) for s seconds after the last activity. The
-    # host's cpufreq governor clocks an idle core down: the same host work ran 3.6x slower after 0.5 s idle, so a
-    # burst's registration and first step's host work ran at the low clock.
-    busy_poll_s = float(os.environ.get("NANOVLLM_BUSY_POLL_S", "0") or 0)
+    # NANOVLLM_BUSY_POLL_S=s (default 30, 0: off): wait for requests spinning (not blocked) for s seconds after the
+    # last activity. The host's cpufreq governor clocks an idle core down: the same host work ran 3.6x slower after
+    # 0.5 s idle, so a burst's registration and first step's host work ran at the low clock.
+    busy_poll_s = float(os.environ.get("NANOVLLM_BUSY_POLL_S", "30") or 0)
     last_active = [time.perf_counter()]
 
     def wait_cmd():
@@ -713,9 +713,10 @@ class _AudioRing:
 
 
 _BRIDGE_POLL_S = float(os.environ.get("NANOVLLM_BRIDGE_POLL_S", "0.1"))  # idle wake-up of the receiving thread
-# NANOVLLM_BUSY_POLL_S=s: the client's event loop does not block for s seconds after its last request or engine message
-# (the engine's main loop spins the same way): a burst's submission and its first audio's dispatch run at full clock
-_BUSY_POLL_S = float(os.environ.get("NANOVLLM_BUSY_POLL_S", "0") or 0)
+# NANOVLLM_BUSY_POLL_S=s (default 30): the client's event loop does not block for s seconds after its last request or
+# engine message (the engine's main loop spins the same way): a burst's submission and its first audio's dispatch run
+# at full clock
+_BUSY_POLL_S = float(os.environ.get("NANOVLLM_BUSY_POLL_S", "30") or 0)
 
 
 def _channel(ctx):

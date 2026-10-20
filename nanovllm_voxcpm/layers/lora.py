@@ -69,12 +69,6 @@ class _LoRALayerBase(nn.Module):
         self._lora_base_scaling_values = [0.0 for _ in range(max_loras)]
         self._effective_lora_rank_values = [0 for _ in range(max_loras)]
 
-    def _active_rank(self, slot_id: int) -> int:
-        return self._effective_lora_rank_values[slot_id]
-
-    def _slot_scaling(self, slot_id: int) -> float:
-        return self._lora_scaling_values[slot_id]
-
     def _resolve_token_slots(self, x_flat: torch.Tensor) -> torch.Tensor | None:
         if not self.supports_lora:
             return None
@@ -138,35 +132,6 @@ class _LoRALayerBase(nn.Module):
                 return False
         return True
 
-    def _get_grouped_token_indices(self, token_to_slot: torch.Tensor, slot_id: int, context) -> torch.Tensor:
-        if (
-            context.active_slot_ids is not None
-            and context.slot_start_offsets is not None
-            and context.token_indices_sorted_by_slot is not None
-            and not context.active_slot_ids.is_cuda
-        ):
-            active_slot_ids = context.active_slot_ids.to(dtype=torch.int64)
-            matches = torch.nonzero(active_slot_ids == slot_id, as_tuple=False).flatten()
-            if matches.numel() > 0:
-                group_idx = int(matches[0].item())
-                start = int(context.slot_start_offsets[group_idx].item())
-                end = int(context.slot_start_offsets[group_idx + 1].item())
-                return context.token_indices_sorted_by_slot[start:end].to(
-                    device=token_to_slot.device, dtype=torch.int64
-                )
-        if _is_cuda_graph_capture():
-            return torch.nonzero(token_to_slot == slot_id, as_tuple=False).flatten()
-        return torch.nonzero(token_to_slot == slot_id, as_tuple=False).flatten()
-
-    def _get_active_slot_ids(self, token_to_slot: torch.Tensor, context) -> list[int]:
-        if context.active_slot_ids is not None and not context.active_slot_ids.is_cuda:
-            return context.active_slot_ids.to(dtype=torch.int64).tolist()
-        if _is_cuda_graph_capture():
-            return list(range(self.max_loras))
-        if context.active_slot_ids is not None:
-            return context.active_slot_ids.to(device=token_to_slot.device, dtype=torch.int64).tolist()
-        return torch.unique(token_to_slot[token_to_slot >= 0], sorted=True).tolist()
-
     def _validate_effective_rank(self, effective_rank: int) -> None:
         if effective_rank < 0 or effective_rank > self.max_lora_rank:
             raise ValueError(f"effective_rank={effective_rank} exceeds max_lora_rank={self.max_lora_rank}")
@@ -224,9 +189,6 @@ class _LoRALayerBase(nn.Module):
         effective_rank: int,
         scaling: float,
     ) -> None:
-        raise NotImplementedError
-
-    def reset_lora_parameters(self):
         raise NotImplementedError
 
     def _clear_slot_metadata(self, slot_id: int) -> None:
@@ -326,16 +288,6 @@ class LoRAQKVParallelLinear(_LoRALayerBase):
             param.data[0, :, : loaded_weight.size(1)].copy_(loaded_weight.chunk(self.tp_size, 0)[self.tp_rank])
 
         return loader
-
-    def load_lora_A(self, loaded_weight: torch.Tensor, target: str):
-        if target not in self.target_to_index:
-            return
-        self._validate_effective_rank(loaded_weight.size(0))
-        target_idx = self.target_to_index[target]
-        self.lora_A.data[target_idx, 0].zero_()
-        self.lora_A.data[target_idx, 0, : loaded_weight.size(0)].copy_(loaded_weight)
-        self.effective_lora_rank[0] = loaded_weight.size(0)
-        self._effective_lora_rank_values[0] = loaded_weight.size(0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         qkv = F.linear(x, self.weight, self.bias)
@@ -456,13 +408,6 @@ class LoRAQKVParallelLinear(_LoRALayerBase):
                     f"Target '{target}' rank dim {target_b.size(1)} is smaller than effective_rank={effective_rank}"
                 )
 
-    def reset_lora_parameters(self):
-        if not self.supports_lora:
-            return
-        self.lora_A.data.zero_()
-        for target in self.lora_targets:
-            getattr(self, f"lora_B_{target}").data.zero_()
-
     def clear_slot_lora(self, slot_id: int) -> None:
         if not self.supports_lora:
             return
@@ -540,16 +485,6 @@ class LoRAMergedColumnParallelLinear(_LoRALayerBase):
 
         return loader
 
-    def load_lora_A(self, loaded_weight: torch.Tensor, target_idx: int):
-        if target_idx not in self.target_to_index:
-            return
-        self._validate_effective_rank(loaded_weight.size(0))
-        fused_idx = self.target_to_index[target_idx]
-        self.lora_A.data[fused_idx, 0].zero_()
-        self.lora_A.data[fused_idx, 0, : loaded_weight.size(0)].copy_(loaded_weight)
-        self.effective_lora_rank[0] = loaded_weight.size(0)
-        self._effective_lora_rank_values[0] = loaded_weight.size(0)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         result = F.linear(x, self.weight, self.bias)
         x_flat, original_shape = _flatten_tokens(x)
@@ -626,13 +561,6 @@ class LoRAMergedColumnParallelLinear(_LoRALayerBase):
         self._effective_lora_rank_values[slot_id] = effective_rank
         self._lora_scaling_values[slot_id] = scaling
         self._lora_base_scaling_values[slot_id] = scaling
-
-    def reset_lora_parameters(self):
-        if not self.supports_lora:
-            return
-        self.lora_A.data.zero_()
-        for target_idx in self.lora_targets:
-            getattr(self, f"lora_B_{target_idx}").data.zero_()
 
     def clear_slot_lora(self, slot_id: int) -> None:
         if not self.supports_lora:
@@ -772,11 +700,6 @@ class LoRARowParallelLinear(_LoRALayerBase):
         self._lora_scaling_values[slot_id] = scaling
         self._lora_base_scaling_values[slot_id] = scaling
 
-    def reset_lora_parameters(self):
-        if self.supports_lora:
-            self.lora_A.data.zero_()
-            self.lora_B.data.zero_()
-
     def clear_slot_lora(self, slot_id: int) -> None:
         if not self.supports_lora:
             return
@@ -878,11 +801,6 @@ class LoRALinear(_LoRALayerBase):
         self._effective_lora_rank_values[slot_id] = effective_rank
         self._lora_scaling_values[slot_id] = scaling
         self._lora_base_scaling_values[slot_id] = scaling
-
-    def reset_lora_parameters(self):
-        if self.supports_lora:
-            self.lora_A.data.zero_()
-            self.lora_B.data.zero_()
 
     def clear_slot_lora(self, slot_id: int) -> None:
         if not self.supports_lora:

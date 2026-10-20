@@ -420,11 +420,6 @@ def get_backend() -> LoRABackend:
     return _PROBED_BACKEND
 
 
-def set_backend_for_testing(backend: LoRABackend | None) -> None:
-    global _BACKEND_OVERRIDE
-    _BACKEND_OVERRIDE = backend
-
-
 def get_availability() -> LoRAAvailability:
     return get_backend().availability()
 

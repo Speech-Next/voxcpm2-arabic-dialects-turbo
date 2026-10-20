@@ -58,7 +58,7 @@ Concrete model families subclass :class:`BaseModelRunner` and implement:
 
 Concrete example: VoxCPM
 ------------------------
-``nanovllm_voxcpm/models/voxcpm/runner.py`` shows a typical implementation:
+``nanovllm_voxcpm/models/voxcpm2/runner.py`` shows a typical implementation:
 
 - Prefill: the engine slices away ``num_cached_tokens`` and sends the remaining
   prompt segment (text tokens + audio features + masks) to the runner.
@@ -159,10 +159,6 @@ class RunnerTask(Generic[PlayloadType]):
     @property
     def num_blocks(self):
         return (self.seq_length + self.block_size - 1) // self.block_size
-
-    @property
-    def num_cached_blocks(self):
-        return self.num_cached_tokens // self.block_size
 
     @property
     def last_block_num_tokens(self):
@@ -540,9 +536,6 @@ class BaseModelRunner:
 
     def lora_on_sequence_enqueued(self, adapter_id: int | None) -> None:
         self.lora_runtime.on_sequence_enqueued(adapter_id)
-
-    def lora_on_sequence_started(self, adapter_id: int | None) -> None:
-        self.lora_runtime.on_sequence_started(adapter_id)
 
     def lora_on_sequences_started(self, adapter_ids: list[int | None]) -> None:
         for adapter_id in adapter_ids:

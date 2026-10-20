@@ -39,8 +39,7 @@ table uses are loaded.
 Cost (one A10, int8, 600 KV blocks): the speed of the unrouted engine and less memory than it (5 adapters instead
 of 11, plus teacher-v3's merged MLP weights, 1 GB; README). In int8 the tagged requests run the merged int8 weights
 at every batch size, as the adapters do; SmoothQuant statistics are the base model's (teacher-v3's own, max-combined
-with them, changed nothing on #2). A 2:4 sparse FFN (sparse24) cannot take the tagged adapter's MLP LoRA: the engine
-refuses to start.
+with them, changed nothing on #2).
 """
 
 from __future__ import annotations

@@ -129,14 +129,6 @@ def build_lora_context_from_token_to_slot(
     )
 
 
-def set_lora_context_from_token_to_slot(
-    token_to_slot: torch.Tensor | None,
-    *,
-    domain: str = LM_LORA_DOMAIN,
-) -> None:
-    set_lora_context(build_lora_context_from_token_to_slot(token_to_slot), domain=domain)
-
-
 def set_lora_context(
     lora_context: LoRAContext,
     *,

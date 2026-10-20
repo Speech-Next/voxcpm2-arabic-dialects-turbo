@@ -17,7 +17,7 @@ except Exception:
     try:
         import importlib.metadata
 
-        __version__ = importlib.metadata.version("nano-vllm-voxcpm")
+        __version__ = importlib.metadata.version("voxcpm2-arabic-dialects-turbo")
     except Exception:
         __version__ = "0.0.0"
 
