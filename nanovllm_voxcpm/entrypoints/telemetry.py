@@ -82,6 +82,15 @@ class Gauge:
         yield f"{self.name} {_num(self.read())}"
 
 
+class ReadCounter(Gauge):
+    """A counter kept elsewhere (e.g. in the engine's process), read when scraped."""
+
+    def lines(self) -> Iterator[str]:
+        yield f"# HELP {self.name} {self.help}"
+        yield f"# TYPE {self.name} counter"
+        yield f"{self.name} {_num(self.read())}"
+
+
 class Histogram:
     def __init__(self, name: str, help: str, buckets: tuple[float, ...]):
         self.name, self.help, self.buckets = name, help, tuple(sorted(buckets))
@@ -117,6 +126,19 @@ class Metrics:
 
     def render(self) -> str:
         return "\n".join(line for s in self.series for line in s.lines()) + "\n"
+
+
+def add_audio_cache(metrics: Metrics, stats: Callable[[], dict | None]) -> None:
+    """The audio cache's series (--audio-cache-mb): ``stats()`` its AudioCache.stats() (None: none yet, 0)."""
+
+    def read(key: str) -> Callable[[], float]:
+        return lambda: float((stats() or {}).get(key, 0))
+
+    metrics.add(ReadCounter("voxcpm_audio_cache_hits_total", "sentences played from the audio cache", read("hits")))
+    metrics.add(ReadCounter("voxcpm_audio_cache_misses_total", "sentences generated (not in the audio cache)",
+                            read("misses")))
+    metrics.add(Gauge("voxcpm_audio_cache_bytes", "audio kept in the audio cache, bytes", read("bytes")))
+    metrics.add(Gauge("voxcpm_audio_cache_entries", "sentences kept in the audio cache", read("entries")))
 
 
 class ServerMetrics(Metrics):
