@@ -3,6 +3,8 @@ of the resolved dialect (aliases, adapters, --default-lora), the empty check aft
 transcripts read like target text."""
 
 import asyncio
+import contextlib
+import io
 import json
 from types import SimpleNamespace
 
@@ -101,32 +103,62 @@ def server_args(model, **kw):
     args = dict(model=str(model), dit=None, dit_cache=None, head_tokens=8, kv_blocks=0, lora_dir=None, lora=[],
                 default_lora=None, max_lora_rank=None, inference_timesteps=10, max_num_seqs=8, max_model_len=2048,
                 max_num_batched_tokens=2048, gpu_memory_utilization=0.5, voice_dir=None, voices=None,
-                served_model_name="voxcpm2", split_max_chars=200, max_tokens=600, no_route=True, tagged_model=None)
+                served_model_name="voxcpm2", split_max_chars=200, max_tokens=600, no_route=True, tagged_model=None,
+                host="127.0.0.1", port=8092, api_key=None, max_streams=0, max_input_chars=4096, max_voice_mb=10.0,
+                max_voice_seconds=30.0)
     return SimpleNamespace(**{**args, **kw})
 
 
-async def serve(asgi, requests: list[dict]) -> list[tuple[int, bytes]]:
-    """Start the app's lifespan, POST each request to /v1/audio/speech, shut down."""
+@contextlib.asynccontextmanager
+async def running(asgi):
+    """The app between its lifespan's startup and shutdown."""
     inbox, outbox = asyncio.Queue(), asyncio.Queue()
     await inbox.put({"type": "lifespan.startup"})
     life = asyncio.ensure_future(asgi({"type": "lifespan", "asgi": {"version": "3.0"}, "state": {}}, inbox.get,
                                       outbox.put))
     msg = await outbox.get()
     assert msg["type"] == "lifespan.startup.complete", msg
-    out = []
-    for req in requests:
-        sent = []
+    try:
+        yield
+    finally:
+        await inbox.put({"type": "lifespan.shutdown"})
+        await life
 
-        async def receive(body=json.dumps(req).encode()):
+
+async def request(asgi, method: str, path: str, body: bytes = b"", headers=(), content_type=b"application/json",
+                  on_send=None) -> tuple[int, dict, bytes]:
+    """(status, headers, body) of one request; receive() as an ASGI server's: the body, then (only) the
+    disconnect, once the response is done or ``on_send(message, gone)`` sets ``gone``."""
+    sent, gone, first = [], asyncio.Event(), [True]
+
+    async def receive():
+        if first[0]:
+            first[0] = False
             return {"type": "http.request", "body": body, "more_body": False}
+        await gone.wait()
+        return {"type": "http.disconnect"}
 
-        async def send(m):
-            sent.append(m)
+    async def send(m):
+        sent.append(m)
+        if on_send is not None:
+            on_send(m, gone)
 
-        await asgi({"type": "http", "method": "POST", "path": "/v1/audio/speech", "headers": []}, receive, send)
-        out.append((sent[0]["status"], b"".join(m.get("body", b"") for m in sent[1:])))
-    await inbox.put({"type": "lifespan.shutdown"})
-    await life
+    scope = {"type": "http", "method": method, "path": path, "raw_path": path.encode(), "query_string": b"",
+             "headers": [(b"content-type", content_type), *headers], "http_version": "1.1", "scheme": "http",
+             "server": ("127.0.0.1", 8092), "client": ("127.0.0.1", 50000), "root_path": "", "asgi": {"version": "3.0"}}
+    await asgi(scope, receive, send)
+    gone.set()
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    return start["status"], dict(start["headers"]), b"".join(m.get("body", b"") for m in sent[1:])
+
+
+async def serve(asgi, requests: list[dict]) -> list[tuple[int, bytes]]:
+    """Start the app's lifespan, POST each request to /v1/audio/speech, shut down."""
+    out = []
+    async with running(asgi):
+        for req in requests:
+            status, _, body = await request(asgi, "POST", "/v1/audio/speech", json.dumps(req).encode())
+            out.append((status, body))
     return out
 
 
@@ -172,3 +204,174 @@ def test_server_tagged_model_voice_transcript(server, tmp_path):
     assert engine.voices["v"] == "عمري خمسة وعشرين سنة"
     assert engine.voices["v@<msa>"] == "<msa>عمري خمسة وعشرين سنة"
     assert "<msa>الساعة تسعة وخمس دقائق" in engine.targets
+
+
+# --- production: API key, limits, busy, client disconnects, engine errors and death ---
+
+
+class SlowEngine(FakeEngine):
+    """50 chunks, 10 ms apart; counts the requests closed before their end."""
+
+    closed_early = 0
+
+    async def generate(self, target_text, **kw):
+        self.targets.append(target_text)
+        try:
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                yield np.zeros(4, dtype=np.int16)
+        except BaseException:
+            type(self).closed_early += 1
+            raise
+
+
+class RejectingEngine(FakeEngine):
+    async def generate(self, target_text, **kw):  # (as AsyncVoxCPM2Server: the engine's ValueError as itself)
+        if target_text == "hello":  # (not the start-up warm-up's)
+            raise ValueError("Request may exceed max_model_len")
+        yield np.zeros(4, dtype=np.int16)
+
+
+class DyingEngine(FakeEngine):
+    alive = True
+
+    async def wait_dead(self):
+        await asyncio.sleep(0.05)
+        self.alive = False
+
+
+def speech_body(**kw) -> bytes:
+    return json.dumps({"input": "hello", **kw}).encode()
+
+
+def test_api_key(server, tmp_path):
+    asgi = server.build_app(server_args(tmp_path, api_key="k"))
+
+    async def main():
+        async with running(asgi):
+            return [(await request(asgi, "POST", "/v1/audio/speech", speech_body(), headers=h))[0] for h in
+                    ((), [(b"authorization", b"Bearer wrong")], [(b"authorization", b"Bearer k")])] + [
+                (await request(asgi, "GET", "/health"))[0], (await request(asgi, "GET", "/v1/models"))[0]]
+
+    assert asyncio.run(main()) == [401, 401, 200, 200, 401]
+
+
+def test_limits(server, tmp_path):
+    asgi = server.build_app(server_args(tmp_path, max_input_chars=10))
+    out = run(serve(asgi, [{"input": "x" * 11}, {"input": "hello", "cfg_value": float("nan")},
+                           {"input": "hello", "cfg_value": 11}, {"input": "hello", "max_tokens": 0},
+                           {"input": "hello", "cfg_value": 3.0, "max_tokens": 5}]))
+    assert [status for status, _ in out] == [400, 422, 422, 422, 200]
+    assert b"at most 10 characters" in out[0][1]
+
+
+def test_engine_value_error_is_a_400(server, monkeypatch, tmp_path):
+    monkeypatch.setattr(nanovllm_voxcpm, "VoxCPM", RejectingEngine)
+    out = run(serve(server.build_app(server_args(tmp_path)), [{"input": "hello"}]))
+    assert out[0][0] == 400 and b"max_model_len" in out[0][1]
+
+
+def test_busy_beyond_max_streams(server, monkeypatch, tmp_path):
+    monkeypatch.setattr(nanovllm_voxcpm, "VoxCPM", SlowEngine)
+    asgi = server.build_app(server_args(tmp_path, max_streams=1))
+
+    async def main():
+        async with running(asgi):
+            first = asyncio.ensure_future(request(asgi, "POST", "/v1/audio/speech", speech_body()))
+            await asyncio.sleep(0.05)
+            busy = await request(asgi, "POST", "/v1/audio/speech", speech_body())
+            return (await first)[0], busy
+
+    status, (busy_status, headers, body) = asyncio.run(main())
+    assert status == 200 and busy_status == 503 and headers[b"retry-after"] == b"1" and b"busy" in body
+
+
+def test_a_client_gone_ends_its_engine_request(server, monkeypatch, tmp_path):
+    # uvicorn's send() returns quietly once the client is gone: only the disconnect stops the generation
+    monkeypatch.setattr(nanovllm_voxcpm, "VoxCPM", SlowEngine)
+    SlowEngine.closed_early = 0
+    asgi = server.build_app(server_args(tmp_path))
+
+    def leave_after_two_chunks(m, gone):
+        if m.get("more_body") and m.get("body"):
+            leave_after_two_chunks.n += 1
+            if leave_after_two_chunks.n == 2:
+                gone.set()
+
+    leave_after_two_chunks.n = 0
+
+    async def main():
+        async with running(asgi):
+            await request(asgi, "POST", "/v1/audio/speech", speech_body(), on_send=leave_after_two_chunks)
+            await asyncio.sleep(0.05)
+
+    asyncio.run(main())
+    assert SlowEngine.closed_early == 1
+    assert leave_after_two_chunks.n < 10
+
+
+def test_engine_death_stops_the_server(server, monkeypatch, tmp_path):
+    monkeypatch.setattr(nanovllm_voxcpm, "VoxCPM", DyingEngine)
+    asgi = server.build_app(server_args(tmp_path))
+    stopped = []
+    asgi.state["on_engine_dead"] = lambda: stopped.append(True)
+
+    async def main():
+        async with running(asgi):
+            ok = (await request(asgi, "GET", "/health"))[0]
+            await asyncio.sleep(0.1)
+            return ok, (await request(asgi, "GET", "/health"))[0], (await request(asgi, "POST", "/v1/audio/speech",
+                                                                                   speech_body()))[0]
+
+    assert asyncio.run(main()) == (200, 503, 503)
+    assert stopped == [True] and asgi.state["dead"]
+
+
+def multipart(fields: dict, files: dict) -> tuple[bytes, bytes]:
+    out = []
+    for k, v in fields.items():
+        out.append(f'--b0undary\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+    for k, (name, data) in files.items():
+        out.append(f'--b0undary\r\nContent-Disposition: form-data; name="{k}"; filename="{name}"\r\n'
+                   f"Content-Type: application/octet-stream\r\n\r\n".encode() + data + b"\r\n")
+    return b"".join(out) + b"--b0undary--\r\n", b"multipart/form-data; boundary=b0undary"
+
+
+def wav(seconds: float, sr: int = 24000) -> bytes:
+    import soundfile as sf
+
+    buf = io.BytesIO()
+    t = np.arange(int(seconds * sr)) / sr
+    sf.write(buf, (0.3 * np.sin(2 * np.pi * 220 * t)).astype(np.float32), sr, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def test_voice_upload_limits(server, monkeypatch, tmp_path):
+    pytest.importorskip("multipart")
+    import soundfile as sf
+
+    clips = []
+
+    class Engine(FakeEngine):
+        async def encode_latents(self, audio, audio_format):
+            clips.append((audio, audio_format))
+            return b"latents"
+
+    monkeypatch.setattr(nanovllm_voxcpm, "VoxCPM", Engine)
+    asgi = server.build_app(server_args(tmp_path, max_voice_mb=1.0))
+
+    async def upload(name, data):
+        body, ctype = multipart({"name": name}, {"audio_sample": ("clip.wav", data)})
+        return await request(asgi, "POST", "/v1/audio/voices", body, content_type=ctype)
+
+    async def main():
+        async with running(asgi):
+            return [await upload(n, d) for n, d in (("ok", wav(2.0)), ("noise", b"not audio" * 100),
+                                                     ("long", wav(31.0, 8000)), ("big", wav(25.0)), ("ok", wav(2.0)))]
+
+    out = asyncio.run(main())
+    assert [status for status, _, _ in out] == [200, 400, 400, 413, 409]
+    assert b"at most 30 s" in out[2][2]
+    audio, fmt = clips[-1]  # (startup's warm-up voice first): decoded here, 16 kHz float WAV for the engine
+    info = sf.info(io.BytesIO(audio))
+    assert fmt == "wav" and info.samplerate == 16000 and info.subtype == "FLOAT" and abs(info.duration - 2.0) < 0.01

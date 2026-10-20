@@ -163,6 +163,11 @@ class Scheduler:
             i += 1
         self.waiting.insert(i, seq)
 
+    def is_admitted(self, seq_id: str) -> bool:
+        """``seq_id`` is admitted to the next prefill step ahead of it (admit), its KV not computed yet."""
+        seq = self._id_to_seq.get(seq_id) if self._admitted else None
+        return seq is not None and any(s is seq for s in self._admitted)
+
     def cancel(self, seq_id: str):
         try:
             seq = self._id_to_seq.pop(seq_id)

@@ -163,6 +163,7 @@ class VoxCPM2Engine(LLMEngineBase):
     _pretok_cache: dict | None = None
     _tag_remap: dict = {}  # (instances built without __init__, e.g. in tests: no tagged adapters)
     tag_rows = _tag_rows_used = 0
+    vocab_size = 1 << 62  # (instances built without __init__: any text id is read)
 
     def __init__(self, config: Config[VoxCPM2Config]):
         self.n_decode_pad_frames = 12
@@ -500,7 +501,10 @@ class VoxCPM2Engine(LLMEngineBase):
             seq.custom_payload.feat_keys.append(0)  # generated patches are not LocEnc-cached
         if seq.custom_payload.seed is not None and seq.custom_payload.seed >= 0:
             seq.custom_payload.seed_step += 1
-        seq.custom_payload.generated_waveforms.append(waveforms)
+        waves = seq.custom_payload.generated_waveforms
+        if waves:  # only the last patch's audio is read (the server streams it): each earlier one, a row of its
+            waves[-1] = None  # step's page-locked buffer, kept that whole buffer alive for as long as the stream
+        waves.append(waveforms)
         payload = seq.custom_payload
         if payload.chain is not None or (self.lead_silence_patches >= 0 and payload.lead_silent >= 0):
             silent = outputs.get("patch_silent")  # (else the whole patch's audio, or the streamed one)
@@ -607,6 +611,7 @@ class VoxCPM2Engine(LLMEngineBase):
                 if voice is None or entry is not None:  # (an unknown voice: the head's add_request says so)
                     # the whole request must fit now: its continuation is built only after the head's patches
                     try:
+                        self._check_ids(full_ids)
                         self._check_length(
                             self._prompt_len(full_ids, prompt_latents, ref_audio_latents, entry, clone_mode),
                             max_generate_length,
@@ -677,6 +682,7 @@ class VoxCPM2Engine(LLMEngineBase):
 
         if text_tokens is None:
             text_tokens = self._text_ids(prompt_text, target_text)
+        self._check_ids(text_tokens)
         remap = self._tag_remap.get(lora_name) if lora_name is not None and self._tag_remap else None
         if remap:  # a tagged adapter's request: its tags read their trained rows
             text_tokens = [remap.get(t, t) for t in text_tokens]
@@ -755,6 +761,16 @@ class VoxCPM2Engine(LLMEngineBase):
         seq.has_stream = resume  # a continuation carries on the head's stream (VAE state): ahead of new requests
         self.add_sequence(seq, front=resume)
         return seq
+
+    def _check_ids(self, ids) -> None:
+        """Text ids past the model's embedding rows are the request's fault: the tokenizer's added special tokens
+        beyond the model's vocabulary (<|fim_middle|>, <|fim_suffix|>) read from the text as typed. Their embedding
+        lookup was a device-side assert, which ended the engine process and every stream with it."""
+        if ids and max(ids) >= self.vocab_size:
+            bad = sorted({i for i in ids if i >= self.vocab_size})
+            convert = getattr(getattr(self.tokenizer, "tokenizer", None), "convert_ids_to_tokens", None)
+            names = convert(bad) if convert is not None else bad
+            raise ValueError(f"the text holds special tokens the model cannot read: {', '.join(map(str, names))}")
 
     def _check_length(self, prompt_len: int, max_generate_length: int) -> None:
         total_len_upper_bound = prompt_len + max_generate_length
@@ -1065,7 +1081,8 @@ class VoxCPM2Engine(LLMEngineBase):
         # prompt of nothing but silence was continued as silence, never reaching the stop (measured: 400 silent
         # patches). They were streamed already; the continuation starts after them.
         prior = chain.get("prior")  # an intermediate stage's: the earlier stages' prompt audio (None: silence)
-        silent = payload.patch_silent or [_is_silent(w) for w in payload.generated_waveforms[-n:]]
+        # (None: a patch's audio dropped once a later one came, postprocess_seq)
+        silent = payload.patch_silent or [w is not None and _is_silent(w) for w in payload.generated_waveforms[-n:]]
         k = 0
         while prior is None and k < n and silent[-n + k]:
             k += 1

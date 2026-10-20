@@ -13,7 +13,7 @@ import pytest
 websockets = pytest.importorskip("websockets")
 pytest.importorskip("soxr")
 
-from nanovllm_voxcpm.entrypoints.ws_server import EngineLink, Server, local_feed, serve_engine  # noqa: E402
+from nanovllm_voxcpm.entrypoints.ws_server import PATH, EngineLink, Server, local_feed, serve_engine  # noqa: E402
 
 PATCH = 7680  # 160 ms at 48 kHz
 
@@ -203,3 +203,124 @@ def test_through_the_two_processes_link():
     msgs = asyncio.run(main())
     assert sum(len(m) for m in msgs if isinstance(m, bytes)) == 6 * PATCH // 3 * 2
     assert cancelled == [True]
+
+
+# --- production: API key and /health at the handshake, dialects, control values, limits, errors per utterance ---
+
+
+class PickyTTS(FakeTTS):
+    """Fails the text "bad" (as an engine's ValueError would), slow otherwise (busy)."""
+
+    async def stream(self, text, dialect=None, voice=None, **kw):
+        if text == "bad":
+            raise ValueError("Request may exceed max_model_len")
+        async for c in super().stream(text, dialect, voice, **kw):
+            yield c
+
+
+async def exchange(srv, query="chunk_size=4096", texts=(), control=None, headers=None, path=PATH):
+    """The messages a client gets (audio as its byte count) for ``texts``, one at a time."""
+    from websockets.asyncio.client import connect
+    from websockets.asyncio.server import serve
+
+    async with serve(srv.handler, "127.0.0.1", 0, process_request=srv.process_request) as s:
+        port = s.sockets[0].getsockname()[1]
+        out = []
+        async with connect(f"ws://127.0.0.1:{port}{path}?{query}", additional_headers=headers) as ws:
+            if control is not None:
+                await ws.send(json.dumps(control))
+                out.append(json.loads(await ws.recv()))
+            for t in texts:
+                await ws.send(t)
+                while True:
+                    m = await ws.recv()
+                    if isinstance(m, bytes):
+                        out.append(len(m))
+                        continue
+                    out.append(json.loads(m))
+                    if out[-1]["type"] in ("end_of_audio", "error"):
+                        break
+        return out
+
+
+
+def kinds(msgs):
+    return [m["type"] for m in msgs if isinstance(m, dict)]
+
+
+def test_api_key_and_health():
+    import urllib.request
+
+    from websockets.exceptions import InvalidStatus
+
+    tts = FakeTTS(patches=1)
+    srv = Server(set(tts.voices), local_feed(tts), args(api_key="k"))
+
+    async def main():
+        from websockets.asyncio.server import serve
+
+        out = []
+        for headers, query in ((None, "chunk_size=4096"), ({"Authorization": "Bearer wrong"}, "chunk_size=4096"),
+                               ({"Authorization": "Bearer k"}, "chunk_size=4096"), (None, "chunk_size=4096&api_key=k")):
+            try:
+                out.append(kinds(await exchange(srv, query, ["x"], headers=headers)))
+            except InvalidStatus as e:
+                out.append(e.response.status_code)
+        async with serve(srv.handler, "127.0.0.1", 0, process_request=srv.process_request) as s:
+            url = f"http://127.0.0.1:{s.sockets[0].getsockname()[1]}/health"
+            health = await asyncio.to_thread(lambda: urllib.request.urlopen(url, timeout=5).status)
+        return out, health
+
+    out, health = asyncio.run(main())
+    assert out == [401, 401, ["start", "end_of_audio"], ["start", "end_of_audio"]] and health == 200
+
+
+def test_unknown_dialect_is_refused_at_the_handshake():
+    tts = FakeTTS(patches=1)
+    srv = Server(set(tts.voices), local_feed(tts), args(), dialects={"egyptian", "najdi"})
+    from websockets.asyncio.client import connect
+    from websockets.asyncio.server import serve
+
+    async def main():
+        async with serve(srv.handler, "127.0.0.1", 0) as s:
+            port = s.sockets[0].getsockname()[1]
+            async with connect(f"ws://127.0.0.1:{port}{PATH}?dialect=klingon") as ws:
+                return json.loads(await ws.recv())
+
+    err = asyncio.run(main())
+    assert err["type"] == "error" and "klingon" in err["message"] and "najdi" in err["message"]
+
+
+def test_control_values_are_checked():
+    tts = FakeTTS(patches=1)
+    srv = Server(set(tts.voices), local_feed(tts), args())
+    for control in ({"type": "control", "cfg_value": "abc"}, {"type": "control", "cfg_value": float("nan")},
+                    {"type": "control", "cfg_value": 1e9}, {"type": "control", "voice": ["default"]}):
+        msgs = asyncio.run(exchange(srv, texts=["x"], control=control))
+        assert kinds(msgs) == ["config_error", "start", "end_of_audio"], control  # (the connection goes on)
+    msgs = asyncio.run(exchange(srv, texts=["x"], control={"type": "control", "cfg_value": 3, "voice": "default"}))
+    assert kinds(msgs)[0] == "config_updated" and tts.calls[-1][3]["cfg_value"] == 3.0
+
+
+def test_an_utterance_error_leaves_the_connection_open():
+    tts = PickyTTS(patches=2)
+    srv = Server(set(tts.voices), local_feed(tts), args(max_text_chars=5))
+    msgs = asyncio.run(exchange(srv, texts=["bad", "x" * 6, "ok"]))
+    errors = [m["message"] for m in msgs if isinstance(m, dict) and m["type"] == "error"]
+    assert errors == ["Request may exceed max_model_len", "text: at most 5 characters (--max-text-chars)"]
+    assert kinds(msgs)[-2:] == ["start", "end_of_audio"]  # "ok" spoken after both errors
+    assert not any("Traceback" in e or "ValueError(" in e for e in errors)
+
+
+def test_busy_beyond_max_streams():
+    tts = FakeTTS(patches=6, burst=1, pause=0.05)
+    srv = Server(set(tts.voices), local_feed(tts), args(max_streams=1))
+
+    async def main():
+        first = asyncio.ensure_future(exchange(srv, texts=["one"]))
+        await asyncio.sleep(0.1)
+        return await exchange(srv, texts=["two"]), await first
+
+    second, first = asyncio.run(main())
+    assert kinds(first) == ["start", "end_of_audio"]
+    assert kinds(second) == ["error"] and "busy" in second[0]["message"]

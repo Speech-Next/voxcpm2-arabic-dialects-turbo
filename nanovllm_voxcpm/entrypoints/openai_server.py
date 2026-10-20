@@ -44,14 +44,24 @@ tag. ``/v1/models`` lists the dialects.
 Arabic input and ref_text are read as the model was trained on them (dialect_tts.read_as: digits, dates, times, amounts
 as words; formal when the request's dialect or adapter, aliases resolved, is msa); hindi_english and text without
 Arabic script stay as they are. ``"normalize": false`` sends the text as written.
+
+In production: ``--api-key`` (or VOXCPM_API_KEY) makes every endpoint but /health ask for ``Authorization: Bearer
+<key>``; ``--max-streams`` answers 503 (Retry-After) beyond that many speech requests at once (one A10: 150);
+``--max-input-chars`` and ``--max-voice-mb`` / ``--max-voice-seconds`` bound a request's input and a voice's clip. A
+speech request whose client disconnects ends its engine request. /health is 503 once the engine process has died, and
+the server then exits with code 1, for its supervisor to start it again.
 """
 
 import argparse
 import asyncio
+import contextlib
+import hmac
 import io
 import json
 import os
 import re
+import signal
+import sys
 import time
 import wave
 from contextlib import asynccontextmanager
@@ -59,7 +69,8 @@ from contextlib import asynccontextmanager
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel, ValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, ValidationError
 
 from nanovllm_voxcpm import warmup
 from nanovllm_voxcpm.dialect_routing import (DEFAULT_ROUTES, DEFAULT_TAGGED_MODEL, TAGGED, TAGGED_ADAPTER,
@@ -69,6 +80,7 @@ from nanovllm_voxcpm.dialect_tts import (DEFAULT_DIT, DEFAULT_MODEL, DialectTags
 
 CLONE_MODES = ("prompt_ref", "ref", "prompt")
 VOICE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # voice names are also file names in --voice-dir
+MAX_JSON_BODY = 1 << 20  # a speech request's body, bytes
 
 # sentence ends: Latin / Arabic-script punctuation followed by whitespace (Arabic ؟ ؛ and the Urdu full stop ۔),
 # CJK punctuation anywhere; clause ends: commas (Arabic ، included)
@@ -147,8 +159,8 @@ class SpeechRequest(BaseModel):
     response_format: str = "pcm"
     clone_mode: str | None = None
     seed: int | None = None
-    cfg_value: float = 2.0
-    max_tokens: int | None = None  # latent patches to generate at most per sentence (160 ms of audio each)
+    cfg_value: float = Field(2.0, ge=0.0, le=10.0)  # (NaN and infinity fail the bounds)
+    max_tokens: int | None = Field(None, ge=1)  # latent patches to generate at most per sentence (160 ms of audio each)
     split: bool = True  # long input: sentence by sentence into one stream
     lora: str | None = None  # a registered LoRA adapter (--lora-dir / --lora)
     dialect: str | None = None  # alias of lora; a tagged model's dialect
@@ -172,7 +184,10 @@ def wav_bytes(pcm: bytes, sample_rate: int) -> bytes:
 
 
 def build_app(args: argparse.Namespace):
-    state: dict = {"voices": {}, "tags": None, "route": None}
+    # active: speech requests in progress (--max-streams); registering: voice names being uploaded; dead: the engine
+    # process died; on_engine_dead: what stops the server then (main: uvicorn's exit)
+    state: dict = {"voices": {}, "tags": None, "route": None, "active": 0, "registering": set(), "dead": False,
+                   "on_engine_dead": lambda: os.kill(os.getpid(), signal.SIGTERM)}
 
     async def warm_up(names: list[str]) -> None:
         """One short generation per voice and clone mode: fills the voice's caches (prefix KV, LocEnc embeddings,
@@ -216,9 +231,33 @@ def build_app(args: argparse.Namespace):
             if state["tags"] is not None:
                 await state["tags"].drop_voice(state["pool"], name)
 
-    async def register(name: str, audio: bytes, audio_format: str, text: str | None, normalize: bool = True) -> dict:
+    def uploaded_clip(audio: bytes) -> bytes:
+        """An uploaded reference clip decoded and resampled here (in a worker thread: in the engine process this
+        held every stream's next step for as long), at most --max-voice-seconds long (its header checked before it
+        is decoded): float32 WAV at the encoder's rate, which the engine reads as it is."""
+        import librosa
+        import soundfile as sf
+
+        sr = state["encoder_rate"]
+        try:
+            seconds = sf.info(io.BytesIO(audio)).duration
+            y, _ = librosa.load(io.BytesIO(audio), sr=sr, mono=True) if seconds <= args.max_voice_seconds else (None, 0)
+        except Exception as e:  # noqa: BLE001 - whatever the decoder says: not a clip it reads
+            raise HTTPException(400, f"audio_sample: not an audio file the server reads ({type(e).__name__})") from e
+        if y is None:
+            raise HTTPException(400, f"audio_sample: {seconds:.1f} s, at most {args.max_voice_seconds:g} s "
+                                     "(--max-voice-seconds)")
+        if not y.size or not np.isfinite(y).all():
+            raise HTTPException(400, "audio_sample: no audio")
+        buf = io.BytesIO()
+        sf.write(buf, y, sr, format="WAV", subtype="FLOAT")
+        return buf.getvalue()
+
+    async def register(name: str, audio: bytes, audio_format: str, text: str | None, normalize: bool = True,
+                       upload: bool = False) -> dict:
         # encoded once and kept inside the engine: a request then sends only the voice name
-        latents = await state["pool"].encode_latents(audio, audio_format)
+        clip, fmt = (await asyncio.to_thread(uploaded_clip, audio), "wav") if upload else (audio, audio_format)
+        latents = await state["pool"].encode_latents(clip, fmt)
         await register_voice(name, latents, text or None, normalize)
         if args.voice_dir:
             save_voice(args.voice_dir, name, latents, text or None, audio, audio_format, normalize)
@@ -287,7 +326,9 @@ def build_app(args: argparse.Namespace):
             await pool.register_lora(name, path)
         state["adapters"] = sorted(adapters)
         state["pool"] = pool
-        state["sample_rate"] = int((await pool.get_model_info())["sample_rate"])
+        info = await pool.get_model_info()
+        state["sample_rate"] = int(info["sample_rate"])
+        state["encoder_rate"] = int(info.get("encoder_sample_rate", 16000))
         if args.voice_dir:  # voices registered in earlier runs: latents are on disk, no re-encoding
             for meta, latents in load_voices(args.voice_dir):
                 norm = meta.get("normalize", True)
@@ -305,19 +346,36 @@ def build_app(args: argparse.Namespace):
                     f"{len(state['tags'].names)} dialects (tagged model), " if state["tags"] else "")
         print(f"[server] ready: {len(state['voices'])} voices, {dialects}{len(state['adapters'])} LoRA adapters, "
               f"sample rate {state['sample_rate']}", flush=True)
+        if not args.api_key:
+            print(f"[server] no --api-key: whoever reaches {args.host}:{args.port} can use every endpoint", flush=True)
         import gc
 
         gc.collect()  # startup objects frozen: no full collection over them while requests stream
         gc.freeze()
+
+        async def watch_engine() -> None:
+            await pool.wait_dead()
+            state["dead"] = True
+            print("[server] the engine process died: shutting down (exit code 1)", flush=True)
+            state["on_engine_dead"]()
+
+        watcher = asyncio.create_task(watch_engine()) if hasattr(pool, "wait_dead") else None
         try:
             yield
         finally:
+            if watcher is not None:
+                watcher.cancel()
             await pool.stop()
 
     app = FastAPI(title="VoxCPM2 (nanovllm-voxcpm-turbo)", lifespan=lifespan)
 
+    def engine_alive() -> bool:
+        return not state["dead"] and getattr(state.get("pool"), "alive", True)
+
     @app.get("/health")
     async def health():
+        if not engine_alive():
+            return JSONResponse({"status": "engine process died"}, status_code=503)
         return {"status": "ok"}
 
     @app.get("/v1/models")
@@ -342,10 +400,17 @@ def build_app(args: argparse.Namespace):
     ):
         if not VOICE_NAME.match(name):
             raise HTTPException(400, "voice name: 1-64 characters from A-Z a-z 0-9 . _ -")
-        if name in state["voices"]:
+        if name in state["voices"] or name in state["registering"]:
             raise HTTPException(409, f"voice '{name}' exists; DELETE /v1/audio/voices/{name} first")
+        limit = int(args.max_voice_mb * (1 << 20))
+        if (audio_sample.size or 0) > limit:
+            raise HTTPException(413, f"audio_sample: at most {args.max_voice_mb:g} MB (--max-voice-mb)")
         audio_format = os.path.splitext(audio_sample.filename or "")[1].lstrip(".") or "wav"
-        return await register(name, await audio_sample.read(), audio_format, ref_text, normalize)
+        state["registering"].add(name)
+        try:
+            return await register(name, await audio_sample.read(), audio_format, ref_text, normalize, upload=True)
+        finally:
+            state["registering"].discard(name)
 
     @app.get("/v1/audio/voices")
     async def list_voices():
@@ -416,8 +481,10 @@ def build_app(args: argparse.Namespace):
 
     async def send_json(send, status: int, obj: dict):
         body = json.dumps(obj).encode()
+        retry = [(b"retry-after", b"1")] if status == 503 else []
         await send({"type": "http.response.start", "status": status,
-                    "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+                    "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
+                                *retry]})
         await send({"type": "http.response.body", "body": body})
 
     def request_dialect(req: SpeechRequest, lk: dict) -> str | None:
@@ -472,56 +539,112 @@ def build_app(args: argparse.Namespace):
         """POST /v1/audio/speech as a bare ASGI handler: with hundreds of simultaneous requests, FastAPI's
         per-request work (dependency resolution, body handling) on the event loop that also drives the engine
         delays when later requests reach the engine; this path reads the body, validates it with pydantic's
-        JSON parser and streams the PCM chunks itself. A failed send (client gone) cancels the request."""
+        JSON parser and streams the PCM chunks itself. The response runs against the client's disconnect, which
+        cancels it and so its engine request: uvicorn's send() returns quietly once the client is gone, and the
+        engine generated the rest of the audio for no one."""
         body = b""
         while True:
             msg = await receive()
+            if msg["type"] == "http.disconnect":
+                return
             body += msg.get("body", b"")
+            if len(body) > MAX_JSON_BODY:
+                return await send_json(send, 413, {"detail": f"request body over {MAX_JSON_BODY} bytes"})
             if not msg.get("more_body"):
                 break
+
+        async def disconnected() -> None:
+            while (await receive())["type"] != "http.disconnect":
+                pass
+
+        job, gone = asyncio.ensure_future(respond(body, send)), asyncio.ensure_future(disconnected())
+        try:
+            await asyncio.wait((job, gone), return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            gone.cancel()
+            if not job.done():
+                job.cancel()  # (the client is gone: closing its generator cancels the engine request)
+            with contextlib.suppress(asyncio.CancelledError):
+                await job
+
+    async def respond(body: bytes, send) -> None:
+        """A speech request's response, once its body is read (speech)."""
         try:
             req = SpeechRequest.model_validate_json(body)
             if req.response_format not in ("pcm", "wav"):
                 raise HTTPException(400, "response_format must be 'pcm' or 'wav'")
+            if len(req.input) > args.max_input_chars:
+                raise HTTPException(400, f"input: at most {args.max_input_chars} characters (--max-input-chars)")
+            if not engine_alive():
+                raise HTTPException(503, "the engine process died; the server restarts")
+            if args.max_streams and state["active"] >= args.max_streams:
+                raise HTTPException(503, f"busy: {state['active']} speech requests in progress (--max-streams)")
+        except ValidationError as e:
+            return await send_json(send, 422, {"detail": e.errors(include_url=False)})
+        except HTTPException as e:
+            return await send_json(send, e.status_code, {"detail": e.detail})
+        state["active"] += 1
+        try:
+            await respond_audio(req, send)
+        finally:
+            state["active"] -= 1
+
+    async def respond_audio(req: SpeechRequest, send) -> None:
+        try:
             gen = request_audio(req)
             try:
                 first = await gen.__anext__()  # errors (e.g. a prompt too long) become HTTP errors
             except StopAsyncIteration:
                 first = None
-            except ValueError as e:
+            except ValueError as e:  # the request's fault, also when the engine says so (too long, ...)
                 raise HTTPException(400, str(e)) from e
-        except ValidationError as e:
-            return await send_json(send, 422, {"detail": e.errors(include_url=False)})
+            except RuntimeError as e:
+                if engine_alive():
+                    raise
+                raise HTTPException(503, "the engine process died; the server restarts") from e
         except HTTPException as e:
             return await send_json(send, e.status_code, {"detail": e.detail})
-        sr = str(state["sample_rate"]).encode()
-        if req.stream and req.response_format == "pcm":
-            await send({"type": "http.response.start", "status": 200,
-                        "headers": [(b"content-type", b"audio/pcm"), (b"x-sample-rate", sr)]})
-            try:
+        try:
+            sr = str(state["sample_rate"]).encode()
+            if req.stream and req.response_format == "pcm":
+                await send({"type": "http.response.start", "status": 200,
+                            "headers": [(b"content-type", b"audio/pcm"), (b"x-sample-rate", sr)]})
                 if first is not None:
                     await send({"type": "http.response.body", "body": pcm16(first), "more_body": True})
                 async for chunk in gen:
                     await send({"type": "http.response.body", "body": pcm16(chunk), "more_body": True})
                 await send({"type": "http.response.body", "body": b"", "more_body": False})
-            finally:
-                await gen.aclose()
-            return
-        chunks = [] if first is None else [pcm16(first)]
-        async for chunk in gen:
-            chunks.append(pcm16(chunk))
-        pcm = b"".join(chunks)
-        out, ctype = (wav_bytes(pcm, int(sr)), b"audio/wav") if req.response_format == "wav" else (pcm, b"audio/pcm")
-        await send({"type": "http.response.start", "status": 200,
-                    "headers": [(b"content-type", ctype), (b"content-length", str(len(out)).encode()),
-                                (b"x-sample-rate", sr)]})
-        await send({"type": "http.response.body", "body": out})
+                return
+            chunks = [] if first is None else [pcm16(first)]
+            async for chunk in gen:
+                chunks.append(pcm16(chunk))
+            pcm = b"".join(chunks)
+            out, ctype = ((wav_bytes(pcm, int(sr)), b"audio/wav") if req.response_format == "wav"
+                          else (pcm, b"audio/pcm"))
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", ctype), (b"content-length", str(len(out)).encode()),
+                                    (b"x-sample-rate", sr)]})
+            await send({"type": "http.response.body", "body": out})
+        finally:
+            await gen.aclose()
+
+    key = f"Bearer {args.api_key}".encode() if args.api_key else None
+
+    def authorized(scope) -> bool:
+        """--api-key: the request's ``Authorization: Bearer <key>`` (/health needs none)."""
+        if key is None or scope["path"] == "/health":
+            return True
+        got = next((v for k, v in scope.get("headers", ()) if k == b"authorization"), b"")
+        return hmac.compare_digest(got, key)
 
     async def asgi(scope, receive, send):
+        if scope["type"] == "http" and not authorized(scope):
+            return await send_json(send, 401, {"detail": "missing or wrong API key (Authorization: Bearer <key>)"})
         if scope["type"] == "http" and scope["method"] == "POST" and scope["path"] == "/v1/audio/speech":
             return await speech(scope, receive, send)
         return await app(scope, receive, send)
 
+    asgi.state = state  # (main: the engine's death ends the server, which then exits non-zero)
     return asgi
 
 
@@ -557,10 +680,23 @@ def main():
     ap.add_argument("--tagged-model", default=DEFAULT_TAGGED_MODEL, help="routing: the tagged model whose LoRA "
                                                                           "serves the routed-away dialects")
     ap.add_argument("--max-lora-rank", type=int, help="LoRA slot rank (default: the largest adapter rank)")
+    ap.add_argument("--api-key", default=os.environ.get("VOXCPM_API_KEY"),
+                    help="every endpoint but /health asks for 'Authorization: Bearer <key>' (default: $VOXCPM_API_KEY; "
+                         "none: open to whoever reaches the port)")
+    ap.add_argument("--max-streams", type=int, default=0, help="speech requests at once; more get 503 with "
+                                                                "Retry-After (0: no limit; one A10: 150)")
+    ap.add_argument("--max-input-chars", type=int, default=4096, help="longest input of a speech request")
+    ap.add_argument("--max-voice-mb", type=float, default=10.0, help="largest uploaded voice clip")
+    ap.add_argument("--max-voice-seconds", type=float, default=30.0, help="longest uploaded voice clip")
     args = ap.parse_args()
     os.environ.setdefault("NANOVLLM_SUBMIT_FLUSH_EVERY", "4")  # requests reach the engine as a steady stream
-    uvicorn.run(build_app(args), host=args.host, port=args.port, loop="uvloop", http="httptools",
-                backlog=4096, timeout_keep_alive=30, log_level="warning")
+    app = build_app(args)
+    server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port, loop="uvloop", http="httptools",
+                                           backlog=4096, timeout_keep_alive=30, log_level="warning"))
+    app.state["on_engine_dead"] = lambda: setattr(server, "should_exit", True)
+    server.run()
+    if app.state["dead"]:  # (exit code 1: a supervisor starts the server again)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

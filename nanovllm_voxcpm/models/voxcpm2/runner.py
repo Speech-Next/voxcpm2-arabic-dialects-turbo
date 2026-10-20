@@ -151,7 +151,7 @@ class VoxCPM2Runner(BaseModelRunner):
 
         torch.set_default_dtype(torch.float32)
         self.vae = AudioVAEV2(config=model_config.audio_vae_config)
-        vae_state_dict = torch.load(os.path.join(model_path, "audiovae.pth"))["state_dict"]
+        vae_state_dict = torch.load(os.path.join(model_path, "audiovae.pth"), weights_only=True)["state_dict"]
         self.vae.load_state_dict(vae_state_dict)
         self._prepare_vae_decoder_for_inference()
         from voxcpm_kernels import SlotStreamingVAEDecoder

@@ -151,7 +151,10 @@ class LLMEngineBase:
         self.scheduler.add(seq, front=front)
 
     def cancel_sequence(self, seq_id: str):
-        if self._step_depth:
+        # mid-step: after the step. Admitted to the next prefill step ahead of it (prepare_prefill): after that step
+        # too, which computes the KV of the full blocks it published at admission; freed before, they stayed in the
+        # prefix cache with that KV never computed, and a later request with the same prefix read them as cached
+        if self._step_depth or self.scheduler.is_admitted(seq_id):
             if self._deferred_cancels is None:
                 self._deferred_cancels = deque()
             self._deferred_cancels.append(seq_id)

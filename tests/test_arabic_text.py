@@ -253,3 +253,11 @@ def test_import_needs_no_engine():
             "assert not {'torch', 'flash_attn', 'numpy'} & set(sys.modules), sorted(sys.modules)")
     env = {**os.environ, "PYTHONPATH": str(ROOT)}
     subprocess.run([sys.executable, "-c", code], check=True, env=env, cwd=ROOT)
+
+
+def test_currency_codes_only_in_ascii_case():
+    # matched case-insensitively with Unicode folding, İLS (U+0130) and KWD with the Kelvin sign were looked up with
+    # .upper() and raised KeyError in the request handler
+    assert normalize("سعر 100 İLS", "colloquial") == "سعر مية İLS"
+    assert normalize("سعر 100 KWD", "colloquial") == "سعر مية KWD"
+    assert normalize("سعر 100 kwd", "colloquial") == "سعر مية دينار"

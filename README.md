@@ -126,6 +126,24 @@ curl http://127.0.0.1:8092/v1/audio/speech -H 'Content-Type: application/json' \
   -d '{"input": "هلا والله", "voice": "ahmed", "dialect": "najdi", "response_format": "wav"}' -o out.wav
 ```
 
+## Production
+
+| | WebSocket server | HTTP server |
+|---|---|---|
+| API key (`--api-key` or `VOXCPM_API_KEY`) | `Authorization: Bearer <key>` or `?api_key=<key>` | `Authorization: Bearer <key>` (all but `/health`) |
+| requests at once (`--max-streams`, one A10: 150) | more get `{"type": "error", "message": "busy: .."}` | more get 503 with `Retry-After` |
+| health | `GET /health` on the same port | `GET /health`, 503 once the engine process died |
+| input | `--max-text-chars` (4096), messages up to 1 MiB, an unknown dialect refused at the handshake | `--max-input-chars` (4096), `cfg_value` 0-10, voice clips up to `--max-voice-mb` (10) and `--max-voice-seconds` (30) |
+| a client that leaves | its engine request ends (pings every `--ping-interval`, 20 s, find dead connections) | its engine request ends |
+| the engine process dies | the server exits with code 1 | the server exits with code 1 |
+
+Run a server under a supervisor that starts it again when it exits (systemd `Restart=always`, Docker
+`--restart unless-stopped`, Kubernetes), and send traffic once `/health` answers (~75 s after start). The engine
+process ends with its server, also when the server is killed (`kill -9`, the OOM killer). Both servers listen on
+127.0.0.1 by default: put them behind a TLS proxy, or listen on 0.0.0.0 only with an API key. After the first
+download, `HF_HUB_OFFLINE=1` keeps a restart on the models already downloaded. Voices registered over HTTP live in
+that server's process; several replicas share them with `--voice-dir` on a shared disk (read at startup).
+
 ## Examples
 
 ```bash
