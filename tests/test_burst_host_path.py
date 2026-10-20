@@ -221,7 +221,6 @@ def _runner(n_adapters=3, max_loras=3, graphs=False):
     r.max_loras, r.max_lora_rank = max_loras, 8
     r.lora_config = SimpleNamespace(enable_dit=True)
     r.patch_size, r.feat_dim = 2, 3
-    r._fast_noise = True
     r.lora_runtime = LoRARuntime(max_loras=max_loras, max_lora_rank=8)
     r._load_lora_slot = lambda slot, payload: None
     r._enc_cache_size = 16
@@ -441,10 +440,10 @@ class _Engine(LLMEngineBase):
         self.ps = []
 
 
-def _config(max_num_seqs=6, blocks=40, block_size=BS, max_tokens=40, prefill_max_seqs=0):
+def _config(max_num_seqs=6, blocks=40, block_size=BS, max_tokens=40):
     return SimpleNamespace(max_num_seqs=max_num_seqs, max_num_batched_tokens=max_tokens, num_kvcache_blocks=blocks,
                            kvcache_block_size=block_size,
-                           model_config=SimpleNamespace(turbo=SimpleNamespace(prefill_max_seqs=prefill_max_seqs)))
+                           model_config=SimpleNamespace(turbo=SimpleNamespace()))
 
 
 def _requests(rng, n):
@@ -787,7 +786,7 @@ def _add_cmd(seq_id, target, prompt=""):
 
 
 def test_the_client_tokenizes_a_batch_with_the_engines_tokenizer():
-    """NANOVLLM_CLIENT_TOKENIZE: the client's ids and offsets are the engine's (its tokenizer, sent with init_ok);
+    """The client's ids and offsets are the engine's (its tokenizer, sent with init_ok);
     CJK texts and other commands are left to the engine, and the engine registers with the client's ids."""
     from tokenizers import Tokenizer
 
@@ -870,7 +869,7 @@ def test_the_models_tokenizer_round_trips_to_the_client():
 
 
 def test_a_bursts_first_flush_is_small():
-    """NANOVLLM_SUBMIT_FLUSH_FIRST: a burst's commands reach the engine in batches of 16, then 48 (the engine starts
+    """A burst's commands reach the engine in batches of 16, then 48 (the engine starts
     registering while the client builds the rest), the last one not marked "more", and the next burst starts with 16
     again."""
     import asyncio
@@ -898,7 +897,7 @@ def test_a_bursts_first_flush_is_small():
 
 
 def test_a_prefill_steps_first_audio_reaches_the_client_as_its_chunks():
-    """NANOVLLM_EMIT_BLOCK: equal chunks travel through the ring as one block; the client hands each stream its own
+    """Equal chunks travel through the ring as one block; the client hands each stream its own
     chunk (the same bytes, in order); chunks that differ, or a single one, keep the per-chunk items."""
     from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, _AudioRing, _block_item
 
@@ -924,8 +923,10 @@ def test_a_prefill_steps_first_audio_reaches_the_client_as_its_chunks():
 # --- 6. the server's admission window ------------------------------------------------------------------------------
 
 
-def _run_main_loop(monkeypatch, feed, env):
-    """server.main_loop on a VoxCPM2 engine with a fake runner; ``feed(put)`` sends commands from a thread."""
+def _run_main_loop(monkeypatch, feed, window):
+    """server.main_loop on a VoxCPM2 engine with a fake runner; ``feed(put)`` sends commands from a thread;
+    ``window``: admission-window constants to override."""
+    import gc
     import nanovllm_voxcpm.models.voxcpm2.server as server
 
     eng = _voxcpm2_engine(max_num_seqs=16)
@@ -954,12 +955,17 @@ def _run_main_loop(monkeypatch, feed, env):
             return eng.is_finished()
 
     monkeypatch.setattr(server, "VoxCPM2ServerImpl", Impl)
-    for k, v in {"NANOVLLM_SHM_AUDIO": "0", "NANOVLLM_GC_FREEZE": "0", "RAYON_NUM_THREADS": "1", **env}.items():
-        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("RAYON_NUM_THREADS", "1")
+    for k, v in window.items():
+        monkeypatch.setattr(server, k, v)
     q_in, q_out = queue.Queue(), queue.Queue()
     t = threading.Thread(target=feed, args=(q_in.put,), daemon=True)
     t.start()
-    server.main_loop(q_in, q_out, (), {})
+    try:
+        server.main_loop(q_in, q_out, (), {})
+    finally:  # (main_loop freezes and disables the garbage collector of its process: this one)
+        gc.unfreeze()
+        gc.enable()
     t.join(1)
     out = []
     while not q_out.empty():
@@ -984,8 +990,7 @@ def test_trickling_requests_are_prepared_in_the_windows_idle_moments(monkeypatch
         time.sleep(0.3)
         put({"id": "stop", "type": "stop", "args": (), "kwargs": {}})
 
-    eng, prepared, out = _run_main_loop(monkeypatch, feed, {"NANOVLLM_QUEUE_GAP_MS": "50",
-                                                             "NANOVLLM_QUEUE_COALESCE_MS": "50"})
+    eng, prepared, out = _run_main_loop(monkeypatch, feed, {"_QUEUE_GAP_MS": 50.0, "_QUEUE_COALESCE_MS": 50.0})
     assert sum(prepared) == 3  # each request admitted in an idle moment of the window
     first, is_prefill, _ = eng.model_runner.runs[0]
     assert is_prefill and [t.seq_id for t in first] == ["s0", "s1", "s2"]  # one head step, as without preparation
@@ -998,7 +1003,7 @@ def test_a_burst_handed_over_at_once_runs_without_preparation(monkeypatch):
         time.sleep(0.3)
         put({"id": "stop", "type": "stop", "args": (), "kwargs": {}})
 
-    eng, prepared, out = _run_main_loop(monkeypatch, feed, {"NANOVLLM_QUEUE_BATCH_GO": "4"})
+    eng, prepared, out = _run_main_loop(monkeypatch, feed, {"_QUEUE_BATCH_GO": 4})
     assert prepared == []  # the window ends with the client's turn: nothing to overlap
     first, is_prefill, _ = eng.model_runner.runs[0]
     assert is_prefill and [t.seq_id for t in first] == ["s0", "s1", "s2", "s3"]

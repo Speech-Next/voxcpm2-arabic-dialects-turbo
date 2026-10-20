@@ -94,19 +94,14 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         turbo = getattr(config.model_config, "turbo", None)
-        self.max_prefill_seqs = getattr(turbo, "prefill_max_seqs", 0) or self.max_num_seqs
         # streams before new requests (TurboConfig.stream_guard_ms, 0 = off): see _admit_loop
         self.stream_guard = (getattr(turbo, "stream_guard_ms", 0) or 0) / 1000
         # while streams play: prefill steps that decode the playing streams too (TurboConfig.mix_decode), steps of
-        # bounded length (step_cap_ms, 0 = off) and new requests only while the streams keep real time
-        # (realtime_margin_ms, -1 = off), judged with the callbacks' predicted step times (step_seconds): see
+        # bounded length (step_cap_ms, 0 = off), judged with the callbacks' predicted step times (step_seconds): see
         # _admit_loop
         self.step_cap = (getattr(turbo, "step_cap_ms", 0) or 0) / 1000
         self.mix_decode = bool(getattr(turbo, "mix_decode", False))
         self.mix_heads = self.mix_decode and bool(getattr(turbo, "mix_heads", False))  # (TurboConfig.mix_heads)
-        self.heads_deadline = self.mix_heads and bool(getattr(turbo, "heads_deadline", False))
-        margin = getattr(turbo, "realtime_margin_ms", -1)
-        self.realtime_margin = margin / 1000 if isinstance(margin, (int, float)) and margin >= 0 else None
         # the last step: (is_prefill, rows, tokens computed), for the callbacks' step time model; mixed: the running
         # sequences a prefill step decodes as well (mix_decode)
         self.last_step = (False, 0, 0)
@@ -214,7 +209,6 @@ class Scheduler:
     def _admit_loop(self, admitted: list[Sequence], deferred_waiting: deque[Sequence]) -> None:
         waiting, running, bm, callbacks = self.waiting, self.running, self.block_manager, self.callbacks
         budget = self._budget  # the next prefill step's sequences and batched tokens so far, updated per admission
-        max_seqs = min(self.max_num_seqs, self.max_prefill_seqs)
         # model-level prefix caches (VoxCPM2 ref_prefix_cache) shrink the prefill; optional callback
         prefix_hint = getattr(callbacks, "cached_prefix_tokens", None)
         running_ids = None  # adapters of the running sequences, built once and kept up to date in this pass
@@ -234,10 +228,6 @@ class Scheduler:
         # - mix_decode: a prefill step that resumes streams (a burst's continuations) also decodes the running ones
         #   short of audio (their next patch, as a decode step would), so it is no pause for them: the cap then bounds
         #   the step, those rows included, and the stream guard no longer holds the resuming streams back.
-        # - realtime_margin: a new request waits while a decode step of every stream would take longer than a
-        #   patch's audio minus the margin (callbacks.patch_seconds): the streams would fall behind real time.
-        # - callbacks.head_fits: a new request waits while the model says its start would come too late anyway
-        #   (VoxCPM2: a head start head whose continuation's prefill comes after too much of the others').
         cost = getattr(callbacks, "step_seconds", None)
         self._playing = least is not None
         # a prefill step that resumes a stream also decodes the running ones short of audio (mix_decode: _ride); one
@@ -252,12 +242,8 @@ class Scheduler:
             return  # two pauses in a row would make one longer than the cap: a decode step comes between
         if self.stream_guard > 0 and least is not None and least < self.stream_guard:
             slack = least
-        fits = getattr(callbacks, "head_fits", None)
-        realtime = None
-        if self.realtime_margin is not None and cost is not None:
-            realtime = patch - self.realtime_margin
         for _ in range(len(waiting)):
-            if not waiting or budget[0] >= max_seqs:
+            if not waiting or budget[0] >= self.max_num_seqs:
                 break
             seq = waiting.popleft()
             mixed = mixable and (self._resumes or seq.has_stream or self.mix_heads)  # the short streams ride too
@@ -272,16 +258,7 @@ class Scheduler:
             if cap is not None:
                 t = cost(budget[0] + 1 + ride, budget[1] + seq.num_tokens - hint + ride, True)
                 first = max(cap, least - _PAUSE_MARGIN + (patch if mixed else 0.0))
-                if self.heads_deadline and mixed and not seq.has_stream and not self._resumes:
-                    # a step of new heads that streams ride (mix_heads): over by the time the least of them needs
-                    # its next audio (else the heads wait for the decode step)
-                    first = min(cap, least - _PAUSE_MARGIN)
                 late = t > (first if budget[0] == 0 else cap)
-            if not seq.has_stream and not late and realtime is not None:
-                rows = len(running) + 1
-                late = cost(rows, rows, False) > realtime
-            if not seq.has_stream and not late and fits is not None:
-                late = not fits(seq)  # (a head whose continuation would come too late: callbacks.head_fits)
             if late:
                 waiting.appendleft(seq)
                 break

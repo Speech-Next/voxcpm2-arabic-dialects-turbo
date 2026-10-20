@@ -109,75 +109,37 @@ class LoRAConfig(BaseModel):
 
 
 class TurboConfig(BaseModel):
-    """Latency/throughput trade-offs (``NANOVLLM_VOXCPM2_TURBO`` JSON env var).
-
-    Defaults reproduce the original algorithm except ``skip_text_locenc``,
-    which only drops work whose result was masked out anyway.
-    """
+    """Latency/throughput trade-offs (``NANOVLLM_VOXCPM2_TURBO`` JSON env var)."""
 
     model_config = ConfigDict(extra="forbid")  # a misspelled key fails at startup instead of being ignored
 
-    first_steps: Optional[int] = None  # CFM steps for the first patch (None = inference_timesteps)
-    cfg_steps: int = -1  # evaluated decode steps that use CFG (-1 = all, 0 = none)
-    first_cfg_steps: int = -1  # same for the first patch
-    skip_text_locenc: bool = True  # prefill: run LocEnc only on audio positions
-    vae_kernel: bool = True  # voxcpm_kernels slot-based CUDA-graph streaming VAE decoder
-    vae_fused: bool = True  # fused Triton residual units inside it (same output, ~1.4x faster VAE)
-    # W8A8 (voxcpm_kernels): per-token int8 activations x per-channel int8 weights, for calls with
-    # at least w8a8_min_rows rows (prefill, a full decode batch, DiT, LocEnc); smaller batches stay bf16. At 128+
-    # rows the int8 path beats bf16 at the A10's power cap (256-stream decode step 116 -> 110 ms, same quality).
-    fast_noise: bool = True  # one Philox launch for all rows' seeded noise (voxcpm_kernels.seeded_randn)
-    prefill_graph: bool = True  # CUDA-graph the prefill backbone per token bucket (paged KV, clone audio too)
-    # largest prefill step replayed from a graph: small steps are launch-bound (a single cloned request), large
-    # ones GPU-bound, where padding up to the next bucket would only add work
-    prefill_graph_max_tokens: int = 512
-    # Reference-prefix KV cache: the first KV block of each voice's (reference latents') first request is kept;
-    # later requests of that voice copy the KV of the longest token prefix they share with it (the reference
-    # audio, plus the prompt text in prompt+reference cloning) and prefill only the tokens after it.
-    ref_prefix_cache: bool = True
-    ref_prefix_cache_size: int = 64
-    # LocEnc embedding cache (rows; 0 = off): prefill embeds of audio patches seen before (a cloned voice's
-    # prompt audio) are reused instead of re-running LocEnc; LocEnc encodes each patch independently.
-    locenc_cache_size: int = 8192
-    # at most this many sequences per prefill step (0 = only max_num_batched_tokens limits): with a large token
-    # budget, short (text-only / cached-prefix) prompts still start streaming in groups instead of all at once
-    prefill_max_seqs: int = 0
     # stream int16 PCM instead of float32 waveforms: converted on the GPU before the copy to the host, half the
     # bytes through the result pipe (the OpenAI-style server turns this on)
     pcm16_output: bool = False
+    # W8A8 (voxcpm_kernels): per-token int8 activations x per-channel int8 weights in the fused decoder layers of
+    # base_lm, residual_lm, LocEnc and LocDiT, for calls with at least 128 rows; smaller batches stay bf16
     w8a8: bool = False
-    w8a8_min_rows: int = 128
-    w8a8_targets: List[str] = ["base_lm", "residual_lm", "feat_encoder", "feat_decoder"]
-    fused_layers: bool = True  # voxcpm_kernels fused decoder layers (RoPE, norm+quant, epilogue residual)
-    # Distilled LocDiT: estimator weights + explicit Euler time grid (no zero-init step, no CFG).
+    # Distilled LocDiT: estimator weights + explicit Euler time grid (read from the checkpoint; no zero-init step,
+    # no CFG).
     dit_checkpoint: Optional[str] = None
-    dit_t_span: Optional[List[float]] = None  # e.g. [1.0, 0.7071, 0.0]; read from the checkpoint if None
     # the first patch's grid (prefill), e.g. [1.0, 0.0]: fewer LocDiT solves before the first audio
     dit_first_t_span: Optional[List[float]] = None
     # block caching across the LocDiT solver's steps (cache-dit's DBCache with a static step mask + TaylorSeer), e.g.
     # {"fn": 2, "bn": 2, "mask": [1, 1, 0, 1, 0, 1, 0, 1, 1], "taylor": true}; see models/voxcpm2/dit_cache.py
     dit_cache: Optional[Dict[str, Any]] = None
-    # Head start (0 = off): a request whose text has more than head_tokens + head_min_rest tokens first generates
-    # head_patches patches from a head of its text (a word-boundary prefix of at most head_tokens tokens; a clause
-    # boundary when there is one), then continues with the whole text: the head's patches become prompt audio of a
-    # continuation that keeps the request's stream, VAE state, seed and voice. Time to first audio then waits only
-    # for the head's prefill; only the first head_patches patches (160 ms each) were sampled seeing the head alone.
+    # Head start (0 = off): a request whose text has more than head_tokens + 8 tokens first generates 3 patches
+    # from a head of its text (a word-boundary prefix of at most head_tokens tokens; a clause boundary when there is
+    # one), then continues with the whole text: the head's patches become prompt audio of a continuation that keeps
+    # the request's stream, VAE state, seed and voice. Time to first audio then waits only for the head's prefill;
+    # only the first 3 patches (160 ms each) were sampled seeing the head alone.
     head_tokens: int = 0
-    head_patches: int = 3
-    head_min_rest: int = 8
-    # Head start under load (0 = every head head_patches long): a head gets up to this many patches, the fewest whose
-    # audio lasts, with head_margin_ms to spare, until its continuation is prefilled after those queued ahead of it
+    # Head start under load (0 = every head 3 patches long): a head gets up to this many patches, the fewest whose
+    # audio lasts, with 150 ms to spare, until its continuation is prefilled after those queued ahead of it
     # (the heads in their head phase), from the predicted step times (engine/step_cost.py). A burst's heads all end
     # together and their continuations' prefill (~86 tokens a stream in #28's WebSocket benchmark: ~0.35 s for 100,
     # ~0.5 s for 150 streams on one A10) outlasted the 480 ms of a 3-patch head: the players ran dry. Heads that
-    # start with fewer streams ahead of them stay head_patches long; time to first audio does not change.
+    # start with fewer streams ahead of them stay 3 patches long; time to first audio does not change.
     head_patches_max: int = 0
-    head_margin_ms: int = 150
-    # With head_patches_max: a new request with a head start waits while even head_patches_max patches would not last
-    # until its continuation is prefilled, or while a burst's continuations are still being prefilled (False = never
-    # waits). No underruns in bursts beyond what the A10 can cover (#28's WebSocket benchmark: about 110 at once and
-    # up), at the cost of time to first audio there (p95 at 150 / 200 at once: ~0.15 -> 0.8 / 1.7 s).
-    head_hold: bool = False
     # Head start under load, intermediate stages (#31; 0 = off): a head whose audio would run out before its whole
     # continuation is prefilled (a burst: ~65 tokens a stream, ~0.8 s for 200 on one A10) is continued first with
     # the text's first <= mid_tokens tokens (a word-boundary prefix; with stage_kv_reuse its prefill computes only
@@ -189,26 +151,10 @@ class TurboConfig(BaseModel):
     # Each stream's stages end up to mid_stagger - 1 patches earlier (by its id): the stages end at a fixed patch
     # (0.5 a token of the stage's text), so a burst's streams reached each seam in the same step (#31). 0: off.
     mid_stagger: int = 0
-    # The front sends a stream's audio in chunks of this many ms (e.g. 128: 4096 bytes of 16 kHz PCM16) and holds
-    # the rest back: the engine's estimate of a player's queued audio (stream_buffer: the scheduler's deadlines,
-    # mixed steps' riders, mid_tokens) leaves out the held-back part (the audio streamed so far modulo a chunk).
-    # 0: every patch reaches the client whole (with a chunk size set such a client only looks a little more urgent).
-    client_chunk_ms: int = 0
-    # With chunks: the front paces its sends (#31, a jitter buffer: streaming.ChunkPacer, as ws_server): the first
-    # chunk at once, the next ones on a grid of client_pace x a chunk's audio (client_pace_last for the last complete
-    # chunk queued), more than client_pace_reserve_ms queued at once. The engine runs the same pacer per stream; its
-    # deadlines are the pacer's (stream_buffer: when it needs a chunk the engine has not produced, dry_at). The
-    # request's pace (add_request's client_pace) defaults to client_pace; 0: the client plays the chunks as they come.
-    client_pace: float = 0.0
-    client_pace_last: float = 0.95
-    client_pace_reserve_ms: float = 1000.0
     # With mix_decode: a prefill step of new requests (heads) also decodes the playing streams that would run out of
     # audio during it, as a resuming step does (a burst whose requests arrive over tens of ms: the late ones' heads
     # no longer pause the first ones). Their heads then solve the first patch with the usual grid.
     mix_heads: bool = False
-    # With mix_heads: such a step must end before the least of the streams riding it needs its next audio (their
-    # deadline less 30 ms); a longer one waits for the next decode step (a paced front's first->second chunk, #31)
-    heads_deadline: bool = False
     # A head start's continuation (or intermediate stage) takes the KV of the prefix it shares with the stage
     # before it (the voice and that stage's text) from that stage's first block instead of computing it again.
     stage_kv_reuse: bool = False
@@ -229,20 +175,11 @@ class TurboConfig(BaseModel):
     # continuations: long steps) also decodes the running streams that would run out of audio during it (their next
     # patch, through the prefill path with everything before it cached); steps of new requests only stay plain, so
     # first audio is as fast as before. Needs the first patch's LocDiT settings to be the others' (no
-    # dit_first_t_span, first_steps or first_cfg_steps of their own).
+    # dit_first_t_span of its own).
     mix_decode: bool = False
-    # Head start for at most this many streams at once (0 = no limit): a request arriving while this many streams are
-    # in their head phase (a head generating, or its continuation waiting for its prefill) is prefilled whole. Each
-    # continuation is a prefill that comes due when its head ends; a burst's continuations come due together and the
-    # step that prefills them pauses every stream (#28's WebSocket benchmark: one stall per request at 40-200
-    # requests at once). With the limit, a burst's first requests start fast and the rest whole.
-    head_start_limit: int = 0
     # While streams play, a prefill (or mixed) step is filled only while its predicted time stays under this (0 = no
     # cap; the first sequence also when the least playing buffer covers it): it bounds the wait between two chunks.
     step_cap_ms: int = 0
-    # A new request waits while a decode step of every stream would take longer than a patch's audio (160 ms) minus
-    # this margin (-1 = off): the streams would fall behind real time. Predicted step times: engine/step_cost.py.
-    realtime_margin_ms: int = -1
 
 
 class VoxCPM2Config(BaseModel):

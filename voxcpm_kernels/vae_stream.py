@@ -11,7 +11,6 @@ size bucket is captured once as a CUDA graph and replayed.
 The last slot is a scratch slot that padded rows of a bucket read and write.
 """
 
-import os
 from collections import OrderedDict
 from collections.abc import Hashable, Sequence
 
@@ -19,8 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .resunit import (CudaResidualUnit, DirectResidualUnit, FusedResidualUnit, OnePassResidualUnit, SnakeConvTanhHead,
-                      SplitResidualUnit, TwoPassResidualUnit)
+from .resunit import CudaResidualUnit, OnePassResidualUnit, SnakeConvTanhHead, TwoPassResidualUnit
 from .snake import Snake
 from .tconv import FusedSnakeTransposeConv
 
@@ -97,39 +95,16 @@ class _Tanh:
         return torch.tanh(x)
 
 
-# Residual-unit implementation per channel count (tuned on an A10, B=256, power cap): "onepass" (depthwise
-# conv, snakes, 1x1 conv and residual in one Triton kernel) for the narrow late blocks, "twopass" (depthwise conv +
-# snakes, then a Triton 1x1 conv with bias and residual in its epilogue) from 128 channels on. "direct" (the same
-# depthwise kernel, then cuBLAS baddbmm into an output pre-set to x + bias) and the others stay for A/B.
-UNIT_KIND = {32: "onepass", 64: "onepass", 128: "twopass", 256: "twopass", 512: "twopass", 1024: "twopass"}
-if os.environ.get("VOXCPM_KERNELS_ONEPASS", "1") == "0":  # A/B: the earlier split units everywhere
-    UNIT_KIND = {c: "direct" for c in UNIT_KIND}
-# "cuda": one-pass CUDA C++ unit (cuda/resunit_fused.cu, smem-staged snake + depthwise conv, tensor-core 1x1 conv) for
-# these channel counts; falls back to the Triton units when the extension cannot be built
-for _c in filter(None, os.environ.get("VOXCPM_KERNELS_RESUNIT_CUDA", "32,64,128,256").split(",")):
-    UNIT_KIND[int(_c)] = "cuda"
-
-
-# Snake of a transposed conv in the epilogue of the residual unit before it; VOXCPM_KERNELS_POST_SNAKE=0 keeps it apart.
-POST_SNAKE = os.environ.get("VOXCPM_KERNELS_POST_SNAKE", "1") == "1"
-
-# Fused output head (snake -> 1-channel conv -> tanh); VOXCPM_KERNELS_HEAD=0 keeps the three ops.
-HEAD_FUSED = os.environ.get("VOXCPM_KERNELS_HEAD", "1") == "1"
-
-# Fused snake + transposed conv (tconv.py); VOXCPM_KERNELS_TCONV=0 falls back to snake + cuDNN.
-TCONV_FUSED = os.environ.get("VOXCPM_KERNELS_TCONV", "1") == "1"
+# Residual-unit implementation per channel count (tuned on an A10, B=256, power cap): "cuda" (one-pass CUDA C++ unit,
+# cuda/resunit_fused.cu: smem-staged snake + depthwise conv, tensor-core 1x1 conv) up to 256 channels, "twopass"
+# (depthwise conv + snakes, then a Triton 1x1 conv with bias and residual in its epilogue) above. When the extension
+# cannot be built, the Triton units: "onepass" (depthwise conv, snakes, 1x1 conv and residual in one kernel) for the
+# narrow late blocks, "twopass" from 128 channels on.
+UNIT_KIND = {32: "cuda", 64: "cuda", 128: "cuda", 256: "cuda", 512: "twopass", 1024: "twopass"}
 
 
 def _make_residual_unit(unit: nn.Module, slots: int, fused: bool):
     kind = UNIT_KIND.get(unit.block[1].in_channels, "plain") if fused else "plain"
-    if kind == "fused":
-        return FusedResidualUnit(unit, slots)
-    if kind == "split":
-        return SplitResidualUnit(unit, slots)
-    if kind == "direct":
-        return DirectResidualUnit(unit, slots)
-    if kind == "onepass":
-        return OnePassResidualUnit(unit, slots)
     if kind == "twopass":
         return TwoPassResidualUnit(unit, slots)
     if kind == "cuda":
@@ -144,8 +119,6 @@ def _make_residual_unit(unit: nn.Module, slots: int, fused: bool):
 def _fuse_post_snakes(ops: list) -> None:
     """A residual unit whose output only feeds a fused (affine +) snake + transposed conv applies that snake in its
     epilogue (saves a read and a write of the activation); the conv then takes its input as already snaked."""
-    if not POST_SNAKE:
-        return
     for prev, op in zip(ops, ops[1:]):
         if isinstance(op, FusedSnakeTransposeConv) and isinstance(prev, (OnePassResidualUnit, TwoPassResidualUnit, CudaResidualUnit)) \
                 and op.snake.fast_sin:
@@ -174,7 +147,7 @@ def _build_ops(decoder: nn.Module, slots: int, fused: bool = True) -> list:
             parts = list(layer.block)
             if type(parts[0]).__name__ != "Snake1d" or type(parts[1]).__name__ != "CausalTransposeConv1d":
                 raise NotImplementedError("unexpected decoder block layout")
-            if fused and TCONV_FUSED:
+            if fused:  # fused snake + transposed conv (tconv.py)
                 ops.append(FusedSnakeTransposeConv(parts[0], parts[1], slots, affine))
             else:
                 ops.append(_SnakeOp(parts[0], affine))
@@ -194,7 +167,7 @@ def _build_ops(decoder: nn.Module, slots: int, fused: bool = True) -> list:
             raise NotImplementedError("sample-rate affine not followed by a decoder block")
     _fuse_post_snakes(ops)
     # output head: snake -> 1-channel causal conv -> tanh as one kernel
-    if fused and HEAD_FUSED and len(layers) >= 3 and [type(m).__name__ for m in layers[-3:]] == ["Snake1d", "CausalConv1d", "Tanh"] \
+    if fused and len(layers) >= 3 and [type(m).__name__ for m in layers[-3:]] == ["Snake1d", "CausalConv1d", "Tanh"] \
             and layers[-2].out_channels == 1 and layers[-2].groups == 1 and layers[-2].dilation[0] == 1 \
             and isinstance(ops[-3], _SnakeOp) and ops[-3].fn.scale is None and ops[-3].fn.bias is None:
         ops[-3:] = [SnakeConvTanhHead(layers[-3], layers[-2], slots)]

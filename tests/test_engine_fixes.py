@@ -20,10 +20,10 @@ from nanovllm_voxcpm.engine.sequence import Sequence, SequenceStatus
 from nanovllm_voxcpm.utils.context import DIT_LORA_DOMAIN, LM_LORA_DOMAIN, LoRAContext, reset_all_contexts
 
 
-def _config(max_num_seqs=4, blocks=64, block_size=4, max_tokens=4096, prefill_max_seqs=0):
+def _config(max_num_seqs=4, blocks=64, block_size=4, max_tokens=4096):
     return SimpleNamespace(
         max_num_seqs=max_num_seqs, max_num_batched_tokens=max_tokens, num_kvcache_blocks=blocks,
-        kvcache_block_size=block_size, model_config=SimpleNamespace(turbo=SimpleNamespace(prefill_max_seqs=prefill_max_seqs)),
+        kvcache_block_size=block_size, model_config=SimpleNamespace(turbo=SimpleNamespace()),
     )
 
 
@@ -280,15 +280,14 @@ def test_fully_cached_prompt_recomputes_its_last_block():
 
 
 def test_fully_cached_prompt_is_prefilled_and_counted():
-    sch = Scheduler(_config(max_num_seqs=4, prefill_max_seqs=1))
+    sch = Scheduler(_config(max_num_seqs=4))
     sch.add(_seq("a", TOKENS[:8]))
     assert [s.seq_id for s in sch.schedule()[0]] == ["a"]
     b, c = _seq("b", TOKENS[:8]), _seq("c", [7, 7])
     sch.add(b)
     sch.add(c)
     seqs, is_prefill = sch.schedule()
-    assert is_prefill and seqs == [b] and b.num_cached_tokens == 4
-    assert list(sch.waiting) == [c]  # b took the step's one prefill seat
+    assert is_prefill and seqs == [b, c] and b.num_cached_tokens == 4
 
 
 def _step(sch):
@@ -519,20 +518,6 @@ def test_the_step_cap_counts_the_mixed_rows():
     assert prefill and seqs == [c, a, b] and list(sch.waiting) == [d]
 
 
-def test_a_new_request_waits_while_the_streams_would_fall_behind_real_time():
-    sch = _timed({}, realtime_margin_ms=9)  # a decode step: 50 ms a row: 3 rows = 150 ms < 160 - 9
-    _playing(sch, *(seqs := [_seq(f"s{i}", [i + 1]) for i in range(3)]))
-    late = _seq("late", [9])
-    sch.add(late)
-    assert sch.schedule() == (seqs, False) and list(sch.waiting) == [late]  # 4 rows: 200 ms > 151
-    cont = _seq("h", [4, 5])  # a stream already playing (a continuation) is not held back
-    cont.has_stream = True
-    sch.add(cont, front=True)
-    for s in seqs:
-        s.append_token(9)
-    assert sch.schedule() == ([cont], True) and list(sch.waiting) == [late]
-
-
 # --- 4. cancels during a step, VAE stream slots ---------------------------------------------------------------------
 
 
@@ -729,23 +714,6 @@ def test_head_start_checks_the_whole_request_length():
     assert head.custom_payload.chain is not None and list(eng.scheduler.waiting) == [head]
 
 
-def test_head_start_for_at_most_head_start_limit_streams_at_once():
-    eng = _voxcpm2_engine(max_model_len=128)
-    eng.head_start_limit, eng._head_phase = 2, {}
-    h1, h2, w = (eng.add_request(f"r{i}", _words(20), max_generate_length=20) for i in range(3))
-    assert h1.custom_payload.chain is not None and h2.custom_payload.chain is not None
-    assert w.custom_payload.chain is None and set(eng._head_phase) == {"r0", "r1"}  # r2: prefilled whole
-    assert eng._head_phase["r0"] == 20 + 1 + 3  # its continuation's tokens: text, audio start, the head's patches
-    for _ in range(3):  # the heads' prefill and patches; they end and queue their continuations
-        eng.step()
-    assert set(eng._head_phase) == {"r0", "r1"}  # continuations queued, not prefilled yet
-    eng.step()  # their prefill
-    assert not eng._head_phase
-    assert eng.add_request("r3", _words(20), max_generate_length=20).custom_payload.chain is not None
-    eng.cancel_sequence("r3")
-    assert not eng._head_phase
-
-
 def test_head_patches_cover_the_continuation_prefill_ahead():
     from nanovllm_voxcpm.engine.step_cost import head_patches_for
 
@@ -789,21 +757,11 @@ def test_heads_are_lengthened_when_the_burst_grows():
     assert first.custom_payload.max_generate_length == 4 and eng._head_phase["r0"] == 25
 
 
-def test_a_head_waits_while_even_the_longest_would_not_last():
+def test_a_head_does_not_wait_while_even_the_longest_would_not_last():
     eng = _loaded(0.01)  # 10 ms a token: each continuation 0.24-0.26 s
-    eng.head_hold = True
     heads = [eng.add_request(f"r{i}", _words(20), max_generate_length=40) for i in range(3)]
-    assert [h.custom_payload.max_generate_length for h in heads] == [3, 5, 5]
-    assert eng.head_fits(heads[0]) and eng.head_fits(heads[1]) and not eng.head_fits(heads[2])
-    seqs = eng.step()
-    assert {s.seq_id for s in seqs} == {"r0", "r1"} and list(eng.scheduler.waiting) == [heads[2]]
-    for _ in range(4):  # r0 ends after 3 patches, its continuation is prefilled: r2's wait is shorter
-        eng.step()
-    assert "r0" not in eng._head_phase and heads[2].status != SequenceStatus.WAITING
-    assert eng._head_sum == sum(eng._head_phase.values())
-    free = _loaded(0.01)  # head_hold off: no waiting, the third head is as long as it gets
-    free_heads = [free.add_request(f"r{i}", _words(20), max_generate_length=40) for i in range(3)]
-    assert free.head_fits(free_heads[2]) and {s.seq_id for s in free.step()} == {"r0", "r1", "r2"}
+    assert [h.custom_payload.max_generate_length for h in heads] == [3, 5, 5]  # the third is as long as it gets
+    assert {s.seq_id for s in eng.step()} == {"r0", "r1", "r2"}
 
 
 def _steps_until_chained(eng, seq_id):
@@ -1307,7 +1265,6 @@ def test_head_and_stage_splits_are_unchanged_by_the_shared_scan():
 
     from tokenizers import Tokenizer, models, normalizers
 
-    from nanovllm_voxcpm.models.voxcpm2.config import TurboConfig
     from nanovllm_voxcpm.models.voxcpm2.engine import RegisteredVoice, VoxCPM2Engine
 
     tokenizers = []
@@ -1332,10 +1289,9 @@ def test_head_and_stage_splits_are_unchanged_by_the_shared_scan():
     texts += ["".join(rng.choice(alphabet) for _ in range(rng.randint(1, 90))) for _ in range(400)]
     texts += ["<reserved_101>" + t for t in texts[:200]] + ["abcdefabcdefabcdef gh", "a", " ", "ab, cd: ef، gh ab"]
 
-    turbo = TurboConfig()
     for tok in tokenizers:
         eng = object.__new__(VoxCPM2Engine)
-        eng.head_tokens, eng.head_min_rest, eng.mid_stages = 8, turbo.head_min_rest, (24, 48)
+        eng.head_tokens, eng.mid_stages = 8, (24, 48)
         eng.voices = {"v": RegisteredVoice(None, "gh, ab "), "r": RegisteredVoice(None, None)}
         cache = {}
 

@@ -13,8 +13,6 @@ Unfused this reads/writes the [B, C, T] activation ~14 times per unit. Here:
   3. the causal state is advanced from the padded [state | h1] buffer.
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
@@ -141,97 +139,6 @@ class FusedResidualUnit:
         return out
 
 
-# ---------------------------------------------------------------------------------------------------------------
-# Split variant for wide units: Triton depthwise conv + snake2, then the 1x1 conv as one cuBLAS batched GEMM.
-# The fused kernel recomputes the depthwise conv once per output-channel block, which dominates when C >= 256.
-@triton.jit
-def _dw_snake2(
-    h1_ptr, x_ptr, h3_ptr, o_ptr,
-    w7_ptr, b7_ptr, a2_ptr, i2_ptr, b1_ptr,
-    C, T, P,
-    DIL: tl.constexpr, KSIZE: tl.constexpr, FAST_SIN: tl.constexpr, BC: tl.constexpr, BT: tl.constexpr,
-):
-    """h3 = snake2(dwconv7(h1p)); o = x + b1  (h1p rows are [state | snake1(x)], length P + T)."""
-    b = tl.program_id(0)
-    t = tl.program_id(1) * BT + tl.arange(0, BT)
-    c = tl.program_id(2) * BC + tl.arange(0, BC)
-    cm = c < C
-    m = cm[:, None] & (t < T)[None, :]
-    hrow = h1_ptr + b.to(tl.int64) * C * (P + T) + c[:, None] * (P + T)
-    h2 = tl.zeros([BC, BT], dtype=tl.float32) + tl.load(b7_ptr + c, mask=cm, other=0.0)[:, None]
-    for k in tl.static_range(KSIZE):
-        hv = tl.load(hrow + (t + k * DIL)[None, :], mask=m, other=0.0)
-        h2 += tl.load(w7_ptr + c * KSIZE + k, mask=cm, other=0.0)[:, None] * hv.to(tl.float32)
-    s2 = _sin(tl.load(a2_ptr + c, mask=cm, other=1.0)[:, None] * h2, FAST_SIN)
-    h3 = h2 + s2 * s2 * tl.load(i2_ptr + c, mask=cm, other=1.0)[:, None]
-    offs = b.to(tl.int64) * C * T + c[:, None] * T + t[None, :]
-    tl.store(h3_ptr + offs, h3.to(h3_ptr.dtype.element_ty), mask=m)
-    xv = tl.load(x_ptr + offs, mask=m, other=0.0).to(tl.float32)
-    tl.store(o_ptr + offs, (xv + tl.load(b1_ptr + c, mask=cm, other=0.0)[:, None]).to(o_ptr.dtype.element_ty), mask=m)
-
-
-class SplitResidualUnit(FusedResidualUnit):
-    """Same math and state layout as FusedResidualUnit; the 1x1 conv runs as cuBLAS bmm."""
-
-    def __call__(self, x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-        x = x.contiguous()
-        B, C, T = x.shape
-        L = self.P + T
-        h1p = torch.empty(B, C, L, device=x.device, dtype=x.dtype)
-        _snake_pad[(B, C, triton.cdiv(L, 1024))](
-            x, self.state, idx, h1p, self.a1, self.i1,
-            C, T, self.P, self.state.stride(0),
-            FAST_SIN=self.fast_sin, BLOCK=1024,
-        )
-        self.state.index_copy_(0, idx, h1p[:, :, T:])
-        h3 = torch.empty_like(x)
-        out = torch.empty_like(x)
-        bt = min(64, triton.next_power_of_2(T))
-        _dw_snake2[(B, triton.cdiv(T, bt), triton.cdiv(C, 32))](
-            h1p, x, h3, out, self.w7, self.b7, self.a2, self.i2, self.b1,
-            C, T, self.P, DIL=self.dil, KSIZE=self.ksize, FAST_SIN=self.fast_sin, BC=32, BT=bt, num_warps=4,
-        )
-        return out.baddbmm_(self.w1.unsqueeze(0).expand(B, C, C), h3)
-
-
-# ---------------------------------------------------------------------------------------------------------------
-# No-padded-buffer variant: snake1 recomputed per tap with the hardware approximate sin (sin.approx: one MUFU op),
-# reading [state | x] directly, so the [B, C, P + T] snake buffer is never written or read.
-@triton.jit
-def _dw_snake12(
-    x_ptr, state_ptr, idx_ptr, h3_ptr, o_ptr,
-    a1_ptr, i1_ptr, w7_ptr, b7_ptr, a2_ptr, i2_ptr, b1_ptr,
-    C, T, P, state_slot_stride,
-    DIL: tl.constexpr, KSIZE: tl.constexpr, BC: tl.constexpr, BT: tl.constexpr, FAST_SIN: tl.constexpr,
-):
-    b = tl.program_id(0)
-    t = tl.program_id(1) * BT + tl.arange(0, BT)
-    c = tl.program_id(2) * BC + tl.arange(0, BC)
-    cm = c < C
-    tm = t < T
-    m = cm[:, None] & tm[None, :]
-    slot = tl.load(idx_ptr + b).to(tl.int64)
-    xrow = x_ptr + b.to(tl.int64) * C * T + c[:, None] * T
-    srow = state_ptr + slot * state_slot_stride + c[:, None] * P
-    a1 = tl.load(a1_ptr + c, mask=cm, other=1.0)[:, None]
-    i1 = tl.load(i1_ptr + c, mask=cm, other=1.0)[:, None]
-    h2 = tl.zeros([BC, BT], dtype=tl.float32) + tl.load(b7_ptr + c, mask=cm, other=0.0)[:, None]
-    for k in tl.static_range(KSIZE):
-        src = t + k * DIL - P
-        in_x = src >= 0
-        xv = tl.load(xrow + src[None, :], mask=cm[:, None] & (in_x & tm)[None, :], other=0.0).to(tl.float32)
-        sx = _sin(a1 * xv, FAST_SIN)
-        sv = tl.load(srow + (src + P)[None, :], mask=cm[:, None] & ((~in_x) & tm)[None, :], other=0.0).to(tl.float32)
-        h1 = tl.where(in_x[None, :], xv + sx * sx * i1, sv)
-        h2 += tl.load(w7_ptr + c * KSIZE + k, mask=cm, other=0.0)[:, None] * h1
-    s2 = _sin(tl.load(a2_ptr + c, mask=cm, other=1.0)[:, None] * h2, FAST_SIN)
-    h3 = h2 + s2 * s2 * tl.load(i2_ptr + c, mask=cm, other=1.0)[:, None]
-    offs = b.to(tl.int64) * C * T + c[:, None] * T + t[None, :]
-    tl.store(h3_ptr + offs, h3.to(h3_ptr.dtype.element_ty), mask=m)
-    xv = tl.load(x_ptr + offs, mask=m, other=0.0).to(tl.float32)
-    tl.store(o_ptr + offs, (xv + tl.load(b1_ptr + c, mask=cm, other=0.0)[:, None]).to(o_ptr.dtype.element_ty), mask=m)
-
-
 @triton.jit
 def _snake_state(x_ptr, state_ptr, idx_ptr, a1_ptr, i1_ptr, C, T, P, state_slot_stride, BC: tl.constexpr, BP: tl.constexpr, FAST_SIN: tl.constexpr):
     """state[slot, c, j] <- [state | snake1(x)][T + j] (one program owns whole rows; loads precede stores)."""
@@ -255,15 +162,11 @@ def _snake_state(x_ptr, state_ptr, idx_ptr, a1_ptr, i1_ptr, C, T, P, state_slot_
     tl.store(srow + j[None, :], new.to(state_ptr.dtype.element_ty), mask=cm[:, None] & jm[None, :])
 
 
-DIRECT_FAST_SIN = os.environ.get("VOXCPM_KERNELS_FAST_SIN", "1") == "1"
-HEAD_CUDA = os.environ.get("VOXCPM_KERNELS_HEAD_CUDA", "1") == "1"
-
-
 # ---------------------------------------------------------------------------------------------------------------
 # The decoder's output head: snake -> causal conv (C -> 1 channel, kernel K) -> tanh, in one pass. The unfused ops
 # concatenate the conv state onto the whole activation (a full copy) and run cuDNN with layout conversions for a
 # single output channel. Here a program owns BT samples of one stream: per tap it loads [C, BT] inputs (the conv
-# state for the first K-1 positions), applies the snake (fast sin, recomputed per tap as in _dw_snake12), weights
+# state for the first K-1 positions), applies the snake (fast sin, recomputed per tap), weights
 # and sums over channels, then tanh -> output. The state (last K-1 snake outputs) advances in _snake_state after.
 @triton.jit
 def _snake_conv1_tanh(
@@ -310,7 +213,7 @@ class SnakeConvTanhHead:
         self.state = torch.zeros(slots, self.C, self.P, device=dev, dtype=dt)
         self.bt, self.warps = bt, warps
         self.ext = None  # CUDA head (cuda/head_fused.cu): snake staged in shared memory once instead of per tap
-        if HEAD_CUDA and self.C == 32 and self.K == 7 and dt == torch.float16:
+        if self.C == 32 and self.K == 7 and dt == torch.float16:
             from .cuda_ext import available, load
 
             self.ext = load("head_fused") if available("head_fused") else None
@@ -325,20 +228,20 @@ class SnakeConvTanhHead:
             bt = min(self.bt, max(16, triton.next_power_of_2(T)))
             _snake_conv1_tanh[(B, triton.cdiv(T, bt))](
                 x, self.state, idx, out, self.a, self.ia, self.w, self.bias, T, self.P, self.state.stride(0),
-                C=C, KSIZE=self.K, BT=bt, FAST_SIN=DIRECT_FAST_SIN, num_warps=self.warps,
+                C=C, KSIZE=self.K, BT=bt, FAST_SIN=True, num_warps=self.warps,
             )
         _snake_state[(B, triton.cdiv(C, 32))](
             x, self.state, idx, self.a, self.ia, C, T, self.P, self.state.stride(0),
-            BC=32, BP=triton.next_power_of_2(self.P), FAST_SIN=DIRECT_FAST_SIN,
+            BC=32, BP=triton.next_power_of_2(self.P), FAST_SIN=True,
         )
         return out
 
 
 # ---------------------------------------------------------------------------------------------------------------
 # One-pass unit: a program owns BT time steps of one stream and *all* C channels. It computes the depthwise conv
-# with per-tap fast-sin snake1 (as _dw_snake12) and snake2 once, keeps h3 [C, BT] on chip, and runs the 1x1 conv
-# as tl.dot over output-channel blocks, adding bias and the residual before the single store. Versus
-# _dw_snake12 + cuBLAS baddbmm, h3 and the bias-initialised output are never written to or re-read from DRAM.
+# with per-tap fast-sin snake1 and snake2 once, keeps h3 [C, BT] on chip, and runs the 1x1 conv as tl.dot over
+# output-channel blocks, adding bias and the residual before the single store. Versus a depthwise pass + cuBLAS
+# baddbmm, h3 and the bias-initialised output are never written to or re-read from DRAM.
 @triton.jit
 def _resunit_onepass(
     x_ptr, state_ptr, idx_ptr, o_ptr,
@@ -381,9 +284,9 @@ def _resunit_onepass(
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# Two-pass unit for wider channels: _dw_snake12's depthwise conv + snakes writing only h3, then a Triton batched
-# 1x1 conv whose epilogue adds bias and the residual and writes the output once (cuBLAS baddbmm needs the output
-# pre-initialised to x + b1 by the first pass, i.e. one more write and read of the activation).
+# Two-pass unit for wider channels: the depthwise conv + snakes (per-tap fast-sin snake1) writing only h3, then a
+# Triton batched 1x1 conv whose epilogue adds bias and the residual and writes the output once (cuBLAS baddbmm needs
+# the output pre-initialised to x + b1 by the first pass, i.e. one more write and read of the activation).
 @triton.jit
 def _dw_snake12_h3(
     x_ptr, state_ptr, idx_ptr, h3_ptr,
@@ -495,17 +398,14 @@ def _conv1x1_res_cols(h3_ptr, x_ptr, w1_ptr, b1_ptr, o_ptr, C, T, NB, pa_ptr, pi
 
 # Chunks shorter than COLS_MAX_T time steps per stream take _conv1x1_res_cols, (BM, BN, num_warps, num_stages) per
 # channel count; BK stays the per-stream kernel's, so the sums run in the same order (bit-identical outputs).
-COLS_MAX_T = int(os.environ.get("VOXCPM_KERNELS_COLS_MAX_T", "16"))
+COLS_MAX_T = 16
 COLS_TILES = {1024: (128, 32, 8, 3), 512: (128, 32, 4, 3)}  # tuned at B=208, T=4 and 8 on an A10
 # Depthwise pass of short chunks: at least this many elements per program (tiles are BC channels x next_pow2(T))
 DW_MIN_TILE = 512
-# A chunk within one depthwise time tile: that pass also advances the causal state (no separate _snake_state); at
-# B=208, T=4: 0.16 -> 0.12 ms per 1024-channel unit of dilation 1 or 3, bit-identical
-DW_STATE = os.environ.get("VOXCPM_KERNELS_DW_STATE", "1") == "1"
 
 
 # (BM, BN, BK, num_warps, num_stages) of the 1x1 conv per channel count, tuned at
-# B=256 on an A10 at the power cap; vs DirectResidualUnit per unit: C=128 / 256 / 512 / 1024
+# B=256 on an A10 at the power cap; vs depthwise pass + cuBLAS baddbmm per unit: C=128 / 256 / 512 / 1024
 # 2.28 / 2.65 / 1.35 / 0.92 -> 2.10 / 2.33 / 1.20 / 0.68 ms.
 # (BC, BT, num_warps) of the depthwise pass per channel count (same tuning):
 # C=128 2.06 -> 1.88 ms per unit; within 3% elsewhere
@@ -514,7 +414,7 @@ TWOPASS_TILES = {128: (128, 128, 64, 8, 2), 256: (128, 128, 32, 4, 3), 512: (128
 
 
 class TwoPassResidualUnit(FusedResidualUnit):
-    """Same math and state layout as DirectResidualUnit; the 1x1 conv adds bias and residual in its epilogue."""
+    """Same math and state layout as FusedResidualUnit; the 1x1 conv adds bias and residual in its epilogue."""
 
     def __init__(self, mod, slots: int, fast_sin: bool = False, tiles=None, dw_tiles=None):
         super().__init__(mod, slots, fast_sin)
@@ -531,19 +431,19 @@ class TwoPassResidualUnit(FusedResidualUnit):
             bc = min(triton.next_power_of_2(C), max(bc, DW_MIN_TILE // bt))
         else:
             bt = min(bt, max(16, triton.next_power_of_2(T)))
-        # one time tile and a short state: the depthwise pass advances the state itself (a long one, dilation 9,
-        # is faster in _snake_state)
-        fused_state = DW_STATE and T <= bt and self.P <= 32
+        # one time tile and a short state: the depthwise pass advances the state itself (B=208, T=4: 0.16 -> 0.12 ms
+        # per 1024-channel unit of dilation 1 or 3, bit-identical; a long one, dilation 9, is faster in _snake_state)
+        fused_state = T <= bt and self.P <= 32
         _dw_snake12_h3[(B, triton.cdiv(T, bt), triton.cdiv(C, bc))](
             x, self.state, idx, h3, self.a1, self.i1, self.w7, self.b7, self.a2, self.i2,
             C, T, self.P, self.state.stride(0), DIL=self.dil, KSIZE=self.ksize, BC=bc, BT=bt,
-            FAST_SIN=DIRECT_FAST_SIN, UPDATE_STATE=fused_state, BP=triton.next_power_of_2(self.P),
+            FAST_SIN=True, UPDATE_STATE=fused_state, BP=triton.next_power_of_2(self.P),
             num_warps=dw_warps,
         )
         if not fused_state:
             _snake_state[(B, triton.cdiv(C, 32))](
                 x, self.state, idx, self.a1, self.i1, C, T, self.P, self.state.stride(0),
-                BC=32, BP=triton.next_power_of_2(self.P), FAST_SIN=DIRECT_FAST_SIN,
+                BC=32, BP=triton.next_power_of_2(self.P), FAST_SIN=True,
             )
         out = torch.empty_like(x)
         bm, bn, bk, warps, stages = self.twopass_tiles
@@ -570,7 +470,7 @@ ONEPASS_TILES = {32: (128, 32, 8), 64: (64, 64, 8), 128: (32, 64, 8), 256: (32, 
 
 
 class OnePassResidualUnit(FusedResidualUnit):
-    """Same math and state layout as DirectResidualUnit; depthwise conv, snakes, 1x1 conv and residual in one pass."""
+    """Same math and state layout as FusedResidualUnit; depthwise conv, snakes, 1x1 conv and residual in one pass."""
 
     def __init__(self, mod, slots: int, fast_sin: bool = False, tiles=None):
         super().__init__(mod, slots, fast_sin)
@@ -586,18 +486,18 @@ class OnePassResidualUnit(FusedResidualUnit):
         _resunit_onepass[(B, triton.cdiv(T, bt))](
             x, self.state, idx, out, self.a1, self.i1, self.w7, self.b7, self.a2, self.i2, self.w1, self.b1,
             T, self.P, self.state.stride(0), *(self.post_snake or (self.a1, self.i1, self.a1, self.i1)), C=C, DIL=self.dil, KSIZE=self.ksize,
-            BT=bt, BCO=bco, FAST_SIN=DIRECT_FAST_SIN, POST_SNAKE=self.post_snake is not None, num_warps=warps,
+            BT=bt, BCO=bco, FAST_SIN=True, POST_SNAKE=self.post_snake is not None, num_warps=warps,
         )
         # the causal state advances after the conv has read the old one (programs run in any order)
         _snake_state[(B, triton.cdiv(C, 32))](
             x, self.state, idx, self.a1, self.i1, C, T, self.P, self.state.stride(0),
-            BC=32, BP=triton.next_power_of_2(self.P), FAST_SIN=DIRECT_FAST_SIN,
+            BC=32, BP=triton.next_power_of_2(self.P), FAST_SIN=True,
         )
         return out
 
 
 class CudaResidualUnit(FusedResidualUnit):
-    """Same math and state layout as DirectResidualUnit; one CUDA kernel (cuda/resunit_fused.cu) with the snaked
+    """Same math and state layout as FusedResidualUnit; one CUDA kernel (cuda/resunit_fused.cu) with the snaked
     tile staged in shared memory and the 1x1 conv on tensor cores, then _snake_state advances the causal state."""
 
     def __init__(self, mod, slots: int, fast_sin: bool = False, variant: int = 0, sweep: bool = False):
@@ -617,27 +517,6 @@ class CudaResidualUnit(FusedResidualUnit):
                                self.variant)
         _snake_state[(B, triton.cdiv(C, 32))](
             x, self.state, idx, self.a1, self.i1, C, T, self.P, self.state.stride(0),
-            BC=32, BP=triton.next_power_of_2(self.P), FAST_SIN=DIRECT_FAST_SIN,
+            BC=32, BP=triton.next_power_of_2(self.P), FAST_SIN=True,
         )
         return out
-
-
-class DirectResidualUnit(FusedResidualUnit):
-    """Split unit without the padded snake buffer (fast-sin recompute per tap) + cuBLAS bmm for the 1x1 conv."""
-
-    def __call__(self, x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-        x = x.contiguous()
-        B, C, T = x.shape
-        h3 = torch.empty_like(x)
-        out = torch.empty_like(x)
-        bt = min(64, triton.next_power_of_2(T))
-        _dw_snake12[(B, triton.cdiv(T, bt), triton.cdiv(C, 32))](
-            x, self.state, idx, h3, out, self.a1, self.i1, self.w7, self.b7, self.a2, self.i2, self.b1,
-            C, T, self.P, self.state.stride(0), DIL=self.dil, KSIZE=self.ksize, BC=32, BT=bt,
-            FAST_SIN=DIRECT_FAST_SIN, num_warps=4,
-        )
-        _snake_state[(B, triton.cdiv(C, 32))](
-            x, self.state, idx, self.a1, self.i1, C, T, self.P, self.state.stride(0),
-            BC=32, BP=triton.next_power_of_2(self.P), FAST_SIN=DIRECT_FAST_SIN,
-        )
-        return out.baddbmm_(self.w1.unsqueeze(0).expand(B, C, C), h3)

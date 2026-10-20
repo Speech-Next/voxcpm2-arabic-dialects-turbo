@@ -59,7 +59,6 @@ on top of this base engine:
 """
 
 import atexit
-import os
 import contextlib
 import sys
 from collections import deque
@@ -82,8 +81,6 @@ def get_distributed_port():
         s.bind(("localhost", 0))
         return s.getsockname()[1]
 
-
-_FIRST_PATCH_RESUMING = os.environ.get("NANOVLLM_FIRST_PATCH_RESUMING", "0") != "0"
 
 class LLMEngineBase:
     model_runner: BaseModelRunner
@@ -280,9 +277,8 @@ class LLMEngineBase:
             else:
                 runner_tasks = [self.preprocess_seq(seq, is_prefill and id(seq) not in ride) for seq in seqs]
             # a prefill step of only new streams: their first patch, with the first patch's LocDiT settings
-            # (NANOVLLM_FIRST_PATCH_RESUMING=1, for evaluations: also steps that resume streams, e.g. continuations)
             resuming = getattr(self.scheduler, "resuming", False)
-            first = is_prefill and not ride and (_FIRST_PATCH_RESUMING or not resuming)
+            first = is_prefill and not ride and not resuming
             _profile.host_mark("preprocess")
             outputs = self.model_runner.call("run", runner_tasks, is_prefill, first)
             _profile.host_mark("run")
