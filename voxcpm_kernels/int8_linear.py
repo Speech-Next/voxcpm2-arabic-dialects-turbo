@@ -43,6 +43,39 @@ def quantize_rows(x: torch.Tensor, inv_smooth: torch.Tensor | None = None):
     return q, scale
 
 
+@triton.jit
+def _group_m_order(pid, M, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, GROUP_M: tl.constexpr):
+    """(M tile, N tile) of program ``pid``: groups of GROUP_M row tiles walk the N tiles together, so the A rows and
+    weight tiles a group shares stay in L2."""
+    num_m = tl.cdiv(M, BLOCK_M)
+    num_n = tl.cdiv(N, BLOCK_N)
+    group = GROUP_M * num_n
+    first_m = (pid // group) * GROUP_M
+    gm = tl.minimum(num_m - first_m, GROUP_M)
+    return first_m + (pid % group) % gm, (pid % group) // gm
+
+
+@triton.jit
+def _int8_dot(a_ptr, b_ptr, wi, rm, rn, rows, N, K,
+              BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    """The int8 main loop of every int8 GEMM here (plain, residual, SwiGLU and qkv-RoPE epilogues, and the segmented
+    ones with a weight per row segment): int32 acc[BLOCK_M, BLOCK_N] = A[rm, :] @ B_wi[rn, :]^T, A int8 [*, K] and B
+    int8 [*, N, K] row-major (``wi``: the weight of a stack, 0 for a single one); A's rows from ``rows`` on, B's
+    from N on and the K tail are read as 0. Inlined, it compiles to the same code (PTX) as each kernel's own copy
+    did."""
+    rk = tl.arange(0, BLOCK_K)
+    a = a_ptr + rm.to(tl.int64)[:, None] * K + rk[None, :]
+    b = b_ptr + wi * N * K + rn.to(tl.int64)[None, :] * K + rk[:, None]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        kk = k * BLOCK_K + rk
+        acc += tl.dot(tl.load(a, mask=(rm[:, None] < rows) & (kk[None, :] < K), other=0),
+                      tl.load(b, mask=(rn[None, :] < N) & (kk[:, None] < K), other=0))
+        a += BLOCK_K
+        b += BLOCK_K
+    return acc
+
+
 @triton.jit(do_not_specialize=["M"])
 def _w8a8_gemm(
     a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr, bias_ptr,
@@ -51,27 +84,10 @@ def _w8a8_gemm(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
 ):
     """C[M, N] = A[M, K] (int8, row-major) @ B[N, K]^T (int8, row-major), dequantized to C's dtype."""
-    pid = tl.program_id(0)
-    num_m = tl.cdiv(M, BLOCK_M)
-    num_n = tl.cdiv(N, BLOCK_N)
-    group = GROUP_M * num_n
-    first_m = (pid // group) * GROUP_M
-    gm = tl.minimum(num_m - first_m, GROUP_M)
-    pid_m = first_m + (pid % group) % gm
-    pid_n = (pid % group) // gm
+    pid_m, pid_n = _group_m_order(tl.program_id(0), M, N, BLOCK_M, BLOCK_N, GROUP_M)
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
-    a = a_ptr + rm.to(tl.int64)[:, None] * K + rk[None, :]
-    b = b_ptr + rn.to(tl.int64)[None, :] * K + rk[:, None]
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        kk = k * BLOCK_K + rk
-        av = tl.load(a, mask=(rm[:, None] < M) & (kk[None, :] < K), other=0)
-        bv = tl.load(b, mask=(rn[None, :] < N) & (kk[:, None] < K), other=0)
-        acc += tl.dot(av, bv)
-        a += BLOCK_K
-        b += BLOCK_K
+    acc = _int8_dot(a_ptr, b_ptr, 0, rm, rn, M, N, K, BLOCK_M, BLOCK_N, BLOCK_K)
     out = acc.to(tl.float32) * tl.load(a_scale_ptr + rm, mask=rm < M, other=0.0)[:, None]
     out = out * tl.load(b_scale_ptr + rn, mask=rn < N, other=0.0)[None, :]
     if HAS_BIAS:

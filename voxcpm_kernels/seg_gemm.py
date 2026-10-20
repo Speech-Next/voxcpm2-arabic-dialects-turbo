@@ -17,6 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .int8_linear import _int8_dot
+
 _EMPTY = np.zeros((0, 3), dtype=np.int32)
 
 
@@ -144,16 +146,7 @@ def _seg_w8a8_gemm(
     wi = wi.to(tl.int64)
     rm = r0 + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
-    a = a_ptr + rm.to(tl.int64)[:, None] * K + rk[None, :]
-    b = w_ptr + wi * N * K + rn.to(tl.int64)[None, :] * K + rk[:, None]
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        kk = k * BLOCK_K + rk
-        acc += tl.dot(tl.load(a, mask=(rm[:, None] < r1) & (kk[None, :] < K), other=0),
-                      tl.load(b, mask=(rn[None, :] < N) & (kk[:, None] < K), other=0))
-        a += BLOCK_K
-        b += BLOCK_K
+    acc = _int8_dot(a_ptr, w_ptr, wi, rm, rn, r1, N, K, BLOCK_M, BLOCK_N, BLOCK_K)
     out = acc.to(tl.float32) * tl.load(a_scale_ptr + rm, mask=rm < r1, other=0.0)[:, None]
     out = out * tl.load(w_scale_ptr + wi * N + rn, mask=rn < N, other=0.0)[None, :]
     if HAS_BIAS:
@@ -182,16 +175,7 @@ def _seg_w8a8_gemm_res(
     wi = wi.to(tl.int64)
     rm = r0 + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
-    a = a_ptr + rm.to(tl.int64)[:, None] * K + rk[None, :]
-    b = w_ptr + wi * N * K + rn.to(tl.int64)[None, :] * K + rk[:, None]
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        kk = k * BLOCK_K + rk
-        acc += tl.dot(tl.load(a, mask=(rm[:, None] < r1) & (kk[None, :] < K), other=0),
-                      tl.load(b, mask=(rn[None, :] < N) & (kk[:, None] < K), other=0))
-        a += BLOCK_K
-        b += BLOCK_K
+    acc = _int8_dot(a_ptr, w_ptr, wi, rm, rn, r1, N, K, BLOCK_M, BLOCK_N, BLOCK_K)
     out = acc.to(tl.float32) * tl.load(a_scale_ptr + rm, mask=rm < r1, other=0.0)[:, None]
     out = out * tl.load(w_scale_ptr + wi * N + rn, mask=rn < N, other=0.0)[None, :]
     cm = (rm[:, None] < r1) & (rn[None, :] < N)
@@ -217,16 +201,7 @@ def _seg_w8a8_gemm_qkv_rope(
     wi = tl.load(tiles_ptr + 3 * t + 2).to(tl.int64)
     rm = r0 + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
-    a = a_ptr + rm.to(tl.int64)[:, None] * K + rk[None, :]
-    b = w_ptr + wi * N * K + rn.to(tl.int64)[None, :] * K + rk[:, None]
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        kk = k * BLOCK_K + rk
-        acc += tl.dot(tl.load(a, mask=(rm[:, None] < r1) & (kk[None, :] < K), other=0),
-                      tl.load(b, mask=(rn[None, :] < N) & (kk[:, None] < K), other=0))
-        a += BLOCK_K
-        b += BLOCK_K
+    acc = _int8_dot(a_ptr, w_ptr, wi, rm, rn, r1, N, K, BLOCK_M, BLOCK_N, BLOCK_K)
     rmask = rm < r1
     out = acc.to(tl.float32) * tl.load(a_scale_ptr + rm, mask=rmask, other=0.0)[:, None]
     out = out * tl.load(w_scale_ptr + wi * N + rn)[None, :]
@@ -265,16 +240,7 @@ def _seg_w8a8_gemm_swiglu(
     wi = wi.to(tl.int64)
     rm = r0 + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
-    a = a_ptr + rm.to(tl.int64)[:, None] * K + rk[None, :]
-    b = w_ptr + wi * N * K + rn.to(tl.int64)[None, :] * K + rk[:, None]
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        kk = k * BLOCK_K + rk
-        acc += tl.dot(tl.load(a, mask=(rm[:, None] < r1) & (kk[None, :] < K), other=0),
-                      tl.load(b, mask=(rn[None, :] < N) & (kk[:, None] < K), other=0))
-        a += BLOCK_K
-        b += BLOCK_K
+    acc = _int8_dot(a_ptr, w_ptr, wi, rm, rn, r1, N, K, BLOCK_M, BLOCK_N, BLOCK_K)
     rmask = rm < r1
     out = acc.to(tl.float32) * tl.load(a_scale_ptr + rm, mask=rmask, other=0.0)[:, None]
     out = out * tl.load(w_scale_ptr + wi * N + rn, mask=rn < N, other=0.0)[None, :]
