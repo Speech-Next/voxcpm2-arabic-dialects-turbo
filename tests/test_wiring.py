@@ -536,9 +536,10 @@ def test_metrics_and_logs(server, monkeypatch, tmp_path, caplog):
     assert 0 < m['voxcpm_first_audio_seconds_bucket{le="0.1"}'] and m["voxcpm_first_audio_seconds_sum"] < 1.0
     assert 400 / 48000 < m["voxcpm_audio_seconds_total"] < 500 / 48000  # 2 x 50 chunks of 4 samples, and 2-3 more
     logged = [(r.levelname, r.getMessage()) for r in caplog.records if r.name == "openai_server"]
-    assert ("INFO", "speech request refused (400): input has nothing to speak (only punctuation, symbols or emoji)") \
-        in logged
-    assert ("WARNING", "speech request refused (503): busy: 1 speech requests in progress (--max-streams)") in logged
+    assert ("INFO", "speech request of default refused (400): input has nothing to speak (only punctuation, "
+                    "symbols or emoji)") in logged
+    assert ("WARNING", "speech request of default refused (503): busy: 1 speech requests in progress "
+                       "(--max-streams)") in logged
     assert any(level == "INFO" and "(401)" in msg and "/metrics" in msg for level, msg in logged)
 
 
@@ -703,3 +704,43 @@ def test_a_replica_follows_the_voice_dir_by_itself(server, monkeypatch, tmp_path
             return "v" in b.state["voices"] and "v" in engines[1].voices
 
     assert run(main())
+
+
+def test_client_keys_and_limits(server, monkeypatch, tmp_path):
+    """--api-keys-file: a key per client, each with its own limits (429 with Retry-After beyond them), /metrics only
+    for a client with metrics=true, counts by client; the file read again when it changes."""
+    from nanovllm_voxcpm.entrypoints.clients import Clients
+
+    monkeypatch.setattr(nanovllm_voxcpm, "VoxCPM", SlowEngine)
+    monkeypatch.setattr(Clients, "RECHECK_S", 0.0)
+    keys = tmp_path / "keys.txt"
+    keys.write_text("a ka max_streams=1\nb kb rpm=2\nm km metrics=true\n")
+    asgi = server.build_app(server_args(tmp_path, api_keys_file=str(keys)))
+
+    def key(k):
+        return [(b"authorization", b"Bearer " + k)]
+
+    async def main():
+        async with running(asgi):
+            speak = lambda k: request(asgi, "POST", "/v1/audio/speech", speech_body(), headers=key(k))  # noqa: E731
+            first = asyncio.ensure_future(speak(b"ka"))
+            await asyncio.sleep(0.05)
+            out = {"a_second": await speak(b"ka"), "b": [await speak(b"kb") for _ in range(3)],
+                   "a_first": await first, "unknown": await speak(b"kx")}
+            out["metrics_a"] = await request(asgi, "GET", "/metrics", headers=key(b"ka"))
+            out["metrics_m"] = await request(asgi, "GET", "/metrics", headers=key(b"km"))
+            keys.write_text("c kc\nm km metrics=true\n")  # a and b gone, c new
+            out["after"] = [(await speak(k))[0] for k in (b"kc", b"ka")]
+        return out
+
+    out = run(main())
+    status, headers, body = out["a_second"]
+    assert out["a_first"][0] == 200 and status == 429 and headers[b"retry-after"] == b"1" and b"max_streams" in body
+    assert [s for s, _, _ in out["b"]] == [200, 200, 429]
+    assert 28 <= int(out["b"][2][1][b"retry-after"]) <= 30  # (rpm 2: a token every 30 s, the requests took ~1 s)
+    assert out["unknown"][0] == 401 and out["metrics_a"][0] == 403 and out["metrics_m"][0] == 200
+    values = metric_values(out["metrics_m"][2].decode())
+    assert values['voxcpm_client_requests_total{client="a",outcome="limited"}'] == 1
+    assert values['voxcpm_client_requests_total{client="b",outcome="ok"}'] == 2
+    assert values['voxcpm_requests_total{outcome="limited"}'] == 2 and b"kb" not in out["metrics_m"][2]
+    assert out["after"] == [200, 401]

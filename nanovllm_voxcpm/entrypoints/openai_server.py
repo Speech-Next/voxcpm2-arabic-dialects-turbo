@@ -54,7 +54,9 @@ as words; formal when the request's dialect or adapter, aliases resolved, is msa
 Arabic script stay as they are. ``"normalize": false`` sends the text as written.
 
 In production: ``--api-key`` (or VOXCPM_API_KEY) makes every endpoint but /health ask for ``Authorization: Bearer
-<key>``; ``--max-streams`` answers 503 (Retry-After) beyond that many speech requests at once (one A10: 150);
+<key>``; ``--api-keys-file`` names a client per key, each with its own limits (max_streams, rpm: 429 with Retry-After
+beyond them; entrypoints.clients), read again when the file changes; ``--max-streams`` answers 503 (Retry-After)
+beyond that many speech requests at once (one A10: 150);
 ``--max-input-chars`` and ``--max-voice-mb`` / ``--max-voice-seconds`` bound a request's input and a voice's clip;
 input with nothing to speak (punctuation, symbols or emoji only) is a 400. A speech request whose client disconnects
 ends its engine request. /health is 503 once the engine process has died or hung (``--hang-timeout``: nothing from it
@@ -72,10 +74,10 @@ seconds of audio sent, the engine alive.
 import argparse
 import asyncio
 import contextlib
-import hmac
 import hashlib
 import io
 import json
+import math
 import logging
 import os
 import re
@@ -97,7 +99,8 @@ from nanovllm_voxcpm.dialect_routing import (DEFAULT_ROUTES, DEFAULT_TAGGED_MODE
                                              resolve_tagged, route_table, routed_lora_config, used_adapters)
 from nanovllm_voxcpm.dialect_tts import (DEFAULT_DIT, DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters,
                                          read_as, resolve, speakable, turbo_config, use_model_calibration)
-from nanovllm_voxcpm.entrypoints.telemetry import CONTENT_TYPE, ServerMetrics, add_audio_cache, setup_logging
+from nanovllm_voxcpm.entrypoints.clients import Client, Clients
+from nanovllm_voxcpm.entrypoints.telemetry import CONTENT_TYPE, Counter, ServerMetrics, add_audio_cache, setup_logging
 
 CLONE_MODES = ("prompt_ref", "ref", "prompt")
 VOICE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # voice names are also file names in --voice-dir
@@ -596,7 +599,7 @@ def build_app(args: argparse.Namespace):
                     f"{len(state['tags'].names)} dialects (tagged model), " if state["tags"] else "")
         print(f"[server] ready: {len(state['voices'])} voices, {dialects}{len(state['adapters'])} LoRA adapters, "
               f"sample rate {state['sample_rate']}", flush=True)
-        if not args.api_key:
+        if not clients.enabled:
             print(f"[server] no --api-key: whoever reaches {args.host}:{args.port} can use every endpoint", flush=True)
         import gc
 
@@ -627,6 +630,10 @@ def build_app(args: argparse.Namespace):
         return not state["dead"] and getattr(state.get("pool"), "alive", True)
 
     metrics = ServerMetrics("speech request", lambda: state["active"], engine_alive)
+    # who may call (--api-key, --api-keys-file) and how much (a client's max_streams, rpm)
+    clients = Clients(args.api_key, getattr(args, "api_keys_file", None), log=logger)
+    by_client = metrics.add(Counter("voxcpm_client_requests_total", "speech requests by client (its name in "
+                                    "--api-keys-file; --api-key's: default) and outcome", ("client", "outcome")))
     if state["cache"] is not None:
         add_audio_cache(metrics, state["cache"].stats)
 
@@ -760,9 +767,9 @@ def build_app(args: argparse.Namespace):
             raise HTTPException(404, f"LoRA adapter '{name}' not found; registered: {state['adapters']}")
         return {"lora_name": name}
 
-    async def send_json(send, status: int, obj: dict):
+    async def send_json(send, status: int, obj: dict, retry_after: float | None = None):
         body = json.dumps(obj).encode()
-        retry = [(b"retry-after", b"1")] if status == 503 else []
+        retry = [(b"retry-after", str(max(1, math.ceil(retry_after or 1))).encode())] if status in (429, 503) else []
         await send({"type": "http.response.start", "status": status,
                     "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
                                 *retry]})
@@ -840,17 +847,24 @@ def build_app(args: argparse.Namespace):
         delays when later requests reach the engine; this path reads the body, validates it with pydantic's
         JSON parser and streams the PCM chunks itself. The response runs against the client's disconnect, which
         cancels it and so its engine request: uvicorn's send() returns quietly once the client is gone, and the
-        engine generated the rest of the audio for no one. Its outcome is counted (metrics)."""
+        engine generated the rest of the audio for no one. Its outcome is counted (metrics), also by its client."""
         t0 = time.perf_counter()
+        client: Client | None = scope.get("voxcpm.client")
+
+        def count(outcome: str) -> None:
+            metrics.requests.inc(outcome)
+            if client is not None:
+                by_client.inc(client.name, outcome)
+
         body = b""
         while True:
             msg = await receive()
             if msg["type"] == "http.disconnect":
-                metrics.requests.inc("cancelled")
+                count("cancelled")
                 return
             body += msg.get("body", b"")
             if len(body) > MAX_JSON_BODY:
-                metrics.requests.inc(await refuse(send, 413, f"request body over {MAX_JSON_BODY} bytes"))
+                count(await refuse(send, 413, f"request body over {MAX_JSON_BODY} bytes", who=client))
                 return
             if not msg.get("more_body"):
                 break
@@ -859,7 +873,7 @@ def build_app(args: argparse.Namespace):
             while (await receive())["type"] != "http.disconnect":
                 pass
 
-        job, gone = asyncio.ensure_future(respond(body, send, t0)), asyncio.ensure_future(disconnected())
+        job, gone = asyncio.ensure_future(respond(body, send, t0, client)), asyncio.ensure_future(disconnected())
         try:
             await asyncio.wait((job, gone), return_when=asyncio.FIRST_COMPLETED)
         finally:
@@ -870,13 +884,15 @@ def build_app(args: argparse.Namespace):
                 with contextlib.suppress(asyncio.CancelledError):
                     await job
             finally:  # (an exception: uvicorn logs it)
-                metrics.requests.inc("cancelled" if not job.done() or job.cancelled() else
-                                     "server_error" if job.exception() is not None else job.result())
+                count("cancelled" if not job.done() or job.cancelled() else
+                      "server_error" if job.exception() is not None else job.result())
 
-    async def refuse(send, status: int, detail, outcome: str | None = None) -> str:
-        """A speech request's error response, sent and logged: its outcome (metrics)."""
-        await send_json(send, status, {"detail": detail})
-        (logger.info if status < 500 else logger.warning)("speech request refused (%d): %s", status, brief(detail))
+    async def refuse(send, status: int, detail, outcome: str | None = None, retry_after: float | None = None,
+                     who: Client | None = None) -> str:
+        """A speech request's error response, sent and logged (``who``: its client): its outcome (metrics)."""
+        await send_json(send, status, {"detail": detail}, retry_after)
+        (logger.info if status < 500 else logger.warning)("speech request%s refused (%d): %s",
+                                                           f" of {who.name}" if who else "", status, brief(detail))
         return outcome or ("client_error" if status < 500 else "server_error")
 
     async def metered(gen, t0: float):
@@ -893,9 +909,11 @@ def build_app(args: argparse.Namespace):
             metrics.audio.inc(by=samples / state["sample_rate"])
             await gen.aclose()
 
-    async def respond(body: bytes, send, t0: float) -> str:
-        """A speech request's response, once its body is read (speech): its outcome (metrics)."""
-        busy = False
+    async def respond(body: bytes, send, t0: float, client: Client | None = None) -> str:
+        """A speech request's response, once its body is read (speech): its outcome (metrics). Beyond its client's
+        limits (max_streams, rpm): 429 with Retry-After, after the server's own (--max-streams: 503)."""
+        busy = limited = False
+        retry = None
         try:
             req = SpeechRequest.model_validate_json(body)
             if req.response_format not in AUDIO_FORMATS:
@@ -912,24 +930,31 @@ def build_app(args: argparse.Namespace):
                 raise HTTPException(503, f"busy: {state['active']} speech requests in progress (--max-streams)")
             if req.voice is not None and req.voice not in state["voices"]:
                 await shared_voice(req.voice)  # (another replica's, in --voice-dir: registered here now)
+            why, retry = clients.acquire(client)  # (counted from here: released when the response ends)
+            if why is not None:
+                limited = True
+                raise HTTPException(429, f"client {client.name}: {why}")
         except ValidationError as e:
-            return await refuse(send, 422, e.errors(include_url=False, include_input=False, include_context=False))
+            return await refuse(send, 422, e.errors(include_url=False, include_input=False, include_context=False),
+                                who=client)
         except HTTPException as e:
-            return await refuse(send, e.status_code, e.detail, "busy" if busy else None)
+            return await refuse(send, e.status_code, e.detail, "busy" if busy else "limited" if limited else None,
+                                retry if limited else None, client)
         state["active"] += 1
         users = state["voice_users"]
         if req.voice is not None:
             users[req.voice] = users.get(req.voice, 0) + 1
         try:
-            return await respond_audio(req, send, t0) or "ok"
+            return await respond_audio(req, send, t0, client) or "ok"
         finally:
             state["active"] -= 1
+            clients.release(client)
             if req.voice is not None:
                 users[req.voice] -= 1
                 if not users[req.voice]:
                     del users[req.voice]
 
-    async def respond_audio(req: SpeechRequest, send, t0: float) -> str | None:
+    async def respond_audio(req: SpeechRequest, send, t0: float, client: Client | None = None) -> str | None:
         """The audio, or an error response (its outcome; None: the audio went out)."""
         try:
             gen = metered(request_audio(req), t0)
@@ -944,7 +969,7 @@ def build_app(args: argparse.Namespace):
                     raise
                 raise HTTPException(503, "the engine process died; the server restarts") from e
         except HTTPException as e:
-            return await refuse(send, e.status_code, e.detail)
+            return await refuse(send, e.status_code, e.detail, who=client)
         enc = None
         try:
             sr = str(state["sample_rate"]).encode()
@@ -979,14 +1004,14 @@ def build_app(args: argparse.Namespace):
                     enc.close()
             await gen.aclose()
 
-    key = f"Bearer {args.api_key}".encode() if args.api_key else None
-
-    def authorized(scope) -> bool:
-        """--api-key: the request's ``Authorization: Bearer <key>`` (/health needs none)."""
-        if key is None or scope["path"] == "/health":
-            return True
+    def client_of(scope) -> tuple[bool, Client | None]:
+        """(allowed, its client): with --api-key / --api-keys-file, the client of the request's ``Authorization:
+        Bearer <key>`` (/health needs none); without, every request is allowed, no client."""
+        if not clients.enabled or scope["path"] == "/health":
+            return True, None
         got = next((v for k, v in scope.get("headers", ()) if k == b"authorization"), b"")
-        return hmac.compare_digest(got, key)
+        client = clients.identify(got[7:]) if got.startswith(b"Bearer ") else None
+        return client is not None, client
 
     async def send_metrics(send):
         body = metrics.render().encode()
@@ -995,17 +1020,24 @@ def build_app(args: argparse.Namespace):
         await send({"type": "http.response.body", "body": body})
 
     async def asgi(scope, receive, send):
-        if scope["type"] == "http" and not authorized(scope):
-            client = scope.get("client") or ("?", 0)
-            logger.info("%s %s from %s:%s refused: missing or wrong API key (401)", scope["method"],
-                        scope["path"][:100], *client[:2])
-            if scope["path"] == "/v1/audio/speech":
-                metrics.requests.inc("client_error")
-            return await send_json(send, 401, {"detail": "missing or wrong API key (Authorization: Bearer <key>)"})
-        if scope["type"] == "http" and scope["method"] == "POST" and scope["path"] == "/v1/audio/speech":
-            return await speech(scope, receive, send)
-        if scope["type"] == "http" and scope["method"] == "GET" and scope["path"] == "/metrics":
-            return await send_metrics(send)  # (behind the API key, as every endpoint but /health)
+        if scope["type"] == "http":
+            allowed, client = client_of(scope)
+            if not allowed:
+                peer = scope.get("client") or ("?", 0)
+                logger.info("%s %s from %s:%s refused: missing or wrong API key (401)", scope["method"],
+                            scope["path"][:100], *peer[:2])
+                if scope["path"] == "/v1/audio/speech":
+                    metrics.requests.inc("client_error")
+                return await send_json(send, 401, {"detail": "missing or wrong API key (Authorization: Bearer <key>)"})
+            scope["voxcpm.client"] = client
+            if scope["method"] == "POST" and scope["path"] == "/v1/audio/speech":
+                return await speech(scope, receive, send)
+            if scope["method"] == "GET" and scope["path"] == "/metrics":  # (behind the key, as all but /health)
+                if client is not None and not client.metrics:  # (every client's name and counts are in it)
+                    logger.info("GET /metrics of %s refused: its key may not read it (403)", client.name)
+                    return await send_json(send, 403, {"detail": f"client {client.name}: no metrics=true in "
+                                                                 "--api-keys-file"})
+                return await send_metrics(send)
         return await app(scope, receive, send)
 
     asgi.state = state  # (main: the engine's death ends the server, which then exits non-zero)
@@ -1051,6 +1083,9 @@ def main():
     ap.add_argument("--api-key", default=os.environ.get("VOXCPM_API_KEY"),
                     help="every endpoint but /health asks for 'Authorization: Bearer <key>' (default: $VOXCPM_API_KEY; "
                          "none: open to whoever reaches the port)")
+    ap.add_argument("--api-keys-file", help="a client per API key, with its own limits (lines 'name key "
+                    "[max_streams=N] [rpm=N] [metrics=true]', or JSON; entrypoints/clients.py), read again when it "
+                    "changes; beyond a client's limits: 429 with Retry-After")
     ap.add_argument("--max-streams", type=int, default=0, help="speech requests at once; more get 503 with "
                                                                 "Retry-After (0: no limit; one A10: 150)")
     ap.add_argument("--max-input-chars", type=int, default=4096, help="longest input of a speech request")

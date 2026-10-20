@@ -33,7 +33,9 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
   event loop is busy 10-20 ms after every engine step (a patch of every stream at once), and a paced chunk due
   meanwhile went out that much late: a stall where the server had the audio.
 - Production: ``--api-key`` (or VOXCPM_API_KEY): the handshake needs ``Authorization: Bearer <key>`` or
-  ``?api_key=<key>``; ``--max-streams`` answers an utterance beyond that many at once with an error (one A10: 150);
+  ``?api_key=<key>``; ``--api-keys-file`` names a client per key, each with its own limits (max_streams, rpm: an
+  error for an utterance beyond them, its connection kept; entrypoints.clients), read again when the file changes;
+  ``--max-streams`` answers an utterance beyond that many at once with an error (one A10: 150);
   ``--max-text-chars`` bounds a text (and text with nothing to speak, punctuation, symbols or emoji only, is an
   error); an unknown dialect is refused at the handshake; an utterance's error leaves its connection open for the
   next. ``GET /health`` on the same port answers 200 while the server runs; when the engine process dies or hangs
@@ -52,7 +54,6 @@ import asyncio
 import base64
 import contextlib
 import hashlib
-import hmac
 import json
 import logging
 import math
@@ -68,6 +69,7 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 
 from nanovllm_voxcpm.audio_cache import AudioCache, namespace
+from nanovllm_voxcpm.entrypoints.clients import Client, Clients
 from nanovllm_voxcpm.entrypoints.telemetry import (CONTENT_TYPE, FIRST_AUDIO_BUCKETS, Counter, Gauge, Histogram,
                                                    ServerMetrics, add_audio_cache, setup_logging)
 from nanovllm_voxcpm.streaming import ChunkPacer, ChunkStream, StreamSender
@@ -203,24 +205,40 @@ class Server:
             "--pace-start-ms, included)", FIRST_AUDIO_BUCKETS))
         if cache_stats is not None:
             add_audio_cache(self.metrics, cache_stats)
+        # who may connect (--api-key, --api-keys-file) and how much (a client's max_streams, rpm)
+        self.clients = Clients(getattr(args, "api_key", None), getattr(args, "api_keys_file", None), log=logger)
+        self.by_client = self.metrics.add(Counter(
+            "voxcpm_client_requests_total", "utterances by client (its name in --api-keys-file; --api-key's: default) "
+            "and outcome", ("client", "outcome")))
+
+    def client_of(self, request) -> Client | None:
+        """The handshake's client: its key in ``Authorization: Bearer <key>`` or ``?api_key=<key>`` (browsers); None:
+        no such key, or no keys (--api-key, --api-keys-file)."""
+        if not self.clients.enabled:
+            return None
+        bearer = request.headers.get("Authorization", "")
+        client = self.clients.identify(bearer[7:].encode()) if bearer.startswith("Bearer ") else None
+        query = parse_qs(urlparse(request.path).query).get("api_key", [""])[0]
+        return client or (self.clients.identify(query.encode()) if query else None)
 
     def process_request(self, connection, request):
         """Before a handshake: GET /health answered here (this process runs only while the engine's does); with
-        --api-key, a client without it (``Authorization: Bearer <key>`` or ``?api_key=<key>``, browsers) gets 401;
-        GET /metrics: the counters (telemetry), behind the key too."""
+        --api-key or --api-keys-file, a client without a key of theirs (``Authorization: Bearer <key>`` or
+        ``?api_key=<key>``, browsers) gets 401; GET /metrics: the counters (telemetry), behind a key too (with
+        --api-keys-file, of a client with metrics=true: every client's name and counts are in it)."""
         from http import HTTPStatus
 
         u = urlparse(request.path)
         if u.path == "/health":
             return connection.respond(HTTPStatus.OK, "ok\n")
-        key = getattr(self.args, "api_key", None)
-        if key:
-            bearer = request.headers.get("Authorization", "").encode()
-            query = parse_qs(u.query).get("api_key", [""])[0].encode()
-            if not (hmac.compare_digest(bearer, f"Bearer {key}".encode()) or hmac.compare_digest(query, key.encode())):
-                logger.info("%s %s refused: missing or wrong API key (401)", _peer(connection), u.path[:100])
-                return connection.respond(HTTPStatus.UNAUTHORIZED, "missing or wrong API key\n")
+        client = self.client_of(request)
+        if self.clients.enabled and client is None:
+            logger.info("%s %s refused: missing or wrong API key (401)", _peer(connection), u.path[:100])
+            return connection.respond(HTTPStatus.UNAUTHORIZED, "missing or wrong API key\n")
         if u.path == "/metrics":
+            if client is not None and not client.metrics:
+                logger.info("%s /metrics of %s refused: its key may not read it (403)", _peer(connection), client.name)
+                return connection.respond(HTTPStatus.FORBIDDEN, "this key may not read /metrics\n")
             response = connection.respond(HTTPStatus.OK, self.metrics.render())
             del response.headers["Content-Type"]
             response.headers["Content-Type"] = CONTENT_TYPE
@@ -316,10 +334,12 @@ class Server:
                                                                   f"{', '.join(sorted(self.dialects))}"}))
             await ws.close()
             return
+        client = self.client_of(ws.request)  # (its key was checked at the handshake: process_request)
         cfg = dict(rate=rate, chunk_size=n, transport=transport, segmenting=segmenting == "true",
-                   dialect=dialect, voice=self.args.default_voice, cfg_value=2.0)
-        logger.info("conn %d open: %s, dialect %s, %s, chunk_size %d, %s%s", conn, _peer(ws), dialect[:40], fmt, n,
-                    transport, ", segmenting" if cfg["segmenting"] else "")
+                   dialect=dialect, voice=self.args.default_voice, cfg_value=2.0, client=client)
+        logger.info("conn %d open: %s%s, dialect %s, %s, chunk_size %d, %s%s", conn, _peer(ws),
+                    f", client {client.name}" if client else "", dialect[:40], fmt, n, transport,
+                    ", segmenting" if cfg["segmenting"] else "")
         texts: asyncio.Queue = asyncio.Queue(QUEUED_TEXTS)
 
         async def reader():
@@ -361,14 +381,18 @@ class Server:
             rd.cancel()
 
     async def utterance(self, ws, conn, cfg, t_recv, text):
-        """One text spoken (speak_text), within --max-text-chars and --max-streams; its outcome counted (metrics)
-        and, unless it was spoken, logged."""
+        """One text spoken (speak_text), within --max-text-chars, --max-streams and its client's limits (max_streams,
+        rpm); its outcome counted (metrics, also by client) and, unless it was spoken, logged."""
         from websockets.exceptions import ConnectionClosed
 
         from nanovllm_voxcpm.dialect_tts import check_text
 
-        outcome = "client_error"
+        outcome, client = "client_error", cfg.get("client")
         try:
+            if client is not None:  # (its key as the keys file has it now: other limits, or the key removed)
+                client = self.clients.identify(client.key)
+                if client is None:
+                    raise ValueError("this connection's API key is no longer valid")
             if self.draining:
                 outcome = "busy"
                 raise ValueError("the server is shutting down")
@@ -380,11 +404,16 @@ class Server:
             if most and self.active >= most:
                 outcome = "busy"
                 raise ValueError(f"busy: {self.active} utterances in progress (--max-streams), try again")
+            why, retry = self.clients.acquire(client)
+            if why is not None:
+                outcome = "limited"
+                raise ValueError(f"client {client.name}: {why}, try again in {retry:.1f} s")
             self.active += 1
             try:
                 await self.speak_text(ws, conn, cfg, t_recv, text)
             finally:
                 self.active -= 1
+                self.clients.release(client)
             outcome = "ok"
         except ValueError as e:  # (the engine's too: the request's fault, e.g. too long for the model)
             logger.info("conn %d: utterance refused: %s", conn, message(e))
@@ -399,6 +428,8 @@ class Server:
             raise
         finally:
             self.metrics.requests.inc(outcome)
+            if client is not None:
+                self.by_client.inc(client.name, outcome)
 
     def count_audio(self, stream: ChunkStream, sends: list, t_turn: float, rate: int) -> None:
         """An utterance's audio in the metrics: its time to first audio and to the first chunk sent, the seconds."""
@@ -807,6 +838,9 @@ def cli():
     ap.add_argument("--api-key", default=os.environ.get("VOXCPM_API_KEY"),
                     help="the handshake needs 'Authorization: Bearer <key>' or ?api_key=<key> (default: "
                          "$VOXCPM_API_KEY; none: open to whoever reaches the port)")
+    ap.add_argument("--api-keys-file", help="a client per API key, with its own limits (lines 'name key "
+                    "[max_streams=N] [rpm=N] [metrics=true]', or JSON; entrypoints/clients.py), read again when it "
+                    "changes; an utterance beyond a client's limits gets an error")
     ap.add_argument("--max-streams", type=int, default=0, help="utterances at once; more get an error (0: no limit; "
                                                                 "one A10: 150)")
     ap.add_argument("--max-text-chars", type=int, default=4096, help="longest text of an utterance")
@@ -858,7 +892,7 @@ def cli():
             os._exit(0)
     for _, b in pairs:
         b.close()
-    if not args.api_key:
+    if not args.api_key and not args.api_keys_file:
         print(f"[ws_server] no --api-key: whoever reaches {args.host}:{args.port} can use it", flush=True)
     sys.exit(asyncio.run(main_engine(args, [a for a, _ in pairs], pid), loop_factory=factory))
 
