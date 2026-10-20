@@ -12,8 +12,9 @@ Endpoints (request shapes follow vLLM-Omni's, so one client can drive both serve
                                     normalize (default true)
     GET    /v1/audio/voices
     DELETE /v1/audio/voices/{name}
-    POST   /v1/audio/speech         JSON: input, voice, stream, response_format ("pcm" | "wav"), clone_mode,
-                                    seed, cfg_value, max_tokens, split, normalize (default true)
+    POST   /v1/audio/speech         JSON: input, voice, stream, response_format ("pcm" | "wav" | "mp3" | "opus" |
+                                    "flac"), speed (1.0 only), clone_mode, seed, cfg_value, max_tokens, split,
+                                    normalize (default true)
     GET    /v1/models, /health
 
 A voice is encoded to latents once, when it is registered (or preloaded with --voices), and kept inside the engine
@@ -21,6 +22,11 @@ process; a request only names it, so reference audio is never re-encoded or re-s
 caches (reference-prefix KV, LocEnc embeddings, primed VAE state) apply. clone_mode: "prompt_ref" (reference prefix + transcript continuation, the default when
 the voice has a transcript), "ref" (reference prefix only, the default otherwise) or "prompt" (continuation only).
 Audio is 16-bit little-endian mono PCM at the model's output rate (header X-Sample-Rate), streamed per chunk.
+response_format (AUDIO_FORMATS; "pcm" by default, OpenAI's default is "mp3"): "mp3" (constant bitrate), "opus" (Ogg)
+and "flac" are encoded as the audio comes (streamed, a page of Ogg per 100 ms); "wav" is sent whole (its header holds
+the length). "aac" is not offered (libsndfile does not encode it). ``speed`` other than 1.0 is a 400: a time-stretch
+that keeps the pitch was not available in good quality. ``cfg_value`` has no effect with the distilled LocDiT (the
+default), which runs without CFG; it applies with ``--dit none``.
 
 Long input is split into sentences (``split_text``) that are generated one after another into the same stream: the
 first audio comes from the first sentence, and no request is longer than a sentence. ``--voice-dir`` keeps
@@ -158,10 +164,13 @@ class SpeechRequest(BaseModel):
     model: str | None = None
     stream: bool = True
     stream_format: str | None = None  # accepted for OpenAI / vLLM-Omni compatibility
-    response_format: str = "pcm"
+    response_format: str = "pcm"  # AUDIO_FORMATS
+    speed: float = Field(1.0, ge=0.25, le=4.0)  # OpenAI's bounds; only 1.0 is served (respond)
     clone_mode: str | None = None
     seed: int | None = None
-    cfg_value: float = Field(2.0, ge=0.0, le=10.0)  # (NaN and infinity fail the bounds)
+    # (NaN and infinity fail the bounds)
+    cfg_value: float = Field(2.0, ge=0.0, le=10.0, description="classifier-free guidance; no effect with the "
+                             "distilled LocDiT (the default), which runs without CFG; applies with --dit none")
     max_tokens: int | None = Field(None, ge=1)  # latent patches to generate at most per sentence (160 ms of audio each)
     split: bool = True  # long input: sentence by sentence into one stream
     lora: str | None = None  # a registered LoRA adapter (--lora-dir / --lora)
@@ -183,6 +192,92 @@ def wav_bytes(pcm: bytes, sample_rate: int) -> bytes:
         w.setframerate(sample_rate)
         w.writeframes(pcm)
     return buf.getvalue()
+
+
+# response_format: (Content-Type, libsndfile's format and subtype); pcm and wav as before, the others encoded by
+# libsndfile (MP3 >= 1.1, Ogg Opus >= 1.0.29); aac is not among them
+AUDIO_FORMATS = {"pcm": (b"audio/pcm", None, None), "wav": (b"audio/wav", "WAV", "PCM_16"),
+                 "mp3": (b"audio/mpeg", "MP3", "MPEG_LAYER_III"), "opus": (b"audio/ogg; codecs=opus", "OGG", "OPUS"),
+                 "flac": (b"audio/flac", "FLAC", "PCM_16")}
+_SFC_SET_OGG_PAGE_LATENCY_MS = 0x1302  # (sndfile.h; soundfile has no wrapper for it)
+
+
+class _Sink:
+    """The file libsndfile writes an encoded stream into: kept whole (closing, it seeks back to finish a header);
+    take() returns what was written since the last take."""
+
+    def __init__(self) -> None:
+        self.buf, self.pos, self.sent = bytearray(), 0, 0
+
+    def write(self, data) -> int:
+        data = bytes(data)
+        end = self.pos + len(data)
+        if end > len(self.buf):
+            self.buf.extend(bytes(end - len(self.buf)))
+        self.buf[self.pos:end] = data
+        self.pos = end
+        return len(data)
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        self.pos = offset if whence == 0 else self.pos + offset if whence == 1 else len(self.buf) + offset
+        return self.pos
+
+    def tell(self) -> int:
+        return self.pos
+
+    def read(self, size: int = -1) -> bytes:
+        end = len(self.buf) if size < 0 else min(len(self.buf), self.pos + size)
+        out = bytes(self.buf[self.pos:end])
+        self.pos = end
+        return out
+
+    def take(self) -> bytes:
+        out = bytes(self.buf[self.sent:])
+        self.sent = len(self.buf)
+        return out
+
+
+class AudioEncoder:
+    """16-bit mono PCM encoded to a response_format of libsndfile (AUDIO_FORMATS) as it comes: feed() returns the bytes
+    ready so far, close() the rest. A stream's first bytes stay as sent: what libsndfile finishes at close (mp3's Xing
+    frame, flac's length) is not in it. So mp3 is constant bitrate (a decoder reckons its length from its size) and a
+    streamed flac has no length (0: unknown, as the format allows); whole() is the finished file."""
+
+    def __init__(self, fmt: str, sample_rate: int) -> None:
+        import soundfile as sf
+
+        _, major, subtype = AUDIO_FORMATS[fmt]
+        kw = {"bitrate_mode": "CONSTANT", "compression_level": 0.75} if major == "MP3" else {}  # ~96 kbit/s
+        self.sink = _Sink()
+        self.file = sf.SoundFile(self.sink, "w", samplerate=sample_rate, channels=1, format=major, subtype=subtype,
+                                 **kw)
+        if major == "OGG":  # a page per 100 ms of audio (libsndfile's default: a second): the first audio comes sooner
+            latency = sf._ffi.new("double*", 100.0)
+            sf._snd.sf_command(self.file._file, _SFC_SET_OGG_PAGE_LATENCY_MS, latency, sf._ffi.sizeof("double"))
+
+    def feed(self, pcm: bytes) -> bytes:
+        self.file.write(np.frombuffer(pcm, dtype="<i2"))
+        return self.sink.take()
+
+    def close(self) -> bytes:
+        if not self.file.closed:
+            self.file.close()
+        return self.sink.take()
+
+    def whole(self) -> bytes:
+        self.close()
+        return bytes(self.sink.buf)
+
+
+def encode_audio(fmt: str, pcm: bytes, sample_rate: int) -> bytes:
+    """A whole clip of 16-bit mono PCM in response_format ``fmt``."""
+    if fmt == "pcm":
+        return pcm
+    if fmt == "wav":
+        return wav_bytes(pcm, sample_rate)
+    enc = AudioEncoder(fmt, sample_rate)
+    enc.feed(pcm)
+    return enc.whole()
 
 
 def build_app(args: argparse.Namespace):
@@ -583,8 +678,11 @@ def build_app(args: argparse.Namespace):
         """A speech request's response, once its body is read (speech)."""
         try:
             req = SpeechRequest.model_validate_json(body)
-            if req.response_format not in ("pcm", "wav"):
-                raise HTTPException(400, "response_format must be 'pcm' or 'wav'")
+            if req.response_format not in AUDIO_FORMATS:
+                raise HTTPException(400, f"response_format: one of {', '.join(AUDIO_FORMATS)} (not "
+                                         f"{req.response_format!r})")
+            if req.speed != 1.0:  # (a time-stretch that keeps the pitch, in good quality, is not available here)
+                raise HTTPException(400, "speed: only 1.0 is supported")
             if len(req.input) > args.max_input_chars:
                 raise HTTPException(400, f"input: at most {args.max_input_chars} characters (--max-input-chars)")
             if not engine_alive():
@@ -624,28 +722,38 @@ def build_app(args: argparse.Namespace):
                 raise HTTPException(503, "the engine process died; the server restarts") from e
         except HTTPException as e:
             return await send_json(send, e.status_code, {"detail": e.detail})
+        enc = None
         try:
             sr = str(state["sample_rate"]).encode()
-            if req.stream and req.response_format == "pcm":
+            fmt = req.response_format
+            ctype = AUDIO_FORMATS[fmt][0]
+            if req.stream and fmt != "wav":
+                # pcm as it comes; mp3, opus and flac encoded as it comes, in a thread (libsndfile's calls release the
+                # GIL: the loop serves the other streams meanwhile)
+                enc = None if fmt == "pcm" else AudioEncoder(fmt, int(sr))
                 await send({"type": "http.response.start", "status": 200,
-                            "headers": [(b"content-type", b"audio/pcm"), (b"x-sample-rate", sr)]})
-                if first is not None:
-                    await send({"type": "http.response.body", "body": pcm16(first), "more_body": True})
-                async for chunk in gen:
-                    await send({"type": "http.response.body", "body": pcm16(chunk), "more_body": True})
-                await send({"type": "http.response.body", "body": b"", "more_body": False})
+                            "headers": [(b"content-type", ctype), (b"x-sample-rate", sr)]})
+                chunk = first
+                while chunk is not None:
+                    body = pcm16(chunk) if enc is None else await asyncio.to_thread(enc.feed, pcm16(chunk))
+                    if body:
+                        await send({"type": "http.response.body", "body": body, "more_body": True})
+                    chunk = await anext(gen, None)
+                tail = b"" if enc is None else await asyncio.to_thread(enc.close)
+                await send({"type": "http.response.body", "body": tail, "more_body": False})
                 return
             chunks = [] if first is None else [pcm16(first)]
             async for chunk in gen:
                 chunks.append(pcm16(chunk))
-            pcm = b"".join(chunks)
-            out, ctype = ((wav_bytes(pcm, int(sr)), b"audio/wav") if req.response_format == "wav"
-                          else (pcm, b"audio/pcm"))
+            out = await asyncio.to_thread(encode_audio, fmt, b"".join(chunks), int(sr))
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", ctype), (b"content-length", str(len(out)).encode()),
                                     (b"x-sample-rate", sr)]})
             await send({"type": "http.response.body", "body": out})
         finally:
+            if enc is not None:  # (a client gone: libsndfile's file closed now, not by the garbage collector)
+                with contextlib.suppress(Exception):
+                    enc.close()
             await gen.aclose()
 
     key = f"Bearer {args.api_key}".encode() if args.api_key else None

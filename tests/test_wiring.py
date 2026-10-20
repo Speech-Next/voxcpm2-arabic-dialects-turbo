@@ -432,3 +432,57 @@ def test_the_engine_is_watched_for_hangs_once_warmed_up(server, monkeypatch, tmp
     monkeypatch.setattr(nanovllm_voxcpm, "VoxCPM", Engine)
     run(serve(server.build_app(server_args(tmp_path, hang_timeout=7.0)), []))
     assert Engine.watched[0] == 7.0 and Engine.watched[1] > 0
+
+
+@pytest.mark.parametrize("stream", [True, False])
+@pytest.mark.parametrize("fmt", ["pcm", "wav", "mp3", "opus", "flac"])
+def test_response_formats(server, monkeypatch, tmp_path, fmt, stream):
+    """#47: mp3, opus and flac besides pcm and wav, streamed as they are encoded (wav whole); each decodes to the
+    second of audio the engine made."""
+    import shutil
+    import subprocess
+
+    sf = pytest.importorskip("soundfile")
+
+    async def generate(self, target_text, **kw):  # 1 s at 48 kHz in ten chunks
+        t = np.arange(4800) / 48000
+        for i in range(10):
+            yield (np.sin(2 * np.pi * 220 * (t + i * 0.1)) * 8000).astype(np.int16)
+
+    monkeypatch.setattr(FakeEngine, "generate", generate)
+    asgi = server.build_app(server_args(tmp_path))
+    sent = []
+
+    async def main():
+        async with running(asgi):
+            body = json.dumps({"input": "ok", "response_format": fmt, "stream": stream}).encode()
+            return await request(asgi, "POST", "/v1/audio/speech", body,
+                                 on_send=lambda m, gone: sent.append(m.get("body")))
+
+    status, headers, body = run(main())
+    assert status == 200 and headers[b"content-type"] == server.AUDIO_FORMATS[fmt][0]
+    assert (b"content-length" in headers) == (not stream or fmt == "wav")
+    if stream and fmt != "wav":  # sent as it comes, not at the end
+        assert sum(1 for b in sent if b) >= (10 if fmt == "pcm" else 3)
+    if fmt == "pcm":
+        assert len(body) == 2 * 48000
+        return
+    if fmt == "flac" and stream:  # a streamed flac has no length (0: unknown); a stream decoder reads it all
+        assert body[:4] == b"fLaC"
+        if shutil.which("ffmpeg") is None:
+            return
+        pcm = subprocess.run(["ffmpeg", "-v", "error", "-i", "-", "-f", "s16le", "-"], input=body,
+                             capture_output=True, check=True).stdout
+        assert len(pcm) == 2 * 48000
+        return
+    audio, rate = sf.read(io.BytesIO(body))
+    # (a streamed mp3 also holds the encoder's delay and padding: its Xing frame, which tells them, comes at close)
+    assert rate == 48000 and abs(len(audio) / rate - 1.0) <= (0.06 if fmt == "mp3" and stream else 0.0)
+
+
+def test_unsupported_format_and_speed(server, tmp_path):
+    out = run(serve(server.build_app(server_args(tmp_path)), [
+        {"input": "ok", "response_format": "aac"}, {"input": "ok", "speed": 1.5}, {"input": "ok", "speed": 5.0},
+        {"input": "ok", "speed": 0.1}, {"input": "ok", "speed": 1.0}]))
+    assert [status for status, _ in out] == [400, 400, 422, 422, 200]
+    assert b"pcm, wav, mp3, opus, flac" in out[0][1] and b"only 1.0" in out[1][1]
