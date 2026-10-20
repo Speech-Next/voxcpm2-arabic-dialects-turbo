@@ -14,7 +14,7 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
   <base64>} instead of binary messages. segmenting=true: a long text spoken sentence by sentence into the same stream
   (openai_server.split_text). Errors: {"type": "error", "message": ..}.
 - dialect: a name RoutedDialectTTS routes (--dialect: the default). The seed is the text's CRC32 (the same text, the
-  same audio).
+  same seed; its audio still varies with the load: a head start's split follows the queue).
 - Pacing (default; --no-pace sends each chunk the moment it is complete): streaming.ChunkPacer per utterance, the
   first chunk --pace-start-ms (150) after it is complete, the next ones on a grid of --pace-alpha (0.9) x a chunk's audio (--pace-alpha-last, 0.92,
   for the last chunk queued), more than --pace-reserve-ms queued and the rest at the end sooner (at least
