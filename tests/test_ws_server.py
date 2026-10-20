@@ -420,3 +420,98 @@ def test_shutdown_cuts_what_does_not_end_in_time():
 
     took, active = asyncio.run(main())
     assert cut == [True] and 0.3 <= took < 1.0 and active == 1
+
+
+TWO_PROCESSES = '''
+import asyncio, sys
+import numpy as np
+from nanovllm_voxcpm.entrypoints import ws_server
+
+
+class Pool:
+    async def wait_dead(self):
+        await asyncio.Future()
+
+
+class TTS:  # 20 patches, 50 ms apart: 1 s of engine time per utterance
+    sample_rate, voices, dialects, server = 48000, {"default": True}, ["egyptian"], Pool()
+
+    async def stream(self, text, **kw):
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            yield np.zeros(7680, np.float32)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        pass
+
+
+async def load_tts(args):
+    return TTS()
+
+
+ws_server.load_tts = load_tts
+sys.argv = ["ws_server", "--port", sys.argv[1], "--voice", "default=x.wav", "--link-sockets", "2"]
+ws_server.cli()
+'''
+
+
+def test_sigterm_drains_and_exits_in_time(tmp_path):
+    # SIGTERM took 31-41 s, more than Kubernetes' 30 s grace period: now the utterance in progress ends whole, then
+    # both processes exit at once (idle: at once)
+    import os
+    import signal
+    import socket
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    from websockets.asyncio.client import connect
+
+    script = tmp_path / "two.py"
+    script.write_text(TWO_PROCESSES)
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]), "CUDA_VISIBLE_DEVICES": ""}
+
+    def start():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        p = subprocess.Popen([sys.executable, str(script), str(port)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             env=env, text=True)
+        for line in p.stdout:
+            if "ready (pacing" in line:
+                return p, port
+        raise AssertionError("the server did not start")
+
+    def stop(p) -> float:
+        t = time.monotonic()
+        p.send_signal(signal.SIGTERM)
+        p.wait(timeout=30)
+        return time.monotonic() - t
+
+    p, _ = start()
+    try:
+        assert stop(p) < 2.0 and p.returncode == 0
+    finally:
+        p.kill()
+
+    async def speak_then_stop(p, port):
+        msgs = []
+        async with connect(f"ws://127.0.0.1:{port}{PATH}") as ws:
+            await ws.send("one")
+            await ws.recv()  # start
+            stopping = asyncio.ensure_future(asyncio.to_thread(stop, p))
+            async for m in ws:
+                msgs.append(json.loads(m)["type"] if isinstance(m, str) else len(m))
+        return msgs, ws.close_code, await stopping
+
+    p, port = start()
+    try:
+        msgs, code, took = asyncio.run(speak_then_stop(p, port))
+    finally:
+        p.kill()
+    assert msgs[-1] == "end_of_audio" and sum(m for m in msgs if isinstance(m, int)) == 20 * PATCH // 3 * 2
+    assert code == 1001 and took < 3.0 and p.returncode == 0

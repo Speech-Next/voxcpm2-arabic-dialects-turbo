@@ -575,7 +575,8 @@ async def main_engine(args, socks, front_pid: int) -> int:
                 # serving them meanwhile) and exits, which ends serve_engine
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(front_pid, signal.SIGTERM)
-                await asyncio.wait([engine, dead], timeout=args.shutdown_timeout + 3)
+                await asyncio.wait([engine, dead], timeout=args.shutdown_timeout + 3,
+                                   return_when=asyncio.FIRST_COMPLETED)
             engine.cancel()
             died = dead.done()
             dead.cancel()
