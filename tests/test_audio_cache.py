@@ -102,3 +102,13 @@ def test_the_engines_pcm16_kept_in_half_the_memory_played_back_bitwise():
     full = [np.full(4, 1.0, np.float32)]  # 1.0 is no int16 / 32768: kept as float32
     asyncio.run(collect(cache.through("one", engine(full, calls))))
     assert cache.get("one")[0].dtype == np.float32 and cache.get("one")[0][0] == 1.0
+
+
+def test_a_silent_start_does_not_decide_how_the_sentence_is_kept():
+    """Leading silence (zeros) is exact either way: the first sounding chunk decides; float audio that is no PCM16
+    stays float (played back bitwise)."""
+    cache, calls = AudioCache(1 << 20), []
+    audio = [np.zeros(8, np.float32), np.full(8, 0.123456, np.float32)]
+    first = asyncio.run(collect(cache.through("k", engine(audio, calls))))
+    again = asyncio.run(collect(cache.through("k", engine([], calls))))
+    assert all(a.dtype == np.float32 and a.tobytes() == b.tobytes() for a, b in zip(again, first))

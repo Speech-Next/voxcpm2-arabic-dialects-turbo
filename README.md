@@ -177,7 +177,9 @@ own, never by the event loop that paces the audio.
 The audio cache gives a sentence the same audio every time it is asked for, at any load, and a repeated sentence
 costs no GPU. A seed alone does not: a head start's split follows the queue, and the batch and the prefix cache change
 the engine's float results. It keeps each sentence's first complete generation in the server's memory (cut or failed
-ones are not kept) and drops the least recently used beyond `--audio-cache-mb`. Requests for the same sentence that
+ones are not kept) and drops the least recently used beyond `--audio-cache-mb`: 512 MB hold ~780 sentences of 7 s
+(the engine's 48 kHz PCM16, 96 KB a second). A kept sentence plays its first second at once and the rest at 4 x real
+time (a whole HTTP response at once). Requests for the same sentence that
 run at the same time each generate, and the first one to finish is kept. `voxcpm_audio_cache_hits_total`,
 `voxcpm_audio_cache_misses_total` (sentences), `voxcpm_audio_cache_bytes` and `voxcpm_audio_cache_entries` are in
 `/metrics`. Benchmark the engine with `--audio-cache-mb 0`: a benchmark that repeats its sentences measures the cache.

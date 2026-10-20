@@ -23,15 +23,16 @@ import numpy as np
 _INT16_SCALE = np.float32(1 / 32768)
 
 
-def _packed(c: np.ndarray) -> np.ndarray:
-    """A chunk as kept: the engine's PCM16 as float32 (DialectTTS.stream: int16 / 32768) as that int16, in half the
-    memory (_unpacked gives back the very same float32); other audio as it is (a copy)."""
-    if c.dtype == np.float32:
-        q = np.multiply(c, 32768, dtype=np.float32)
-        i = q.astype(np.int16)
-        if np.array_equal(i, q):
-            return i
-    return np.array(c)
+def _is_pcm16(c: np.ndarray) -> bool:
+    """Whether ``c`` is the engine's PCM16 as float32 (DialectTTS.stream: int16 / 32768): kept as that int16, in half
+    the memory, _unpacked gives back the very same float32."""
+    return c.dtype == np.float32 and np.array_equal(np.multiply(c, 32768, dtype=np.float32).astype(np.int16),
+                                                    np.multiply(c, 32768, dtype=np.float32))
+
+
+def _packed(c: np.ndarray, pcm16: bool) -> np.ndarray:
+    """A chunk as kept (a new array: the engine's may be a view of a buffer it reuses)."""
+    return np.multiply(c, 32768, dtype=np.float32).astype(np.int16) if pcm16 else np.array(c)
 
 
 def _unpacked(c: np.ndarray, dtype: np.dtype) -> np.ndarray:
@@ -52,21 +53,23 @@ class AudioCache:
     def stats(self) -> dict:
         return {"hits": self.hits, "misses": self.misses, "bytes": self.bytes, "entries": len(self.entries)}
 
+    def _kept(self, key: Hashable) -> tuple[np.dtype, tuple[np.ndarray, ...]] | None:
+        entry = self.entries.get(key)
+        if entry is not None:
+            self.entries.move_to_end(key)
+        return entry
+
     def get(self, key: Hashable) -> list[np.ndarray] | None:
         """The kept chunks of ``key`` as they were generated, or None."""
-        entry = self.entries.get(key)
-        if entry is None:
-            return None
-        self.entries.move_to_end(key)
-        dtype, chunks = entry
-        return [_unpacked(c, dtype) for c in chunks]
+        entry = self._kept(key)
+        return None if entry is None else [_unpacked(c, entry[0]) for c in entry[1]]
 
     def put(self, key: Hashable, chunks: list[np.ndarray], dtype: np.dtype | None = None) -> None:
         """Kept (``chunks`` _packed already when ``dtype`` is given: the dtype they were generated in), unless it is
         kept already (the first generation stays) or larger than a quarter of the cache."""
         if dtype is None:
             dtype = chunks[0].dtype if chunks else np.dtype(np.float32)
-            chunks = [_packed(c) for c in chunks]
+            chunks = [_packed(c, _is_pcm16(c)) for c in chunks]
         size = sum(c.nbytes for c in chunks)
         if key in self.entries or size > self.max_bytes // 4:
             return
@@ -83,24 +86,27 @@ class AudioCache:
         """The audio chunks of ``key``: the kept ones (after the first LEAD_S seconds at most ``speed`` x real time,
         None: as fast as they are taken, the event loop served between them), else ``generate()``'s, kept once it
         ends (not when it fails, or its consumer stops before the end: a client gone)."""
-        hit = self.get(key)
+        hit = self._kept(key)
         if hit is not None:
             self.hits += 1
+            dtype, chunks = hit
             t0, played = time.perf_counter(), 0.0
-            for c in hit:
-                yield c
+            for c in chunks:  # (each unpacked as it goes: 150 sentences at once, all at the start, held the loop)
+                yield _unpacked(c, dtype)
                 played += c.shape[-1] / self.sample_rate
                 ahead = (played - self.LEAD_S) / speed - (time.perf_counter() - t0) if speed else 0.0
                 await asyncio.sleep(max(ahead, 0.0))
             return
         self.misses += 1
         kept: list[np.ndarray] | None = []
-        size, dtype = 0, None
+        size, dtype, pcm16 = 0, None, None
         async with contextlib.aclosing(generate()) as gen:
             async for c in gen:
                 if kept is not None:
                     dtype = dtype or c.dtype
-                    p = _packed(c)  # (a new array: the engine's chunk may be a view of a buffer it reuses)
+                    if pcm16 is None and c.any():  # (the first sounding chunk tells the rest's form: one engine path)
+                        pcm16 = _is_pcm16(c)
+                    p = _packed(c, pcm16 is not False)  # (silence before it: int16 zeros, the same either way)
                     size += p.nbytes
                     if size <= self.max_bytes // 4:
                         kept.append(p)
