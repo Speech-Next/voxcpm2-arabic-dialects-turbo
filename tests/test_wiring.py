@@ -545,44 +545,69 @@ def test_metrics_and_logs(server, monkeypatch, tmp_path, caplog):
 def test_audio_cache(server, monkeypatch, tmp_path):
     """--audio-cache-mb: a sentence asked again in the same voice and settings gets the audio it got first (the
     engine's would differ: another load), with no engine request; a seed, another sentence or a voice registered
-    again under its name: generated. Its counts in /metrics."""
+    again under its name with other audio (other latents): generated. Requests for a sentence in progress share its
+    generation. --audio-cache-dir: another server on the directory (a restart, a replica) plays it. Its counts in
+    /metrics."""
     pytest.importorskip("multipart")
+    import hashlib
 
-    async def generate(self, target_text, **kw):  # other audio on every call
+    async def generate(self, target_text, **kw):  # other audio on every call, in five chunks 20 ms apart
         self.targets.append(target_text)
-        yield np.random.randint(-1000, 1000, 4800).astype(np.int16)
+        for _ in range(5):
+            await asyncio.sleep(0.02)
+            yield np.random.randint(-1000, 1000, 960).astype(np.int16)
+
+    async def encode_latents(self, audio, audio_format):  # a voice's latents follow its audio
+        return hashlib.sha256(audio).digest()
 
     monkeypatch.setattr(FakeEngine, "generate", generate)
-    asgi = server.build_app(server_args(tmp_path, audio_cache_mb=64))
+    monkeypatch.setattr(FakeEngine, "encode_latents", encode_latents)
+    cache_dir = str(tmp_path / "audio-cache")
+
+    async def speak(asgi, **kw):
+        status, _, body = await request(asgi, "POST", "/v1/audio/speech", json.dumps(kw).encode())
+        assert status == 200
+        return body
+
+    async def upload(asgi, name, seconds):
+        body, ctype = multipart({"name": name}, {"audio_sample": ("clip.wav", wav(seconds))})
+        assert (await request(asgi, "POST", "/v1/audio/voices", body, content_type=ctype))[0] == 200
+
+    asgi = server.build_app(server_args(tmp_path, audio_cache_mb=64, audio_cache_dir=cache_dir))
 
     async def main():
-        async def speak(**kw):
-            status, _, body = await request(asgi, "POST", "/v1/audio/speech", json.dumps(kw).encode())
-            assert status == 200
-            return body
-
-        async def upload(name):
-            body, ctype = multipart({"name": name}, {"audio_sample": ("clip.wav", wav(1.0))})
-            assert (await request(asgi, "POST", "/v1/audio/voices", body, content_type=ctype))[0] == 200
-
         async with running(asgi):
-            out = [await speak(input="مرحبا بك"), await speak(input="مرحبا بك", response_format="wav"),
-                   await speak(input="مرحبا بك", seed=7), await speak(input="أهلا")]
-            await upload("v")
-            out += [await speak(input="مرحبا بك", voice="v"), await speak(input="مرحبا بك", voice="v")]
+            out = [await speak(asgi, input="مرحبا بك"), await speak(asgi, input="مرحبا بك", response_format="wav"),
+                   await speak(asgi, input="مرحبا بك", seed=7), await speak(asgi, input="أهلا")]
+            await upload(asgi, "v", 1.0)
+            out += [await speak(asgi, input="مرحبا بك", voice="v"), await speak(asgi, input="مرحبا بك", voice="v")]
             assert (await request(asgi, "DELETE", "/v1/audio/voices/v"))[0] == 200
-            await upload("v")  # the same name, another voice
-            out.append(await speak(input="مرحبا بك", voice="v"))
+            await upload(asgi, "v", 1.2)  # the same name, another voice
+            out.append(await speak(asgi, input="مرحبا بك", voice="v"))
+            out += await asyncio.gather(*(speak(asgi, input="كيف حالك") for _ in range(3)))  # at the same time
             metrics = (await request(asgi, "GET", "/metrics"))[2].decode()
+            await asgi.state["cache"].idle()
         return out, metrics
 
     out, metrics = run(main())
     assert out[1][44:] == out[0] and out[2] != out[0]  # the wav: the same audio behind its header
     assert out[5] == out[4] and out[6] != out[4]
-    asked = [t for t in FakeEngine.last.targets if t in ("مرحبا بك", "أهلا")]
-    assert len(asked) == 5  # 7 requests, 2 from the cache
+    assert out[7] == out[8] == out[9]
+    asked = [t for t in FakeEngine.last.targets if t in ("مرحبا بك", "أهلا", "كيف حالك")]
+    assert len(asked) == 6  # 10 requests: 2 from the cache, 2 joined a generation in progress
     values = metric_values(metrics)
-    assert values["voxcpm_audio_cache_hits_total"] == 2 and values["voxcpm_audio_cache_misses_total"] == 5
+    assert values["voxcpm_audio_cache_hits_total"] == 2 and values["voxcpm_audio_cache_misses_total"] == 6
+    assert values["voxcpm_audio_cache_joins_total"] == 2
+
+    again = server.build_app(server_args(tmp_path, audio_cache_mb=64, audio_cache_dir=cache_dir))  # a restart
+
+    async def restarted():
+        async with running(again):
+            return [await speak(again, input="مرحبا بك"), await speak(again, input="كيف حالك")]
+
+    played = run(restarted())
+    assert played == [out[0], out[7]] and len(FakeEngine.last.targets) == len(
+        [t for t in FakeEngine.last.targets if t not in ("مرحبا بك", "كيف حالك")])  # (no engine request for them)
 
 
 def replica_engines(monkeypatch, base=FakeEngine) -> list:

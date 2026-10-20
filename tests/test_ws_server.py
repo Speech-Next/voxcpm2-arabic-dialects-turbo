@@ -655,4 +655,46 @@ def test_audio_cache_across_the_link_in_the_metrics():
     text = asyncio.run(main())
     assert len(tts.calls) == 1
     assert "voxcpm_audio_cache_hits_total 1" in text and "voxcpm_audio_cache_misses_total 1" in text
-    assert "voxcpm_audio_cache_entries 1" in text
+    assert "voxcpm_audio_cache_entries 1" in text and "voxcpm_audio_cache_joins_total 0" in text
+
+
+def test_audio_cache_one_generation_for_utterances_at_the_same_time_and_a_directory(tmp_path):
+    """Two utterances of the same sentence at the same time: one engine request, the same bytes; another process on
+    --audio-cache-dir (a restart, a replica) plays it from the file; a voice is known by its file's content."""
+    from nanovllm_voxcpm.audio_cache import AudioCache
+    from nanovllm_voxcpm.entrypoints.ws_server import speak
+
+    tts = FakeTTS()
+
+    async def stream(text, dialect=None, voice=None, **kw):  # other audio on every call, 20 ms apart
+        tts.calls.append((text, dialect, voice, kw))
+        for _ in range(4):
+            await asyncio.sleep(0.02)
+            yield np.random.uniform(-0.5, 0.5, PATCH).astype(np.float32)
+
+    tts.stream = stream
+    req = dict(text="مرحبا", dialect="egyptian", voice="default", cfg_value=2.0, rate=16000, chunk_ms=128, pace=None,
+               segmenting=False)
+
+    async def utter(cache, ids=None):
+        return b"".join([b async for b in speak(tts, req, cache=cache, voice_ids=ids)])
+
+    async def first():
+        cache = AudioCache(1 << 24, directory=str(tmp_path), namespace="ws")
+        both = await asyncio.gather(utter(cache, {"default": "a1"}), utter(cache, {"default": "a1"}))
+        await cache.idle()
+        return both, cache.stats()
+
+    (a, b), stats = asyncio.run(first())
+    assert a == b and len(a) > 0 and len(tts.calls) == 1 and stats["misses"] == 1 and stats["joins"] == 1
+
+    async def restarted(ids):
+        cache = AudioCache(1 << 24, directory=str(tmp_path), namespace="ws")
+        out = await utter(cache, ids)
+        await cache.idle()
+        return out, cache.stats()
+
+    played, stats = asyncio.run(restarted({"default": "a1"}))
+    assert played == a and len(tts.calls) == 1 and stats["disk_hits"] == 1
+    other, stats = asyncio.run(restarted({"default": "b2"}))  # "default" now another file: another voice
+    assert other != a and len(tts.calls) == 2 and stats["misses"] == 1
