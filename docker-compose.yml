@@ -1,0 +1,55 @@
+# One server per GPU (an A10 holds one engine, ~21 GB), README "Docker":
+#   cp .env.example .env            (HF_TOKEN, VOXCPM_API_KEY, COMPOSE_PROFILES)
+#   docker compose build
+#   docker compose --profile http up -d     the HTTP server on :8092
+#   docker compose --profile ws up -d       the WebSocket server on :8093 (both: ws on another GPU, device_ids)
+x-voxcpm: &voxcpm
+  image: voxcpm2-turbo:latest
+  build:
+    context: .
+    args:
+      CUDA_ARCH: "8.6"  # the GPUs' architectures, e.g. "8.6,8.9,9.0"
+  restart: unless-stopped
+  stop_grace_period: 30s  # the servers drain for --shutdown-timeout (10 s), then stop the engine
+  shm_size: 1gb  # the engine streams audio through 128 MiB of shared memory (Docker's default: 64 MiB)
+  environment:
+    HF_TOKEN: ${HF_TOKEN:-}  # the gated models, for their first download
+    VOXCPM_API_KEY: ${VOXCPM_API_KEY:?set VOXCPM_API_KEY in .env, the servers listen on 0.0.0.0}
+  volumes:
+    - voxcpm-cache:/cache  # the models (HF_HOME), compiled Triton kernels and torch.compile graphs
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            device_ids: ["0"]
+            capabilities: [gpu]
+
+services:
+  http:
+    <<: *voxcpm
+    profiles: [http]
+    command: ["http", "--max-streams", "150", "--voice-dir", "/voices"]
+    ports: ["8092:8092"]
+    volumes:
+      - voxcpm-cache:/cache
+      - voxcpm-voices:/voices  # voices registered over HTTP, registered again at a start
+
+  ws:
+    <<: *voxcpm
+    profiles: [ws]
+    command: ["ws", "--max-streams", "150"]  # --voice NAME=/voices/clip.wav --dialect egyptian ...
+    ports: ["8093:8092"]
+
+  # A second replica on a second GPU, behind your load balancer, its voices from the same volume:
+  # http-2:
+  #   <<: *voxcpm
+  #   profiles: [http]
+  #   command: ["http", "--max-streams", "150", "--voice-dir", "/voices"]
+  #   ports: ["8094:8092"]
+  #   volumes: [voxcpm-cache:/cache, voxcpm-voices:/voices]
+  #   deploy: {resources: {reservations: {devices: [{driver: nvidia, device_ids: ["1"], capabilities: [gpu]}]}}}
+
+volumes:
+  voxcpm-cache:
+  voxcpm-voices:
