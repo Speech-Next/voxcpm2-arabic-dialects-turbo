@@ -1093,6 +1093,16 @@ def test_muted_leading_silence_holds_back_no_new_request(monkeypatch):
     assert [s.seq_id for s in eng.step()] == ["b"]  # b's prefill comes next
 
 
+def test_a_muted_stream_s_next_stage_still_goes_by_its_empty_player():
+    eng = _staged(0.032, mid_tokens=(16, 32))
+    seq = eng.add_request("r", _words(2), max_generate_length=4, head_start=False)
+    p = seq.custom_payload
+    p.muted, p.play_end = True, time.perf_counter() - 1.0  # its player ran out a second ago, in muted silence
+    assert eng.stream_buffer(seq) is None and not eng._in_time(seq, 10)  # the stage that sounds soonest
+    p.play_end = None  # nothing streamed yet
+    assert eng._in_time(seq, 10)
+
+
 def test_cancel_while_the_head_ends_also_cancels_its_continuation():
     eng = _voxcpm2_engine(max_model_len=128)
     eng.add_request("r1", _words(20), max_generate_length=20)

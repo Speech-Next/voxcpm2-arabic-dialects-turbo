@@ -1053,7 +1053,8 @@ class VoxCPM2Engine(LLMEngineBase):
         of every other stream in its head phase (in a burst they all come due about when this one does, as in
         _plan_head)? The continuations' steps also carry every other stream (mix_decode), as _head_plan."""
         buf = self.stream_buffer(seq)
-        if buf is None and seq.custom_payload.muted:  # no sound yet: the stage that sounds soonest
+        p = seq.custom_payload
+        if buf is None and p.muted and p.play_end is not None:  # its player ran out (muted leading silence)
             buf = 0.0
         if buf is None or self.step_cost is None:
             return True
