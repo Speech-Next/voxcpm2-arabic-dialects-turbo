@@ -158,7 +158,18 @@ Run a server under a supervisor that starts it again when it exits (systemd `Res
 engine process ends with its server, also when the server is killed (`kill -9`, the OOM killer). Both servers listen on
 127.0.0.1 by default: put them behind a TLS proxy, or listen on 0.0.0.0 only with an API key. After the first
 download, `HF_HUB_OFFLINE=1` keeps a restart on the models already downloaded. Voices registered over HTTP live in
-that server's process; several replicas share them with `--voice-dir` on a shared disk (read at startup).
+that server's process, and in `--voice-dir` when it is given.
+
+**More than 150 streams: one replica per GPU.** A server runs one engine on one GPU (one A10: 150 streams at once).
+Run one server per GPU, each with its own GPU (`CUDA_VISIBLE_DEVICES=0`, `=1`, ...) and port, behind a load balancer
+(nginx, HAProxy, a Kubernetes Service) that sends each request or WebSocket connection to any replica: a request
+holds no state between replicas, so no sticky sessions are needed. For the HTTP server, give every replica the same
+`--voice-dir` on a shared disk: a voice registered on one replica is spoken on any other at once (it registers the
+voice on the first request that names it), and every `--voice-sync-s` seconds (10) each replica picks up the voices
+the others registered and drops the ones they deleted; a voice in use is dropped once its requests end. The voice's
+files are written whole, its `.json` last, so a replica never reads half a voice. The WebSocket server's voices are
+its `--voice` options, the same on every replica. The audio cache is each replica's own, unless the replicas
+share a cache directory.
 
 `/metrics` is Prometheus' text format; with an API key, scrape it with the key as a bearer token
 (`authorization: {credentials: <key>}` in the scrape config). Both servers export:

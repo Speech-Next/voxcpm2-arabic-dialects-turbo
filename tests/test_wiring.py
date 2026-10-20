@@ -583,3 +583,98 @@ def test_audio_cache(server, monkeypatch, tmp_path):
     assert len(asked) == 5  # 7 requests, 2 from the cache
     values = metric_values(metrics)
     assert values["voxcpm_audio_cache_hits_total"] == 2 and values["voxcpm_audio_cache_misses_total"] == 5
+
+
+def replica_engines(monkeypatch, base=FakeEngine) -> list:
+    """Each app (replica) its own engine (SlowEngine's requests take 0.5 s)."""
+    engines = []
+
+    class Engine(base):
+        @classmethod
+        def from_pretrained(cls, **kw):
+            engines.append(cls())
+            return engines[-1]
+
+    monkeypatch.setattr(nanovllm_voxcpm, "VoxCPM", Engine)
+    return engines
+
+
+def test_replicas_share_their_voices_through_the_voice_dir(server, monkeypatch, tmp_path):
+    """Replicas on one --voice-dir: a voice registered on A is spoken on B at once (B registers it on the first
+    request that names it); deleted on A, it goes from B at B's next sync, not while B speaks with it; a voice left
+    half written, or a file that is no voice, is no voice."""
+    pytest.importorskip("multipart")
+    engines = replica_engines(monkeypatch, SlowEngine)
+    voice_dir = tmp_path / "voices"
+    a, b = (server.build_app(server_args(tmp_path, voice_dir=str(voice_dir), voice_sync_s=0)) for _ in range(2))
+
+    async def upload(app, name):
+        body, ctype = multipart({"name": name}, {"audio_sample": ("clip.wav", wav(1.0))})
+        return (await request(app, "POST", "/v1/audio/voices", body, content_type=ctype))[0]
+
+    async def speak(app, voice):
+        return (await request(app, "POST", "/v1/audio/speech", speech_body(voice=voice)))[0]
+
+    async def listed(app):
+        return sorted(v["name"] for v in json.loads((await request(app, "GET", "/v1/audio/voices"))[2])["voices"])
+
+    async def main():
+        out = {}
+        async with running(a), running(b):
+            out["A registers v"] = await upload(a, "v")
+            out["B lists"] = await listed(b)
+            out["B speaks v"] = await speak(b, "v")
+            out["v in B's engine"] = "v" in engines[1].voices
+            out["B registers v too"] = await upload(b, "v")
+            speaking = asyncio.ensure_future(speak(b, "v"))
+            await asyncio.sleep(0.05)
+            out["A deletes v"] = (await request(a, "DELETE", "/v1/audio/voices/v"))[0]
+            out["B lists meanwhile"] = await listed(b)
+            await b.state["sync_voices"]()
+            out["v on B while it speaks"] = "v" in b.state["voices"]
+            out["B's request"] = await speaking
+            await b.state["sync_voices"]()
+            out["v on B after"] = "v" in b.state["voices"] or "v" in engines[1].voices
+            out["B speaks v after"] = await speak(b, "v")
+            (voice_dir / "half.json").write_text(json.dumps({"name": "half", "text": None}), encoding="utf-8")
+            (voice_dir / "bad.json").write_bytes(b"{no json")
+            (voice_dir / "bad.latents").write_bytes(b"latents")
+            (voice_dir / ".w.json.123.tmp").write_bytes(b"{")
+            await b.state["sync_voices"]()
+            out["B speaks half"] = await speak(b, "half")
+            out["B's voices"] = sorted(b.state["voices"])
+            out["B registers w"] = await upload(b, "w")
+            await a.state["sync_voices"]()
+            out["w on A"] = "w" in a.state["voices"] and "w" in engines[0].voices
+            out["A deletes w (B's)"] = (await request(a, "DELETE", "/v1/audio/voices/w"))[0]
+            await b.state["sync_voices"]()
+            out["w on B after"] = "w" in b.state["voices"]
+        return out
+
+    assert run(main()) == {
+        "A registers v": 200, "B lists": ["v"], "B speaks v": 200, "v in B's engine": True, "B registers v too": 409,
+        "A deletes v": 200, "B lists meanwhile": [], "v on B while it speaks": True, "B's request": 200,
+        "v on B after": False, "B speaks v after": 404, "B speaks half": 404, "B's voices": [], "B registers w": 200,
+        "w on A": True, "A deletes w (B's)": 200, "w on B after": False}
+    assert sorted(p.name for p in voice_dir.iterdir()) == [".w.json.123.tmp", "bad.json", "bad.latents", "half.json"]
+
+
+def test_a_replica_follows_the_voice_dir_by_itself(server, monkeypatch, tmp_path):
+    """--voice-sync-s: a voice another replica registered comes without a request naming it."""
+    pytest.importorskip("multipart")
+    engines = replica_engines(monkeypatch)
+    voice_dir = tmp_path / "voices"
+    a = server.build_app(server_args(tmp_path, voice_dir=str(voice_dir), voice_sync_s=0))
+    b = server.build_app(server_args(tmp_path, voice_dir=str(voice_dir), voice_sync_s=0.05))
+
+    async def main():
+        async with running(a), running(b):
+            body, ctype = multipart({"name": "v"}, {"audio_sample": ("clip.wav", wav(1.0))})
+            assert (await request(a, "POST", "/v1/audio/voices", body, content_type=ctype))[0] == 200
+            for _ in range(100):
+                if "v" in b.state["voices"]:
+                    break
+                await asyncio.sleep(0.02)
+            return "v" in b.state["voices"] and "v" in engines[1].voices
+
+    assert run(main())
