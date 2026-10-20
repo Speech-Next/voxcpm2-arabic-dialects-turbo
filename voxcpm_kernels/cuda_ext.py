@@ -13,6 +13,7 @@ import functools
 import hashlib
 import os
 import shutil
+import sys
 
 import torch
 
@@ -48,8 +49,11 @@ def load(name: str, sweep: bool = False, arch: tuple[int, int] | None = None):
     # torch adds nvcc -gencode flags of its own, TORCH_CUDA_ARCH_LIST's or else the visible GPUs' (none, at docker
     # build: an IndexError); this build's architecture as torch derives it on that GPU (8.6+PTX on an A10) keeps the
     # build the same with or without a GPU, so a start finds the image's build up to date
-    arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    arch_list, path = os.environ.get("TORCH_CUDA_ARCH_LIST"), os.environ.get("PATH", "")
     os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list or f"{major}.{minor}+PTX"
+    # the ninja next to this Python (pip's, with torch) before the shell's: another ninja version (/usr/bin's 1.11
+    # against the venv's 1.13) reads the build's log as stale and compiles everything again (~3 min at a start)
+    os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + path
     try:
         return _load(
             name=ext,
@@ -61,6 +65,7 @@ def load(name: str, sweep: bool = False, arch: tuple[int, int] | None = None):
             verbose=os.environ.get("VOXCPM_KERNELS_BUILD_VERBOSE") == "1",
         )
     finally:
+        os.environ["PATH"] = path
         if arch_list is None:
             del os.environ["TORCH_CUDA_ARCH_LIST"]
 
