@@ -31,7 +31,9 @@ default), which runs without CFG; it applies with ``--dit none``.
 Long input is split into sentences (``split_text``) that are generated one after another into the same stream: the
 first audio comes from the first sentence, and no request is longer than a sentence. ``--voice-dir`` keeps
 registered voices on disk (latents, transcript, original audio) and registers them again at startup without
-re-encoding.
+re-encoding. Replicas (one per GPU) sharing it share their voices: one registered on another replica is registered
+here on the first request that names it, and every ``--voice-sync-s`` seconds those registered or deleted elsewhere
+come or go here too (a voice in use goes once its requests end).
 
 LoRA adapters (e.g. one per dialect of a fine-tuned model): ``--lora-dir DIR`` registers every subdirectory with a
 ``lora_weights.safetensors`` (VoxCPM's LoRA format; ``--lora NAME=PATH`` adds one), all resident at once. A request
@@ -138,34 +140,80 @@ def _join(a: str, b: str) -> str:
     return a + b if a[-1] in "。！？；，、" else f"{a} {b}"  # no space after CJK punctuation
 
 
+# --voice-dir: a voice is <name>.json (its metadata), <name>.latents and its clip <name>.<format>. Replicas that share
+# the directory share their voices: each file is written whole (a temp file renamed) and the .json last, so a voice is
+# there, for the other replicas reading the directory, once its .json is; a deleted voice's .json goes first.
+VoiceSig = tuple[int, int]  # a voice's .json (modification time ns, size): another one when it is registered again
+
+
+def _write_whole(path: str, data: bytes) -> None:
+    tmp = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.{os.getpid()}.tmp")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
 def save_voice(voice_dir: str, name: str, latents: bytes, text: str | None, audio: bytes, audio_format: str,
-               normalize: bool = True) -> None:
+               normalize: bool = True) -> VoiceSig | None:
+    """The voice's files, its .json last; returns its signature (voice_sig)."""
     os.makedirs(voice_dir, exist_ok=True)
-    with open(os.path.join(voice_dir, f"{name}.latents"), "wb") as f:
-        f.write(latents)
-    with open(os.path.join(voice_dir, f"{name}.{audio_format}"), "wb") as f:
-        f.write(audio)
+    _write_whole(os.path.join(voice_dir, f"{name}.latents"), latents)
+    _write_whole(os.path.join(voice_dir, f"{name}.{audio_format}"), audio)
     meta = {"name": name, "text": text, "normalize": normalize, "audio": f"{name}.{audio_format}",
             "created_at": int(time.time())}  # text: the transcript as written
-    with open(os.path.join(voice_dir, f"{name}.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False)
+    _write_whole(os.path.join(voice_dir, f"{name}.json"), json.dumps(meta, ensure_ascii=False).encode())
+    return voice_sig(voice_dir, name)
 
 
-def load_voices(voice_dir: str) -> list[tuple[dict, bytes]]:
-    out = []
-    if not os.path.isdir(voice_dir):
+def voice_sig(voice_dir: str, name: str) -> VoiceSig | None:
+    try:
+        st = os.stat(os.path.join(voice_dir, f"{name}.json"))
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def voice_names(voice_dir: str) -> dict[str, VoiceSig]:
+    """The voices in ``voice_dir``: name -> signature (a .tmp being written is none)."""
+    out = {}
+    try:
+        entries = list(os.scandir(voice_dir))
+    except OSError:  # (no directory yet)
         return out
-    for fn in sorted(os.listdir(voice_dir)):
-        if fn.endswith(".json"):
-            meta = json.load(open(os.path.join(voice_dir, fn), encoding="utf-8"))
-            with open(os.path.join(voice_dir, f"{meta['name']}.latents"), "rb") as f:
-                out.append((meta, f.read()))
+    for e in entries:
+        if e.name.endswith(".json"):
+            with contextlib.suppress(OSError):  # (deleted meanwhile)
+                st = e.stat()
+                out[e.name[:-5]] = (st.st_mtime_ns, st.st_size)
     return out
 
 
+def read_voice(voice_dir: str, name: str) -> tuple[dict, bytes, VoiceSig] | None:
+    """A voice's metadata, latents and signature; None if it is not there whole (deleted meanwhile, or left half
+    written by a server before the files were written whole)."""
+    path = os.path.join(voice_dir, f"{name}.json")
+    try:
+        with open(path, "rb") as f:
+            st = os.fstat(f.fileno())
+            meta = json.loads(f.read())
+        with open(os.path.join(voice_dir, f"{name}.latents"), "rb") as f:
+            latents = f.read()
+    except (OSError, ValueError):
+        return None
+    if not isinstance(meta, dict) or meta.get("name") != name or not latents:
+        return None
+    return meta, latents, (st.st_mtime_ns, st.st_size)
+
+
+def load_voices(voice_dir: str) -> list[tuple[dict, bytes, VoiceSig]]:
+    return [v for v in (read_voice(voice_dir, name) for name in sorted(voice_names(voice_dir))) if v is not None]
+
+
 def delete_voice_files(voice_dir: str, name: str) -> None:
-    for fn in os.listdir(voice_dir):
-        if fn.rsplit(".", 1)[0] == name:
+    """Its .json first: the other replicas stop seeing the voice before its other files go."""
+    files = [fn for fn in os.listdir(voice_dir) if fn.rsplit(".", 1)[0] == name]
+    for fn in sorted(files, key=lambda fn: not fn.endswith(".json")):
+        with contextlib.suppress(FileNotFoundError):
             os.remove(os.path.join(voice_dir, fn))
 
 
@@ -381,9 +429,11 @@ def build_app(args: argparse.Namespace):
         clip, fmt = (await asyncio.to_thread(uploaded_clip, audio), "wav") if upload else (audio, audio_format)
         latents = await state["pool"].encode_latents(clip, fmt)
         await register_voice(name, latents, text or None, normalize)
-        if args.voice_dir:
-            save_voice(args.voice_dir, name, latents, text or None, audio, audio_format, normalize)
-        state["voices"][name] = voice_entry(latents, text or None, int(time.time()), normalize)
+        entry = voice_entry(latents, text or None, int(time.time()), normalize)
+        if args.voice_dir:  # (where the other replicas find it)
+            entry["file"] = await asyncio.to_thread(save_voice, args.voice_dir, name, latents, text or None, audio,
+                                                    audio_format, normalize)
+        state["voices"][name] = entry
         await warm_up([name])
         return {"name": name, "has_transcript": bool(text), "created_at": state["voices"][name]["created_at"]}
 
@@ -396,6 +446,66 @@ def build_app(args: argparse.Namespace):
         if state["tags"] is not None and text:
             v["latents"] = latents  # its per-dialect copies are registered from these
         return v
+
+    # Replicas sharing --voice-dir share their voices: a voice another replica registered is registered here on the
+    # first request that names it (shared_voice), and every --voice-sync-s seconds the directory's voices come and go
+    # here too (sync_voices). An entry's "file": its files' signature (voice_sig) when they are in the directory.
+    loading: dict[str, asyncio.Lock] = {}  # voice name -> its load from --voice-dir in progress
+
+    async def add_voice(name: str, meta: dict, latents: bytes, sig: VoiceSig | None) -> None:
+        norm = meta.get("normalize", True)
+        await register_voice(name, latents, meta.get("text"), norm)
+        state["voices"][name] = {**voice_entry(latents, meta.get("text"), meta.get("created_at"), norm), "file": sig}
+
+    async def drop_voice(name: str) -> None:
+        del state["voices"][name]
+        await state["pool"].unregister_voice(name)
+        if state["tags"] is not None:
+            await state["tags"].drop_voice(state["pool"], name)
+
+    async def shared_voice(name: str) -> bool:
+        """Whether this replica has voice ``name``, registering it from --voice-dir first if another replica put it
+        there (a disk read only for a voice it does not have)."""
+        if name in state["voices"]:
+            return True
+        if not args.voice_dir or not VOICE_NAME.match(name):
+            return False
+        lock = loading.setdefault(name, asyncio.Lock())
+        try:
+            async with lock:  # (one load for the requests that name it at once)
+                if name not in state["voices"]:
+                    voice = await asyncio.to_thread(read_voice, args.voice_dir, name)
+                    if voice is None:
+                        return False
+                    await add_voice(name, *voice)
+                    logger.info("voice %r loaded from --voice-dir (registered by another replica)", name)
+        finally:
+            if not lock.locked():
+                loading.pop(name, None)
+        return name in state["voices"]
+
+    async def sync_voices() -> None:
+        """--voice-dir's voices here: those other replicas registered (or registered again) come, those they deleted
+        go; one in use here goes at a later sync, once its requests end."""
+        on_disk = await asyncio.to_thread(voice_names, args.voice_dir)
+        for name, v in list(state["voices"].items()):
+            if "file" in v and on_disk.get(name) != v["file"] and not state["voice_users"].get(name):
+                await drop_voice(name)  # (registered again: loaded again below)
+                logger.info("voice %r dropped: deleted or registered again by another replica", name)
+        new = [name for name in sorted(on_disk.keys() - state["voices"].keys() - state["registering"])
+               if await shared_voice(name)]
+        if new:
+            await warm_up(new)
+
+    state["sync_voices"] = sync_voices  # (tests: a sync now)
+
+    async def sync_loop(every: float) -> None:
+        while True:
+            await asyncio.sleep(every)
+            try:
+                await sync_voices()
+            except Exception:  # noqa: BLE001 - the next round tries again
+                logger.exception("--voice-dir sync failed")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -453,11 +563,9 @@ def build_app(args: argparse.Namespace):
         if state["cache"] is not None:
             state["cache"].sample_rate = state["sample_rate"]  # (its kept sentences' pace)
         state["encoder_rate"] = int(info.get("encoder_sample_rate", 16000))
-        if args.voice_dir:  # voices registered in earlier runs: latents are on disk, no re-encoding
-            for meta, latents in load_voices(args.voice_dir):
-                norm = meta.get("normalize", True)
-                await register_voice(meta["name"], latents, meta.get("text"), norm)
-                state["voices"][meta["name"]] = voice_entry(latents, meta.get("text"), meta.get("created_at"), norm)
+        if args.voice_dir:  # voices registered in earlier runs or by other replicas: latents on disk, no re-encoding
+            for meta, latents, sig in await asyncio.to_thread(load_voices, args.voice_dir):
+                await add_voice(meta["name"], meta, latents, sig)
             await warm_up(list(state["voices"]))
         if args.voices:
             for v in json.load(open(args.voices, encoding="utf-8")):
@@ -486,11 +594,14 @@ def build_app(args: argparse.Namespace):
             state["on_engine_dead"]()
 
         watcher = asyncio.create_task(watch_engine()) if hasattr(pool, "wait_dead") else None
+        sync_s = getattr(args, "voice_sync_s", 0) if args.voice_dir else 0
+        syncer = asyncio.create_task(sync_loop(sync_s)) if sync_s > 0 else None
         try:
             yield
         finally:
-            if watcher is not None:
-                watcher.cancel()
+            for task in (watcher, syncer):
+                if task is not None:
+                    task.cancel()
             logger.info("shutting down: the engine stops")
             await pool.stop()
 
@@ -532,7 +643,8 @@ def build_app(args: argparse.Namespace):
         try:
             if not VOICE_NAME.match(name):
                 raise HTTPException(400, "voice name: 1-64 characters from A-Z a-z 0-9 . _ -")
-            if name in state["voices"] or name in state["registering"]:
+            if name in state["voices"] or name in state["registering"] or (
+                    args.voice_dir and voice_sig(args.voice_dir, name) is not None):  # (or another replica's)
                 raise HTTPException(409, f"voice '{name}' exists; DELETE /v1/audio/voices/{name} first")
             limit = int(args.max_voice_mb * (1 << 20))
             if (audio_sample.size or 0) > limit:
@@ -551,22 +663,32 @@ def build_app(args: argparse.Namespace):
 
     @app.get("/v1/audio/voices")
     async def list_voices():
-        return {"voices": [{"name": k, "has_transcript": bool(v["text"])} for k, v in state["voices"].items()]}
+        voices = {k: bool(v["text"]) for k, v in state["voices"].items()}
+        if args.voice_dir:  # the directory's voices as the replicas left them (this one follows within --voice-sync-s)
+            on_disk = await asyncio.to_thread(voice_names, args.voice_dir)
+            voices = {k: t for k, t in voices.items() if k in on_disk or "file" not in state["voices"][k]}
+            for name in sorted(on_disk.keys() - voices.keys()):
+                voice = await asyncio.to_thread(read_voice, args.voice_dir, name)
+                if voice is not None:
+                    voices[name] = bool(voice[0].get("text"))
+        return {"voices": [{"name": k, "has_transcript": t} for k, t in voices.items()]}
 
     @app.delete("/v1/audio/voices/{name}")
     async def delete_voice(name: str):
         if name not in state["voices"]:
+            if args.voice_dir and VOICE_NAME.match(name) and voice_sig(args.voice_dir, name) is not None:
+                # another replica's, not used here yet: its files go; the replicas drop it at their next sync
+                await asyncio.to_thread(delete_voice_files, args.voice_dir, name)
+                logger.info("voice %r deleted from --voice-dir", name)
+                return {"deleted": name}
             raise HTTPException(404, f"voice '{name}' not found")
         if state["voice_users"].get(name):  # (its next sentence would fail, and its response stop after a 200)
             logger.info("voice %r not deleted: in use by %d speech requests (409)", name, state["voice_users"][name])
             raise HTTPException(409, f"voice '{name}' is in use by {state['voice_users'][name]} speech requests; "
                                      "try again once they end")
-        del state["voices"][name]
-        await state["pool"].unregister_voice(name)
-        if state["tags"] is not None:
-            await state["tags"].drop_voice(state["pool"], name)
-        if args.voice_dir:
-            delete_voice_files(args.voice_dir, name)
+        if args.voice_dir:  # (first: this replica's sync would load it again from the files meanwhile)
+            await asyncio.to_thread(delete_voice_files, args.voice_dir, name)
+        await drop_voice(name)
         logger.info("voice %r deleted", name)
         return {"deleted": name}
 
@@ -772,6 +894,8 @@ def build_app(args: argparse.Namespace):
             if args.max_streams and state["active"] >= args.max_streams:
                 busy = True
                 raise HTTPException(503, f"busy: {state['active']} speech requests in progress (--max-streams)")
+            if req.voice is not None and req.voice not in state["voices"]:
+                await shared_voice(req.voice)  # (another replica's, in --voice-dir: registered here now)
         except ValidationError as e:
             return await refuse(send, 422, e.errors(include_url=False, include_input=False, include_context=False))
         except HTTPException as e:
@@ -884,7 +1008,11 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8092)
     ap.add_argument("--voices", help="JSON list of {id, wav, text?} registered at startup (if not in --voice-dir)")
-    ap.add_argument("--voice-dir", help="keep registered voices here and register them again at startup")
+    ap.add_argument("--voice-dir", help="keep registered voices here and register them again at startup; replicas "
+                                        "sharing it share their voices")
+    ap.add_argument("--voice-sync-s", type=float, default=10.0,
+                    help="every this many seconds, --voice-dir's voices registered or deleted by other replicas "
+                         "come or go here too (0: only at startup; a voice asked for is loaded at once anyway)")
     ap.add_argument("--split-max-chars", type=int, default=200, help="longest piece of input generated as one request")
     ap.add_argument("--served-model-name", default="voxcpm2")
     ap.add_argument("--max-num-seqs", type=int, default=256)
