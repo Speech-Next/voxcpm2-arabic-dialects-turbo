@@ -221,7 +221,6 @@ def _runner(n_adapters=3, max_loras=3, graphs=False):
     r.max_loras, r.max_lora_rank = max_loras, 8
     r.lora_config = SimpleNamespace(enable_dit=True)
     r.patch_size, r.feat_dim = 2, 3
-    r._fast_noise = True
     r.lora_runtime = LoRARuntime(max_loras=max_loras, max_lora_rank=8)
     r._load_lora_slot = lambda slot, payload: None
     r._enc_cache_size = 16

@@ -806,7 +806,7 @@ class VoxCPM2Engine(LLMEngineBase):
         """Tokenize a burst's texts in one batched call (the fast tokenizer, with character offsets for head
         start); add_request then takes them from this cache. Texts with CJK characters keep the per-text path
         (the multi-character Chinese token split). done: text -> (ids, offsets) the client tokenized already (the
-        server's NANOVLLM_CLIENT_TOKENIZE, with this tokenizer)."""
+        server's client process, with this tokenizer)."""
         cache, uses = self._pretok_map, self._pretok_uses
         for t in texts:
             uses[t] = uses.get(t, 0) + 1

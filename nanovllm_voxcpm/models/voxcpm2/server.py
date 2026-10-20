@@ -443,7 +443,7 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
         reg_parts[:] = [(t1 - t0) * 1000, (t2 - t1) * 1000, (time.perf_counter() - t2) * 1000]
 
     sched = getattr(getattr(srv, "llm", None), "scheduler", None)
-    group = min(sched.max_num_seqs, getattr(sched, "max_prefill_seqs", sched.max_num_seqs)) if sched else first_chunk
+    group = sched.max_num_seqs if sched else first_chunk
 
     def n_waiting() -> int:  # waiting for a prefill step, also when admitted to the next one already (prepare)
         if sched is None:

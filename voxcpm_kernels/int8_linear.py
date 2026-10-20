@@ -159,31 +159,3 @@ class W8A8Linear:
         q, a_scale = quantize_rows(x2, self.inv_smooth)
         y = w8a8_gemm(q, a_scale, self.w_q, self.w_scale, self.bias, x.dtype)
         return y.view(*shape[:-1], self.out_features)
-
-
-LINEAR_SUFFIXES = ("qkv_proj", "o_proj", "gate_up_proj", "down_proj")
-
-
-def quantize_linears(model: torch.nn.Module, prefixes, min_rows: int = 512, suffixes=LINEAR_SUFFIXES) -> int:
-    """Route big-batch calls of matching linear layers through W8A8; small batches keep bf16.
-
-    A module matches when its name starts with one of ``prefixes`` and ends with
-    one of ``suffixes``; its ``forward`` must be equivalent to F.linear(x, weight, bias).
-    Returns the number of patched modules.
-    """
-    count = 0
-    for name, mod in model.named_modules():
-        if not name.startswith(tuple(prefixes)) or not name.endswith(tuple(suffixes)):
-            continue
-        weight = getattr(mod, "weight", None)
-        if weight is None or weight.dim() != 2:
-            continue
-        q = W8A8Linear(weight, getattr(mod, "bias", None))
-        original = mod.forward
-
-        def forward(x, _q=q, _original=original, _min=min_rows):
-            return _q(x) if x.numel() // x.shape[-1] >= _min else _original(x)
-
-        mod.forward = forward
-        count += 1
-    return count
