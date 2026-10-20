@@ -488,8 +488,8 @@ def test_admitting_ahead_of_the_step_schedules_what_the_step_would(seed):
 
 
 def test_cancel_of_an_admitted_request_returns_its_budget():
-    eng = _Engine(max_tokens=12)
-    for sid, n in (("x", 6), ("y", 6), ("z", 6)):
+    eng = _Engine(max_tokens=6)
+    for sid, n in (("x", 3), ("y", 3), ("z", 3)):  # (shorter than a block: nothing published to the prefix cache)
         eng.add_sequence(Sequence(sid, list(range(1, n + 1)), BS))
     assert [s.seq_id for s in eng.scheduler.admit()] == ["x", "y"]  # z does not fit the token budget
     assert eng.scheduler.num_queued == 3
@@ -497,6 +497,23 @@ def test_cancel_of_an_admitted_request_returns_its_budget():
     seqs, is_prefill = eng.scheduler.schedule()
     assert is_prefill and [s.seq_id for s in seqs] == ["y", "z"]  # x's budget went to z
     assert eng.scheduler.num_streams == 2 and not eng.scheduler.waiting
+
+
+def test_cancel_of_an_admitted_request_with_published_blocks_waits_for_its_step():
+    # x published its full first block at admission and y, admitted with it, found it cached: cancelled at once, x
+    # left y (and the next request with that prefix) a block whose KV no step wrote
+    eng = _Engine(max_tokens=12)
+    for sid in ("x", "y", "z"):
+        eng.add_sequence(Sequence(sid, list(range(1, 7)), BS))
+    assert [s.seq_id for s in eng.scheduler.admit()] == ["x", "y"]
+    y = eng.scheduler._id_to_seq["y"]
+    assert y.num_cached_tokens == BS and eng.scheduler.holds_unwritten_blocks("x")
+    eng.cancel_sequence("x")
+    seqs, is_prefill = eng.scheduler.schedule()
+    assert is_prefill and [s.seq_id for s in seqs] == ["x", "y"]  # x's step writes the block y reads
+    with eng.stepping():
+        pass
+    assert "x" not in eng.scheduler._id_to_seq  # cancelled once its step ran
 
 
 def test_lora_starts_are_one_runner_call_per_pass_with_the_same_counts():

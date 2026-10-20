@@ -214,8 +214,13 @@ class Server:
             n = int(q.get("chunk_size", 4096))
         except ValueError:
             rate = n = 0
-        if not 8000 <= rate <= 48000 or n <= 0 or n % 2:
-            await ws.send(json.dumps({"type": "error", "message": "audio_format pcm_<8000-48000>, chunk_size even"}))
+        transport, segmenting = q.get("transport", "bytes"), q.get("segmenting", "false").lower()
+        # (chunks under ~8 ms of audio streamed slower than real time; a huge one held the whole utterance back)
+        if (not 8000 <= rate <= 48000 or n % 2 or not 0.02 <= n / (2 * rate) <= 10.0
+                or transport not in ("bytes", "json_base64") or segmenting not in ("true", "false")):
+            await ws.send(json.dumps({"type": "error", "message": "audio_format pcm_<8000-48000>, chunk_size even "
+                                      "and 20 ms to 10 s of audio, transport bytes or json_base64, segmenting true "
+                                      "or false"}))
             await ws.close()
             return
         dialect = q.get("dialect", self.args.dialect)
@@ -224,8 +229,7 @@ class Server:
                                                                   f"{', '.join(sorted(self.dialects))}"}))
             await ws.close()
             return
-        cfg = dict(rate=rate, chunk_size=n, transport=q.get("transport", "bytes"),
-                   segmenting=q.get("segmenting", "false").lower() == "true",
+        cfg = dict(rate=rate, chunk_size=n, transport=transport, segmenting=segmenting == "true",
                    dialect=dialect, voice=self.args.default_voice, cfg_value=2.0)
         self.conn += 1
         conn = self.conn
@@ -242,6 +246,9 @@ class Server:
                         obj = None
                     if isinstance(obj, dict) and obj.get("type") == "control":
                         await ws.send(json.dumps(self.control(cfg, obj)))
+                        continue
+                    if isinstance(obj, dict):  # (another protocol message, e.g. a ping: not a text to speak)
+                        await ws.send(json.dumps({"type": "error", "message": f"unknown message {obj.get('type')!r}"}))
                         continue
                     await texts.put((time.perf_counter(), msg))
             finally:  # (a full queue: the texts in it end the loop, their sends failing on the closed connection)
@@ -263,6 +270,8 @@ class Server:
 
     async def utterance(self, ws, conn, cfg, t_recv, text):
         """One text spoken (speak_text), within --max-text-chars and --max-streams."""
+        if not text.strip():
+            raise ValueError("text is empty")
         limit = getattr(self.args, "max_text_chars", 0)
         if limit and len(text) > limit:
             raise ValueError(f"text: at most {limit} characters (--max-text-chars)")

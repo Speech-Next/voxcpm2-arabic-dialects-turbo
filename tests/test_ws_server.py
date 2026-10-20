@@ -324,3 +324,36 @@ def test_busy_beyond_max_streams():
     second, first = asyncio.run(main())
     assert kinds(first) == ["start", "end_of_audio"]
     assert kinds(second) == ["error"] and "busy" in second[0]["message"]
+
+
+def test_other_json_messages_are_not_spoken_and_the_query_is_checked():
+    tts = FakeTTS(patches=1)
+    srv = Server(set(tts.voices), local_feed(tts), args())
+
+    async def ping_then_text():
+        from websockets.asyncio.client import connect
+        from websockets.asyncio.server import serve
+
+        async with serve(srv.handler, "127.0.0.1", 0) as s:
+            async with connect(f"ws://127.0.0.1:{s.sockets[0].getsockname()[1]}{PATH}?chunk_size=4096") as ws:
+                await ws.send(json.dumps({"type": "ping"}))
+                first = json.loads(await ws.recv())
+                await ws.send("   ")
+                empty = json.loads(await ws.recv())
+            return first, empty
+
+    first, empty = asyncio.run(ping_then_text())
+    assert first["type"] == "error" and "ping" in first["message"] and not tts.calls
+    assert empty == {"type": "error", "message": "text is empty"}  # (before any "start")
+
+    async def first_message(query):
+        from websockets.asyncio.client import connect
+        from websockets.asyncio.server import serve
+
+        async with serve(srv.handler, "127.0.0.1", 0) as s:
+            async with connect(f"ws://127.0.0.1:{s.sockets[0].getsockname()[1]}{PATH}?{query}") as ws:
+                return json.loads(await ws.recv())
+
+    for query in ("chunk_size=2", "chunk_size=1000000000", "chunk_size=4096&transport=foo",
+                  "chunk_size=4096&segmenting=yes"):
+        assert asyncio.run(first_message(query))["type"] == "error", query

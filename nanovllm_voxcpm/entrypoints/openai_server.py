@@ -580,7 +580,8 @@ def build_app(args: argparse.Namespace):
             if args.max_streams and state["active"] >= args.max_streams:
                 raise HTTPException(503, f"busy: {state['active']} speech requests in progress (--max-streams)")
         except ValidationError as e:
-            return await send_json(send, 422, {"detail": e.errors(include_url=False)})
+            return await send_json(send, 422, {"detail": e.errors(include_url=False, include_input=False,
+                                                                  include_context=False)})
         except HTTPException as e:
             return await send_json(send, e.status_code, {"detail": e.detail})
         state["active"] += 1

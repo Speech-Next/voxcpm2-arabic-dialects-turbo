@@ -1326,9 +1326,9 @@ def test_a_cancel_in_the_admission_window_waits_for_the_step():
     tokens = list(range(1000, 1300))  # a full block and the rest: the first block is published
     r1 = Sequence("r1", tokens, 256)
     sch.add(r1)
-    assert sch.admit() == [r1] and sch.is_admitted("r1")
+    assert sch.admit() == [r1] and sch.holds_unwritten_blocks("r1")
     eng.cancel_sequence("r1")  # the client gone in the admission window
-    assert sch.is_admitted("r1"), "cancelled before its step computed the KV of its published block"
+    assert "r1" in sch._id_to_seq, "cancelled before its step computed the KV of its published block"
     seqs, is_prefill = sch.schedule()
     assert seqs == [r1] and is_prefill
     with eng.stepping():  # (the step: r1's prefill computes its blocks' KV)
@@ -1364,7 +1364,8 @@ def test_text_ids_past_the_vocabulary_are_the_requests_fault():
 
     eng = object.__new__(VoxCPM2Engine)
     eng.vocab_size, eng.head_tokens = 10, 0
-    eng.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(convert_ids_to_tokens=lambda ids: [f"<t{i}>" for i in ids]))
+    names = SimpleNamespace(convert_ids_to_tokens=lambda ids: [f"<t{i}>" for i in ids])
+    eng.tokenizer = SimpleNamespace(tokenizer=names)
     eng._text_ids = lambda prompt_text, target_text: [1, 12, 2, 10]
     with pytest.raises(ValueError, match="cannot read: <t10>, <t12>"):
         eng.add_request("a", "text", head_start=False)

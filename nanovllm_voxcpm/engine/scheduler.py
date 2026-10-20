@@ -163,10 +163,15 @@ class Scheduler:
             i += 1
         self.waiting.insert(i, seq)
 
-    def is_admitted(self, seq_id: str) -> bool:
-        """``seq_id`` is admitted to the next prefill step ahead of it (admit), its KV not computed yet."""
+    def holds_unwritten_blocks(self, seq_id: str) -> bool:
+        """``seq_id`` is admitted to the next prefill step ahead of it (admit) and published full blocks to the prefix
+        cache whose KV that step writes: freed before it, they stayed findable with that KV never written, by the
+        next request with the same prefix and by those admitted with it that found them already."""
         seq = self._id_to_seq.get(seq_id) if self._admitted else None
-        return seq is not None and any(s is seq for s in self._admitted)
+        if seq is None or not any(s is seq for s in self._admitted):
+            return False
+        bm = self.block_manager
+        return any(bm.blocks[b].hash != -1 for b in seq.block_table[seq.num_cached_tokens // bm.block_size:])
 
     def cancel(self, seq_id: str):
         try:

@@ -376,8 +376,10 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
     # Only the ends this process uses stay open: with the others closed, the death of the process that started it (also
     # by SIGKILL: the OOM killer, a container's stop timeout) closes both pipes, and the next read (EOFError) or write
     # (BrokenPipeError) ends this one. Holding every end, it blocked on them for good and kept the GPU.
-    queue_in._q._writer.close()
-    queue_out._q._reader.close()
+    if isinstance(queue_in, _Channel):
+        queue_in._q._writer.close()
+    if isinstance(queue_out, _Channel):
+        queue_out._q._reader.close()
     # The fast tokenizer's worker pool (rayon) defaults to one thread per CPU: on this 96-CPU host a chunk of 48
     # texts took 0.9 ms hot / 1.9 ms after idle with 96 workers, 0.4 / 1.0 ms with 16 (set before the pool starts).
     os.environ.setdefault("RAYON_NUM_THREADS", "16")

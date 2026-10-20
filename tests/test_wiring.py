@@ -375,3 +375,14 @@ def test_voice_upload_limits(server, monkeypatch, tmp_path):
     audio, fmt = clips[-1]  # (startup's warm-up voice first): decoded here, 16 kHz float WAV for the engine
     info = sf.info(io.BytesIO(audio))
     assert fmt == "wav" and info.samplerate == 16000 and info.subtype == "FLOAT" and abs(info.duration - 2.0) < 0.01
+
+
+def test_a_body_that_is_not_json_is_a_422(server, tmp_path):
+    asgi = server.build_app(server_args(tmp_path))
+
+    async def main():
+        async with running(asgi):
+            return [(await request(asgi, "POST", "/v1/audio/speech", body))[:3:2] for body in (b"not json", b"{")]
+
+    for status, body in asyncio.run(main()):
+        assert status == 422 and b"json" in body.lower()
