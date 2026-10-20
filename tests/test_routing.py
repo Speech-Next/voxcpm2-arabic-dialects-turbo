@@ -327,7 +327,7 @@ def test_server_routes_by_default(models, monkeypatch):
     (e,) = FakeEngine.started
     assert sorted(e.loras) == ["@tagged", "egyptian", "hejazi", "hindi_english", "qatari", "saudi"]
     assert e.kw["lora_config"].max_mlp_loras == 1 and e.kw["lora_config"].tag_rows == 17
-    reqs = [r for r in e.requests if r["text"] != "Warm up."]
+    reqs = [r for r in e.requests if r["text"] != "Warm up." and r.get("voice") != "_warmup"]  # the start's warm-ups
     assert reqs[0]["text"] == V3["tags"]["najdi"] + "هلا" and reqs[0]["lora_name"] == TAGGED_ADAPTER
     assert reqs[1]["text"] == "هلا" and reqs[1]["lora_name"] == "qatari"
     assert reqs[2]["lora_name"] == "hejazi"

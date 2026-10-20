@@ -393,6 +393,7 @@ class EngineLink(asyncio.Protocol):
 
 async def load_tts(args):
     from nanovllm_voxcpm import RoutedDialectTTS
+    from nanovllm_voxcpm.warmup import warm_up
 
     kw = {k: v for k, v in dict(model=args.model, tagged_model=args.tagged_model, head_tokens=args.head_tokens,
                                 max_concurrency=args.max_concurrency, kv_blocks=args.kv_blocks).items()
@@ -403,21 +404,8 @@ async def load_tts(args):
     for spec in args.voice:
         name, _, path = spec.partition("=")
         await tts.add_voice(name, path)
-    # warm-up: bursts of the sizes a server meets, texts of three lengths, so that Triton compiles the kernel variants
-    # (tile sizes per row count) now and not while the first streams play (#39)
-    for n in WARMUP_BURSTS:
-        await asyncio.gather(*(tts.synthesize(WARMUP_TEXTS[i % len(WARMUP_TEXTS)], dialect=args.dialect,
-                                              voice=args.default_voice) for i in range(n)))
+    await warm_up(lambda i, text: tts.synthesize(text, dialect=args.dialect, voice=args.default_voice))
     return tts
-
-
-WARMUP_BURSTS = (1, 10, 40, 100, 150)
-WARMUP_TEXTS = (
-    "أهلاً بيك، إزيك النهارده؟",
-    "النهارده الجو حلو قوي، تعالى نتمشى شوية على الكورنيش ونشرب حاجة ساقعة.",
-    "لو عندك وقت بكره الصبح، ممكن نعدي على المكتب سوا ونخلص الورق اللي فاضل، وبعدين نروح نتغدى في المطعم اللي "
-    "جنب المحطة.",
-)
 
 
 async def serve_ws(server: Server, args, until: asyncio.Future, on_listening: Callable[[], None]):

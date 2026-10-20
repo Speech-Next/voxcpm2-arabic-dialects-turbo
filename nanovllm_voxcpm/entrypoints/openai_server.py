@@ -61,6 +61,7 @@ import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, ValidationError
 
+from nanovllm_voxcpm import warmup
 from nanovllm_voxcpm.dialect_routing import (DEFAULT_ROUTES, DEFAULT_TAGGED_MODEL, TAGGED, TAGGED_ADAPTER,
                                              resolve_tagged, route_table, routed_lora_config, used_adapters)
 from nanovllm_voxcpm.dialect_tts import (DEFAULT_DIT, DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters,
@@ -187,6 +188,34 @@ def build_app(args: argparse.Namespace):
             jobs += [run(name, m) for m in modes]
         await asyncio.gather(*jobs)
 
+    async def warm_up_kernels() -> None:
+        """nanovllm_voxcpm.warmup's bursts over the dialects, with a throwaway voice (5 s of noise): Triton compiles
+        its kernel variants now, not during the first clients' requests (#39)."""
+        name = "_warmup"
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(np.random.default_rng(0).normal(0.0, 1600.0, 5 * 16000).astype("<i2").tobytes())
+        latents = await state["pool"].encode_latents(buf.getvalue(), "wav")
+        await register_voice(name, latents, None, True)
+        state["voices"][name] = voice_entry(latents, None, 0)
+        dialects = (sorted(state["route"]) if state["route"] is not None else list(state["tags"].names)
+                    if state["tags"] is not None else state["adapters"] or [None])
+
+        async def run(i: int, text: str) -> None:
+            async for _ in request_audio(SpeechRequest(input=text, voice=name, dialect=dialects[i % len(dialects)])):
+                pass
+
+        try:
+            await warmup.warm_up(run)
+        finally:
+            del state["voices"][name]
+            await state["pool"].unregister_voice(name)
+            if state["tags"] is not None:
+                await state["tags"].drop_voice(state["pool"], name)
+
     async def register(name: str, audio: bytes, audio_format: str, text: str | None, normalize: bool = True) -> dict:
         # encoded once and kept inside the engine: a request then sends only the voice name
         latents = await state["pool"].encode_latents(audio, audio_format)
@@ -271,6 +300,7 @@ def build_app(args: argparse.Namespace):
                     with open(v["wav"], "rb") as f:
                         await register(v["id"], f.read(), os.path.splitext(v["wav"])[1].lstrip(".") or "wav",
                                        v.get("text"))
+        await warm_up_kernels()
         dialects = (f"{len(state['route'])} dialects (routed), " if state["route"] is not None else
                     f"{len(state['tags'].names)} dialects (tagged model), " if state["tags"] else "")
         print(f"[server] ready: {len(state['voices'])} voices, {dialects}{len(state['adapters'])} LoRA adapters, "
@@ -425,6 +455,19 @@ def build_app(args: argparse.Namespace):
             finally:
                 await gen.aclose()
 
+    def request_audio(req: SpeechRequest):
+        """The audio chunks of a speech request: its voice, its adapter or dialect tag, its input as read."""
+        vk = voice_kwargs(req)
+        if state["route"] is not None:
+            lk, tag, dialect = routed_kwargs(req)
+        else:
+            lk, tag = lora_kwargs(req), dialect_tag(req)
+            dialect = request_dialect(req, lk)
+        text = read_as(req.input, dialect) if req.normalize else req.input
+        if not text.strip():  # after normalization: tatweel or marks alone read as nothing
+            raise HTTPException(400, "input is empty")
+        return synthesize(req, text, {**vk, **lk}, tag, dialect)
+
     async def speech(scope, receive, send):
         """POST /v1/audio/speech as a bare ASGI handler: with hundreds of simultaneous requests, FastAPI's
         per-request work (dependency resolution, body handling) on the event loop that also drives the engine
@@ -440,16 +483,7 @@ def build_app(args: argparse.Namespace):
             req = SpeechRequest.model_validate_json(body)
             if req.response_format not in ("pcm", "wav"):
                 raise HTTPException(400, "response_format must be 'pcm' or 'wav'")
-            vk = voice_kwargs(req)
-            if state["route"] is not None:
-                lk, tag, dialect = routed_kwargs(req)
-            else:
-                lk, tag = lora_kwargs(req), dialect_tag(req)
-                dialect = request_dialect(req, lk)
-            text = read_as(req.input, dialect) if req.normalize else req.input
-            if not text.strip():  # after normalization: tatweel or marks alone read as nothing
-                raise HTTPException(400, "input is empty")
-            gen = synthesize(req, text, {**vk, **lk}, tag, dialect)
+            gen = request_audio(req)
             try:
                 first = await gen.__anext__()  # errors (e.g. a prompt too long) become HTTP errors
             except StopAsyncIteration:
