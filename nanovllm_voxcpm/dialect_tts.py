@@ -62,7 +62,7 @@ def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | 
     audio (the continuations' and, #31, the heads' of a burst's late arrivals).
     New heads are not held (#31: first audio stays at ~0.1 s at 200 at once): a head whose whole continuation would
     come too late speaks the first 24, then 48 text tokens first (intermediate stages, each reusing the KV of the one
-    before; up to 16 patches each). A front that sends the audio on in chunks passes their length (stream's
+    before; up to 16 patches each, up to 7 fewer by the stream's id: a burst's streams reach the seams apart). A front that sends the audio on in chunks passes their length (stream's
     chunk_ms), so that the deadlines allow for what it holds back, and a paced front its pace (stream's pace, e.g.
     0.9: one chunk per 0.9 x its audio at most), so that they follow its send clock.
     With a distilled LocDiT, a prefill step of new streams solves their first patch in its grid's first step and one
@@ -74,7 +74,7 @@ def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | 
     cfg = {"pcm16_output": True, "head_tokens": head_tokens, "head_patches": 3, "lead_silence_patches": 2,
            "stream_guard_ms": 100, "head_patches_max": 7, "mix_decode": True, "mix_heads": True, "step_cap_ms": 130,
            "head_hold": False,
-           "mid_tokens": [24, 48], "mid_patches_max": 16, "stage_kv_reuse": True}
+           "mid_tokens": [24, 48], "mid_patches_max": 16, "mid_stagger": 8, "stage_kv_reuse": True}
     if w8a8:
         cfg.update(w8a8=True, w8a8_targets=["base_lm", "residual_lm", "feat_encoder", "feat_decoder"])
     if dit and dit_cache:
