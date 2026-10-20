@@ -14,7 +14,9 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
   <base64>} instead of binary messages. segmenting=true: a long text spoken sentence by sentence into the same stream
   (openai_server.split_text). Errors: {"type": "error", "message": ..}.
 - dialect: a name RoutedDialectTTS routes (--dialect: the default). The seed is the text's CRC32 (the same text, the
-  same seed; its audio still varies with the load: a head start's split follows the queue).
+  same seed; its audio still varies with the load: a head start's split follows the queue). The audio cache
+  (--audio-cache-mb, 512; nanovllm_voxcpm.audio_cache) keeps each sentence's first complete audio by sentence,
+  dialect, voice and cfg_value: the same sentence then sounds the same at any load, and a repeated one costs no GPU.
 - Pacing (default; --no-pace sends each chunk the moment it is complete): streaming.ChunkPacer per utterance, the
   first chunk --pace-start-ms (150) after it is complete, the next ones on a grid of --pace-alpha (0.9) x a chunk's audio (--pace-alpha-last, 0.92,
   for the last chunk queued), more than --pace-reserve-ms queued and the rest at the end sooner (at least
@@ -62,8 +64,9 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
+from nanovllm_voxcpm.audio_cache import AudioCache
 from nanovllm_voxcpm.entrypoints.telemetry import (CONTENT_TYPE, FIRST_AUDIO_BUCKETS, Counter, Gauge, Histogram,
-                                                   ServerMetrics, setup_logging)
+                                                   ServerMetrics, add_audio_cache, setup_logging)
 from nanovllm_voxcpm.streaming import ChunkPacer, ChunkStream, StreamSender
 
 PATH = "/api/tts/stream"
@@ -96,9 +99,10 @@ def pcm16(y: np.ndarray) -> bytes:
     return (np.clip(y, -1.0, 1.0) * 32767.0).round().astype("<i2").tobytes()
 
 
-async def speak(tts, req: dict, yields: list | None = None) -> AsyncIterator[bytes]:
+async def speak(tts, req: dict, yields: list | None = None, cache: AudioCache | None = None) -> AsyncIterator[bytes]:
     """One utterance's PCM16 at req["rate"]: req = text, dialect, voice, cfg_value, rate, chunk_ms, pace, segmenting.
-    yields: [time, samples from the engine, ms resampling, bytes out] per engine chunk."""
+    yields: [time, samples from the engine, ms resampling, bytes out] per engine chunk. cache: each sentence's audio
+    as the engine gave it, by sentence, dialect, voice and cfg_value (--audio-cache-mb): played again when kept."""
     parts = [req["text"]]
     if req["segmenting"]:
         from nanovllm_voxcpm.dialect_tts import speakable
@@ -113,8 +117,13 @@ async def speak(tts, req: dict, yields: list | None = None) -> AsyncIterator[byt
         rs = soxr.ResampleStream(tts.sample_rate, req["rate"], 1, dtype="float32")
     for part in parts:
         seed = zlib.crc32(part.encode()) & 0x7FFFFFFF
-        async for c in tts.stream(part, dialect=req["dialect"], voice=req["voice"], seed=seed,
-                                  cfg_value=req["cfg_value"], chunk_ms=req["chunk_ms"], pace=req.get("pace")):
+
+        def generate(part=part, seed=seed):
+            return tts.stream(part, dialect=req["dialect"], voice=req["voice"], seed=seed, cfg_value=req["cfg_value"],
+                              chunk_ms=req["chunk_ms"], pace=req.get("pace"))
+
+        key = (part, req["dialect"], req["voice"], req["cfg_value"])
+        async for c in generate() if cache is None else cache.through(key, generate):
             t = time.perf_counter()
             out = pcm16(rs.resample_chunk(c, last=False) if rs is not None else c)
             if yields is not None:
@@ -130,13 +139,13 @@ async def speak(tts, req: dict, yields: list | None = None) -> AsyncIterator[byt
 Feed = Callable[[dict, list, ChunkStream], Callable[[], None]]
 
 
-def local_feed(tts) -> Feed:
+def local_feed(tts, cache: AudioCache | None = None) -> Feed:
     """An utterance's audio from the engine's client in this process: a task fills the stream (speak); the
     returned callable stops it (the client gone: its engine request ends)."""
 
     def feed(req: dict, yields: list, stream: ChunkStream) -> Callable[[], None]:
         async def read():
-            gen = speak(tts, req, yields)
+            gen = speak(tts, req, yields, cache)
             try:
                 async for data in gen:
                     stream.push(data)
@@ -166,9 +175,11 @@ def _peer(connection) -> str:
 class Server:
     """The connections. voices: the registered voice names; feed(req, yields, stream): fills an utterance's
     ChunkStream with its PCM16 and returns what stops it; dialects: the names a connection may ask for (None: not
-    checked here); engine_alive: whether the engine process runs (/metrics)."""
+    checked here); engine_alive: whether the engine process runs (/metrics); cache_stats: the audio cache's
+    AudioCache.stats() (/metrics; None: no cache)."""
 
-    def __init__(self, voices, feed: Feed, args, dialects=None, engine_alive: Callable[[], bool] | None = None):
+    def __init__(self, voices, feed: Feed, args, dialects=None, engine_alive: Callable[[], bool] | None = None,
+                 cache_stats: Callable[[], dict | None] | None = None):
         self.voices, self.feed, self.args, self.dialects = voices, feed, args, dialects
         self.log = open(args.log, "a") if args.log else None
         self.conn = 0
@@ -184,6 +195,8 @@ class Server:
         self.first_chunk = self.metrics.add(Histogram(
             "voxcpm_first_chunk_seconds", "from an utterance's turn to its first chunk sent (the pacer's hold, "
             "--pace-start-ms, included)", FIRST_AUDIO_BUCKETS))
+        if cache_stats is not None:
+            add_audio_cache(self.metrics, cache_stats)
 
     def process_request(self, connection, request):
         """Before a handshake: GET /health answered here (this process runs only while the engine's does); with
@@ -452,11 +465,12 @@ async def read_frame(reader: asyncio.StreamReader) -> tuple[int, int, bytes]:
     return kind, utt, await reader.readexactly(n) if n else b""
 
 
-async def serve_engine(tts, reader: asyncio.StreamReader, writers, log=None) -> None:
+async def serve_engine(tts, reader: asyncio.StreamReader, writers, log=None, cache: AudioCache | None = None) -> None:
     """The engine's side: START (an utterance's request, JSON) -> DATA frames, then END (or ERROR); CANCEL stops
     one. Returns when the connections' side closes. writers: the link's sockets (a StreamWriter or a list): an
     utterance's frames all go to writers[utt % len]. log: a file, one jsonl line per utterance (perf_counter times:
-    the START frame read, the task started, the yields [t, samples, ms resampling, bytes])."""
+    the START frame read, the task started, the yields [t, samples, ms resampling, bytes]). cache: the audio cache
+    (speak); an END frame carries its stats (JSON) to the connections' process, which exports them (/metrics)."""
     jobs: dict[int, asyncio.Task] = {}
     writers = writers if isinstance(writers, list) else [writers]
 
@@ -464,9 +478,9 @@ async def serve_engine(tts, reader: asyncio.StreamReader, writers, log=None) -> 
         t_task, yields = time.perf_counter(), []
         writer = writers[utt % len(writers)]
         try:
-            async for out in speak(tts, req, yields if log is not None else None):
+            async for out in speak(tts, req, yields if log is not None else None, cache):
                 writer.write(frame(DATA, utt, out))
-            writer.write(frame(END, utt))
+            writer.write(frame(END, utt, json.dumps(cache.stats()).encode() if cache is not None else b""))
             if log is not None:
                 log.write(json.dumps({"utt": utt, "crc": zlib.crc32(req["text"].encode()), "t_start": t_start,
                                       "t_task": t_task, "yields": yields, "t_end": time.perf_counter()}) + "\n")
@@ -500,10 +514,13 @@ class EngineLink(asyncio.Protocol):
     streams ~1 MB, and the rest waited in the engine client until its event loop got round to the socket again
     (the process hop's delay p99 7-9 ms at 200 at once)."""
 
+    cache_stats: dict | None = None  # the engine's audio cache, as its last END frame told (/metrics)
+
     def __init__(self, primary: "EngineLink | None" = None):
         loop = asyncio.get_running_loop()
         self.buf = bytearray()
         self.transport = None
+        self.main = self if primary is None else primary  # (the link the connections' process reads)
         if primary is None:
             self.ready, self.closed = loop.create_future(), loop.create_future()
             self.sinks: dict[int, tuple[ChunkStream, list | None]] = {}
@@ -542,6 +559,8 @@ class EngineLink(asyncio.Protocol):
                         del self.sinks[utt]
                         if kind == END:
                             stream.finish()
+                            if n:  # (the engine's audio cache, its stats)
+                                self.main.cache_stats = json.loads(payload.tobytes())
                         else:
                             err = payload.tobytes()
                             stream.fail((ValueError if err[:1] == b"V" else RuntimeError)(
@@ -649,7 +668,8 @@ async def main_engine(args, socks, front_pid: int) -> int:
                 raise RuntimeError("the connections' process did not start")
             announce(args)
             log = open(args.log + ".engine", "a", buffering=1) if args.log else None
-            engine = asyncio.create_task(serve_engine(tts, reader, [w for _, w in conns], log))
+            cache = AudioCache(int(args.audio_cache_mb * 2**20)) if getattr(args, "audio_cache_mb", 0) > 0 else None
+            engine = asyncio.create_task(serve_engine(tts, reader, [w for _, w in conns], log, cache))
             if args.hang_timeout and hasattr(tts.server, "watch_hangs"):  # (warmed up: no more kernels to compile)
                 tts.server.watch_hangs(args.hang_timeout)
             dead = asyncio.ensure_future(tts.server.wait_dead())
@@ -703,7 +723,8 @@ async def main_front(args, socks):
         if info is None:
             return
         server = Server(set(info["voices"]), link.start, args, set(info["dialects"]) if info.get("dialects") else None,
-                        engine_alive=lambda: not link.closed.done())
+                        engine_alive=lambda: not link.closed.done(),
+                        cache_stats=(lambda: link.cache_stats) if getattr(args, "audio_cache_mb", 0) > 0 else None)
         stop = stop_signal()
         # (a SIGTERM closes the link after the drain; the engine's process gone first: it died, e.g. a kill -9)
         link.closed.add_done_callback(lambda _: stop.done() or logger.error("the engine's process is gone: the "
@@ -766,6 +787,10 @@ def cli():
     ap.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"],
                     help="info: a line per connection opened and closed and per utterance not spoken; warning: "
                          "failures only")
+    ap.add_argument("--audio-cache-mb", type=float, default=512.0,
+                    help="each sentence's audio kept by sentence, dialect, voice and cfg_value: the same sentence gets "
+                         "the same audio at any load, and a repeated one costs no GPU (least recently used dropped "
+                         "beyond this size; 0: off, e.g. to benchmark the engine)")
     args = ap.parse_args()
     if args.default_voice is None and args.voice:
         args.default_voice = args.voice[0].partition("=")[0]

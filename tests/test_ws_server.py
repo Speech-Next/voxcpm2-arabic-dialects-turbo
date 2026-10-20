@@ -587,3 +587,72 @@ def test_an_engine_value_error_is_one_across_the_link():
         "Request may exceed max_model_len"]
     assert m['voxcpm_requests_total{outcome="client_error"}'] == 1 and m['voxcpm_requests_total{outcome="ok"}'] == 1
     assert m['voxcpm_requests_total{outcome="server_error"}'] == 0
+
+
+def test_audio_cache_the_same_sentence_the_same_audio():
+    """--audio-cache-mb: a sentence spoken again (another utterance, here segmented with another one) is played from
+    the cache: the audio it got first, though the engine's would differ (another load), with no engine request."""
+    from nanovllm_voxcpm.audio_cache import AudioCache
+    from nanovllm_voxcpm.entrypoints.ws_server import speak
+
+    tts, cache = FakeTTS(), AudioCache(1 << 24)
+
+    async def stream(text, dialect=None, voice=None, **kw):  # other audio on every call
+        tts.calls.append((text, dialect, voice, kw))
+        for _ in range(3):
+            yield np.random.uniform(-0.5, 0.5, PATCH).astype(np.float32)
+
+    tts.stream = stream
+    s1 = "النهارده الجو حلو قوي، تعالى نتمشى شوية على الكورنيش."  # (split_text: sentences of 40+ characters)
+    s2 = "وبعدين نروح نشرب حاجة ساقعة في الكافيه اللي جنب البحر."
+    req = dict(text=s1, dialect="egyptian", voice="default", cfg_value=2.0, rate=16000, chunk_ms=128, pace=None,
+               segmenting=True)
+
+    async def utter(**kw):
+        return b"".join([b async for b in speak(tts, {**req, **kw}, cache=cache)])
+
+    first, again = asyncio.run(utter()), asyncio.run(utter())
+    assert first == again and len(first) > 0 and len(tts.calls) == 1
+    both = asyncio.run(utter(text=f"{s1} {s2}"))  # its first sentence kept, the second generated
+    assert both[:len(first) - 2000] == first[:-2000] and len(tts.calls) == 2  # (but the resampler's flushed tail)
+    asyncio.run(utter(dialect="najdi"))  # another dialect: generated
+    assert len(tts.calls) == 3
+    assert cache.stats()["hits"] == 2 and cache.stats()["misses"] == 3
+
+
+def test_audio_cache_across_the_link_in_the_metrics():
+    """Two processes: the cache is the engine's (speak in serve_engine); an END frame tells its stats to the
+    connections' process, whose /metrics exports them."""
+    import socket
+
+    from nanovllm_voxcpm.audio_cache import AudioCache
+
+    tts = FakeTTS(patches=3)
+
+    async def main():
+        from websockets.asyncio.client import connect
+        from websockets.asyncio.server import serve
+
+        a, b = socket.socketpair()
+        reader, writer = await asyncio.open_connection(sock=a)
+        engine = asyncio.create_task(serve_engine(tts, reader, writer, cache=AudioCache(1 << 24)))
+        loop = asyncio.get_running_loop()
+        tb, link = await loop.create_connection(EngineLink, sock=b)
+        srv = Server({"default"}, link.start, args(), cache_stats=lambda: link.cache_stats)
+        async with serve(srv.handler, "127.0.0.1", 0) as s:
+            port = s.sockets[0].getsockname()[1]
+            for _ in range(2):
+                async with connect(f"ws://127.0.0.1:{port}/api/tts/stream?chunk_size=4096") as ws:
+                    await ws.send("x")
+                    while True:
+                        m = await ws.recv()
+                        if isinstance(m, str) and "end_of_audio" in m:
+                            break
+        tb.close()
+        await asyncio.wait_for(engine, 2)
+        return srv.metrics.render()
+
+    text = asyncio.run(main())
+    assert len(tts.calls) == 1
+    assert "voxcpm_audio_cache_hits_total 1" in text and "voxcpm_audio_cache_misses_total 1" in text
+    assert "voxcpm_audio_cache_entries 1" in text

@@ -57,7 +57,9 @@ In production: ``--api-key`` (or VOXCPM_API_KEY) makes every endpoint but /healt
 input with nothing to speak (punctuation, symbols or emoji only) is a 400. A speech request whose client disconnects
 ends its engine request. /health is 503 once the engine process has died or hung (``--hang-timeout``: nothing from it
 for that long while requests wait), and the server then exits with code 1, for its supervisor to start it again. On
-SIGTERM the requests in progress get ``--shutdown-timeout`` seconds to end. A voice in use is not deleted (409).
+SIGTERM the requests in progress get ``--shutdown-timeout`` seconds to end. A voice in use is not deleted (409). The
+audio cache (``--audio-cache-mb``, nanovllm_voxcpm.audio_cache) gives a sentence asked again in the same voice and
+settings the audio it got first, at any load, without the engine.
 A line is logged per speech request that fails or is refused and per voice registered or deleted (``--log-level``),
 by a thread of its own (telemetry). ``GET /metrics`` (behind the API key, as a bearer token): Prometheus' text format,
 speech requests by outcome and in progress, time to first audio (from the request to the engine's first audio),
@@ -69,6 +71,7 @@ import asyncio
 import contextlib
 import hmac
 import io
+import itertools
 import json
 import logging
 import os
@@ -86,11 +89,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from nanovllm_voxcpm import warmup
+from nanovllm_voxcpm.audio_cache import AudioCache
 from nanovllm_voxcpm.dialect_routing import (DEFAULT_ROUTES, DEFAULT_TAGGED_MODEL, TAGGED, TAGGED_ADAPTER,
                                              resolve_tagged, route_table, routed_lora_config, used_adapters)
 from nanovllm_voxcpm.dialect_tts import (DEFAULT_DIT, DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters,
                                          read_as, resolve, speakable, turbo_config, use_model_calibration)
-from nanovllm_voxcpm.entrypoints.telemetry import CONTENT_TYPE, ServerMetrics, setup_logging
+from nanovllm_voxcpm.entrypoints.telemetry import CONTENT_TYPE, ServerMetrics, add_audio_cache, setup_logging
 
 CLONE_MODES = ("prompt_ref", "ref", "prompt")
 VOICE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # voice names are also file names in --voice-dir
@@ -298,9 +302,12 @@ def brief(detail) -> str:
 def build_app(args: argparse.Namespace):
     # active: speech requests in progress (--max-streams); registering: voice names being uploaded; voice_users: speech
     # requests in progress per voice (no DELETE meanwhile); dead: the engine process died; on_engine_dead: what stops
-    # the server then (main: uvicorn's exit)
+    # the server then (main: uvicorn's exit); cache: the audio cache (--audio-cache-mb, None: off)
     state: dict = {"voices": {}, "tags": None, "route": None, "active": 0, "registering": set(), "voice_users": {},
                    "dead": False, "on_engine_dead": lambda: os.kill(os.getpid(), signal.SIGTERM)}
+    cache_mb = getattr(args, "audio_cache_mb", 0)
+    state["cache"] = AudioCache(int(cache_mb * 2**20)) if cache_mb > 0 else None
+    voice_versions = itertools.count(1)  # a voice registered again under its name is another voice (the cache's key)
 
     async def warm_up(names: list[str]) -> None:
         """One short generation per voice and clone mode: fills the voice's caches (prefix KV, LocEnc embeddings,
@@ -333,7 +340,9 @@ def build_app(args: argparse.Namespace):
                     if state["tags"] is not None else state["adapters"] or [None])
 
         async def run(i: int, text: str) -> None:
-            async for _ in request_audio(SpeechRequest(input=text, voice=name, dialect=dialects[i % len(dialects)])):
+            # (not from the audio cache: the bursts are there to run the engine)
+            req = SpeechRequest(input=text, voice=name, dialect=dialects[i % len(dialects)])
+            async for _ in request_audio(req, cached=False):
                 pass
 
         try:
@@ -383,7 +392,7 @@ def build_app(args: argparse.Namespace):
         await state["pool"].register_voice(name, latents, read_as(text) if text and normalize else text)
 
     def voice_entry(latents: bytes, text: str | None, created_at, normalize: bool = True) -> dict:
-        v = {"text": text, "created_at": created_at, "normalize": normalize}
+        v = {"text": text, "created_at": created_at, "normalize": normalize, "version": next(voice_versions)}
         if state["tags"] is not None and text:
             v["latents"] = latents  # its per-dialect copies are registered from these
         return v
@@ -489,6 +498,8 @@ def build_app(args: argparse.Namespace):
         return not state["dead"] and getattr(state.get("pool"), "alive", True)
 
     metrics = ServerMetrics("speech request", lambda: state["active"], engine_alive)
+    if state["cache"] is not None:
+        add_audio_cache(metrics, state["cache"].stats)
 
     @app.get("/health")
     async def health():
@@ -624,12 +635,19 @@ def build_app(args: argparse.Namespace):
             return state["tags"].canonical(req.dialect) if req.dialect is not None else None
         return lk.get("lora_name")
 
-    async def synthesize(req: SpeechRequest, text: str, vk: dict, tag: str | None = None, dialect: str | None = None):
+    async def synthesize(req: SpeechRequest, text: str, vk: dict, tag: str | None = None, dialect: str | None = None,
+                         cached: bool = True):
         """Audio chunks of ``text`` (the input as read): one engine request per sentence, in order. tag: a tagged
         model's dialect token, in front of every sentence (or of the transcript: prompt_ref clones the voice's copy for
-        the tag, its transcript read in ``dialect``)."""
+        the tag, its transcript read in ``dialect``). cached: through the audio cache (--audio-cache-mb)."""
         # (a piece of punctuation or symbols alone has nothing to speak: the model made up sounds for it)
         parts = [p for p in split_text(text, args.split_max_chars) if speakable(p)] if req.split else [text]
+        # the audio cache's key, but for the sentence and its seed: what else decides the audio (the voice as
+        # registered: a voice registered again under its name is another)
+        voice = state["voices"].get(vk.get("voice")) if vk.get("voice") else None
+        base = (repr(sorted(vk.items())), voice["version"] if voice else None, tag, dialect, req.cfg_value,
+                req.max_tokens or args.max_tokens)
+        cache = state["cache"] if cached else None
         prefix = ""
         if tag is not None:
             if vk.get("clone_mode") in ("prompt_ref", "prompt"):  # the transcript comes first: the tag leads it
@@ -640,20 +658,25 @@ def build_app(args: argparse.Namespace):
             else:
                 prefix = tag
         for k, part in enumerate(parts):
-            gen = state["pool"].generate(
-                target_text=prefix + part,
-                cfg_value=req.cfg_value,
-                seed=None if req.seed is None else req.seed + k,
-                max_generate_length=req.max_tokens or args.max_tokens,
-                **vk,
-            )
+            seed = None if req.seed is None else req.seed + k
+
+            def generate(part=part, seed=seed, vk=vk):
+                return state["pool"].generate(
+                    target_text=prefix + part,
+                    cfg_value=req.cfg_value,
+                    seed=seed,
+                    max_generate_length=req.max_tokens or args.max_tokens,
+                    **vk,
+                )
+
+            gen = generate() if cache is None else cache.through((base, part, seed), generate)
             try:
                 async for chunk in gen:
                     yield chunk
             finally:
                 await gen.aclose()
 
-    def request_audio(req: SpeechRequest):
+    def request_audio(req: SpeechRequest, cached: bool = True):
         """The audio chunks of a speech request: its voice, its adapter or dialect tag, its input as read."""
         vk = voice_kwargs(req)
         if state["route"] is not None:
@@ -666,7 +689,7 @@ def build_app(args: argparse.Namespace):
             raise HTTPException(400, "input is empty")
         if not speakable(text):
             raise HTTPException(400, "input has nothing to speak (only punctuation, symbols or emoji)")
-        return synthesize(req, text, {**vk, **lk}, tag, dialect)
+        return synthesize(req, text, {**vk, **lk}, tag, dialect, cached)
 
     async def speech(scope, receive, send):
         """POST /v1/audio/speech as a bare ASGI handler: with hundreds of simultaneous requests, FastAPI's
@@ -892,6 +915,11 @@ def main():
     ap.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"],
                     help="info: a line per speech request refused or failed and per voice registered or deleted; "
                          "warning: failures only")
+    ap.add_argument("--audio-cache-mb", type=float, default=512.0,
+                    help="each sentence's audio kept by what decides it (text as read, voice, dialect, seed, "
+                         "cfg_value, max_tokens): the same sentence gets the same audio at any load, and a repeated "
+                         "one costs no GPU (least recently used dropped beyond this size; 0: off, e.g. to benchmark "
+                         "the engine)")
     args = ap.parse_args()
     os.environ.setdefault("NANOVLLM_SUBMIT_FLUSH_EVERY", "4")  # requests reach the engine as a steady stream
     listener = setup_logging("openai_server", args.log_level)

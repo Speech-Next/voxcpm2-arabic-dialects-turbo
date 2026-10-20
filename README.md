@@ -21,8 +21,8 @@ One NVIDIA A10 (24 GB), default settings.
 | 100 | 76-81 ms | 257-270 ms | 257-270 ms | 0 | 0 |
 | 150 | 94-148 ms | 275-330 ms | 288-330 ms | 0 | 0 |
 
-Three runs (both scripts of the dataset), the range over the runs. The script prints no p99 for TTFB; its max is the
-upper bound. Results and the check against the server's own timestamps:
+Three runs (both scripts of the dataset), the range over the runs, without the audio cache (`--audio-cache-mb 0`).
+The script prints no p99 for TTFB; its max is the upper bound. Results and the check against the server's own timestamps:
 [`results/`](https://huggingface.co/datasets/VoxCPM-Kernel/benchmark-test-data-ar/tree/main/results).
 
 - TTFA: time to first audio, from the text arriving at the server to the engine's first audio (server side).
@@ -150,6 +150,7 @@ the pitch in good quality). `cfg_value` has no effect with the distilled LocDiT 
 | `DELETE /v1/audio/voices/{name}` | | 409 while a speech request uses the voice |
 | logs (`--log-level`, `info`) | a line per connection opened and closed (code, reason) and per utterance not spoken; shutdown, engine death | a line per speech request refused or failed (status, why) and per voice registered or deleted; shutdown, engine death |
 | metrics | `GET /metrics` on the same port, behind the API key | `GET /metrics`, behind the API key |
+| audio cache (`--audio-cache-mb`, 512; `0`: off) | each sentence's first audio, by sentence, dialect, voice and `cfg_value` | each sentence's first audio, by sentence as read, voice (as registered), dialect, `seed`, `cfg_value` and `max_tokens` |
 
 Run a server under a supervisor that starts it again when it exits (systemd `Restart=always`, Docker
 `--restart unless-stopped`, Kubernetes), and send traffic once `/health` answers (~75 s after start). A stop
@@ -172,6 +173,14 @@ that server's process; several replicas share them with `--voice-dir` on a share
 The WebSocket server also exports `voxcpm_connections`, `voxcpm_connections_total` and `voxcpm_first_chunk_seconds`
 (to the first chunk sent, the pacer's `--pace-start-ms` hold included). Log lines are written by a thread of their
 own, never by the event loop that paces the audio.
+
+The audio cache gives a sentence the same audio every time it is asked for, at any load, and a repeated sentence
+costs no GPU. A seed alone does not: a head start's split follows the queue, and the batch and the prefix cache change
+the engine's float results. It keeps each sentence's first complete generation in the server's memory (cut or failed
+ones are not kept) and drops the least recently used beyond `--audio-cache-mb`. Requests for the same sentence that
+run at the same time each generate, and the first one to finish is kept. `voxcpm_audio_cache_hits_total`,
+`voxcpm_audio_cache_misses_total` (sentences), `voxcpm_audio_cache_bytes` and `voxcpm_audio_cache_entries` are in
+`/metrics`. Benchmark the engine with `--audio-cache-mb 0`: a benchmark that repeats its sentences measures the cache.
 
 ## Examples
 
