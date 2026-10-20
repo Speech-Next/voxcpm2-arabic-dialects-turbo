@@ -71,12 +71,11 @@ def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | 
     dit_cache: with the original LocDiT (``dit`` None), reuse its middle layers on some solver steps ("light",
     "medium" or a plan, see models/voxcpm2/dit_cache.py).
     w8a8=False: bf16 layers (quality measurements of a model whose SmoothQuant statistics were not calibrated)."""
-    cfg = {"pcm16_output": True, "head_tokens": head_tokens, "head_patches": 3, "lead_silence_patches": 2,
+    cfg = {"pcm16_output": True, "head_tokens": head_tokens, "lead_silence_patches": 2,
            "stream_guard_ms": 100, "head_patches_max": 7, "mix_decode": True, "mix_heads": True, "step_cap_ms": 130,
-           "head_hold": False,
            "mid_tokens": [24, 48], "mid_patches_max": 16, "mid_stagger": 8, "stage_kv_reuse": True}
     if w8a8:
-        cfg.update(w8a8=True, w8a8_targets=["base_lm", "residual_lm", "feat_encoder", "feat_decoder"])
+        cfg["w8a8"] = True
     if dit and dit_cache:
         raise ValueError("dit_cache is for the original LocDiT (dit=None): the distilled one has no step to spare")
     if dit:
@@ -300,9 +299,9 @@ class DialectTTS:
         read as the model was trained on it (read_as: digits, dates, times, amounts as words; formal when the dialect,
         aliases resolved, is msa); hindi_english and text without Arabic script stay as they are. chunk_ms: the
         caller sends the audio on in chunks of this many ms, holding the rest back until a chunk is full (e.g. 128 for
-        4096-byte chunks of 16 kHz PCM16): the engine's deadlines allow for it (None: TurboConfig.client_chunk_ms).
+        4096-byte chunks of 16 kHz PCM16): the engine's deadlines allow for it (None: every patch whole).
         pace: the caller paces the chunks, one per pace x chunk_ms at most (a jitter buffer): the deadlines follow its
-        send clock (None: TurboConfig.client_pace)."""
+        send clock (None: not paced)."""
         if dialect is not None and dialect not in self.dialects:
             raise ValueError(f"unknown dialect {dialect!r}; dialects: {', '.join(self.dialects)}")
         canonical = self.tags.canonical(dialect) if self.tags is not None and dialect is not None else dialect

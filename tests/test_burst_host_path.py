@@ -441,10 +441,10 @@ class _Engine(LLMEngineBase):
         self.ps = []
 
 
-def _config(max_num_seqs=6, blocks=40, block_size=BS, max_tokens=40, prefill_max_seqs=0):
+def _config(max_num_seqs=6, blocks=40, block_size=BS, max_tokens=40):
     return SimpleNamespace(max_num_seqs=max_num_seqs, max_num_batched_tokens=max_tokens, num_kvcache_blocks=blocks,
                            kvcache_block_size=block_size,
-                           model_config=SimpleNamespace(turbo=SimpleNamespace(prefill_max_seqs=prefill_max_seqs)))
+                           model_config=SimpleNamespace(turbo=SimpleNamespace()))
 
 
 def _requests(rng, n):

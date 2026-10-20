@@ -1271,7 +1271,7 @@ class BaseModelRunner:
             },
         }
         # graphs of the first patch's LocDiT solve ("base" / "lora"); when the first patch has settings of its own
-        # (dit_first_t_span, first_steps), also of the others' ("rest_base" / "rest_lora"), for prefill steps that
+        # (dit_first_t_span), also of the others' ("rest_base" / "rest_lora"), for prefill steps that
         # resume streams or decode running ones (Context.first_patch False)
         self.prefill_diffusion_graphs: dict[str, dict[int, torch.cuda.CUDAGraph]] = {"base": {}, "lora": {}}
         capture_lora_graphs = bool(
@@ -1329,12 +1329,12 @@ class BaseModelRunner:
         """
         self.prefill_backbone_graphs = {}
         turbo = getattr(getattr(self._config, "model_config", None), "turbo", None)
-        if not getattr(turbo, "prefill_graph", False) or not hasattr(self.model, "prefill_no_audio"):
-            return
-        if self.max_loras > 0:
+        if turbo is None or self.max_loras > 0:
             return
         cfg = self._config
-        t_cap = min(cfg.max_num_batched_tokens, getattr(turbo, "prefill_graph_max_tokens", 2048), 2048)
+        # largest prefill step replayed from a graph: small steps are launch-bound (a single cloned request), large
+        # ones GPU-bound, where padding up to the next bucket would only add work
+        t_cap = min(cfg.max_num_batched_tokens, 512)
         buckets = sorted({b for b in (64, 128, 256, 384, 512, 768, 1024, 1536, 2048) if b <= t_cap} | {t_cap})
         nseq_max = min(cfg.max_num_seqs, 256)
         t_max = buckets[-1]
