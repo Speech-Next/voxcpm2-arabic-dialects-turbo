@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import unicodedata
 from typing import AsyncIterator
 
 import numpy as np
@@ -39,6 +40,20 @@ def read_as(text: str, dialect: str | None = None) -> str:
     if dialect in NOT_ARABIC or not has_arabic(text):
         return text
     return normalize_text(text, "msa" if dialect == "msa" else "colloquial")
+
+
+def speakable(text: str) -> bool:
+    """Whether ``text`` has something to speak: a letter or a digit. Text of punctuation, symbols, emoji, marks or
+    tatweel alone was spoken anyway (the model made up sounds for it)."""
+    return any(c.isalnum() and unicodedata.category(c) != "Lm" for c in text)
+
+
+def check_text(text: str, normalized: bool = False) -> None:
+    """ValueError for text with nothing to speak (empty, or punctuation / symbols / emoji only)."""
+    if not text.strip():
+        raise ValueError("text is empty" + (" after normalization" if normalized else ""))
+    if not speakable(text):
+        raise ValueError("text has nothing to speak (only punctuation, symbols or emoji)")
 
 
 def resolve(spec: str) -> str:
@@ -307,8 +322,7 @@ class DialectTTS:
         canonical = self.tags.canonical(dialect) if self.tags is not None and dialect is not None else dialect
         if normalize:
             text = read_as(text, canonical)
-        if not text.strip():
-            raise ValueError("text is empty" + (" after normalization" if normalize else ""))
+        check_text(text, normalize)
         kw = {}
         if voice is not None:
             if voice not in self.voices:

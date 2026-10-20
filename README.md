@@ -134,12 +134,16 @@ curl http://127.0.0.1:8092/v1/audio/speech -H 'Content-Type: application/json' \
 | requests at once (`--max-streams`, one A10: 150) | more get `{"type": "error", "message": "busy: .."}` | more get 503 with `Retry-After` |
 | health | `GET /health` on the same port | `GET /health`, 503 once the engine process died |
 | input | `--max-text-chars` (4096), messages up to 1 MiB, an unknown dialect refused at the handshake | `--max-input-chars` (4096), `cfg_value` 0-10, voice clips up to `--max-voice-mb` (10) and `--max-voice-seconds` (30) |
+| text with nothing to speak (punctuation, symbols or emoji only) | an error for that utterance | 400 |
 | a client that leaves | its engine request ends (pings every `--ping-interval`, 20 s, find dead connections) | its engine request ends |
-| the engine process dies | the server exits with code 1 | the server exits with code 1 |
+| the engine process dies, or hangs (sends nothing for `--hang-timeout`, 60 s, while requests wait) | the server exits with code 1 | the server exits with code 1 |
+| SIGTERM | no new connection or utterance; those in progress get `--shutdown-timeout` (10 s) to end, then are cut; the connections close with 1001 | no new connection; requests in progress get `--shutdown-timeout` (10 s) to end, then are cut |
+| `DELETE /v1/audio/voices/{name}` | | 409 while a speech request uses the voice |
 
 Run a server under a supervisor that starts it again when it exits (systemd `Restart=always`, Docker
-`--restart unless-stopped`, Kubernetes), and send traffic once `/health` answers (~75 s after start). The engine
-process ends with its server, also when the server is killed (`kill -9`, the OOM killer). Both servers listen on
+`--restart unless-stopped`, Kubernetes), and send traffic once `/health` answers (~75 s after start). A stop
+(SIGTERM) takes at most `--shutdown-timeout` plus a few seconds, within Kubernetes' default 30 s grace period. The
+engine process ends with its server, also when the server is killed (`kill -9`, the OOM killer). Both servers listen on
 127.0.0.1 by default: put them behind a TLS proxy, or listen on 0.0.0.0 only with an API key. After the first
 download, `HF_HUB_OFFLINE=1` keeps a restart on the models already downloaded. Voices registered over HTTP live in
 that server's process; several replicas share them with `--voice-dir` on a shared disk (read at startup).

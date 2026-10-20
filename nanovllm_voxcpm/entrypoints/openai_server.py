@@ -47,9 +47,11 @@ Arabic script stay as they are. ``"normalize": false`` sends the text as written
 
 In production: ``--api-key`` (or VOXCPM_API_KEY) makes every endpoint but /health ask for ``Authorization: Bearer
 <key>``; ``--max-streams`` answers 503 (Retry-After) beyond that many speech requests at once (one A10: 150);
-``--max-input-chars`` and ``--max-voice-mb`` / ``--max-voice-seconds`` bound a request's input and a voice's clip. A
-speech request whose client disconnects ends its engine request. /health is 503 once the engine process has died, and
-the server then exits with code 1, for its supervisor to start it again.
+``--max-input-chars`` and ``--max-voice-mb`` / ``--max-voice-seconds`` bound a request's input and a voice's clip;
+input with nothing to speak (punctuation, symbols or emoji only) is a 400. A speech request whose client disconnects
+ends its engine request. /health is 503 once the engine process has died or hung (``--hang-timeout``: nothing from it
+for that long while requests wait), and the server then exits with code 1, for its supervisor to start it again. On
+SIGTERM the requests in progress get ``--shutdown-timeout`` seconds to end. A voice in use is not deleted (409).
 """
 
 import argparse
@@ -76,7 +78,7 @@ from nanovllm_voxcpm import warmup
 from nanovllm_voxcpm.dialect_routing import (DEFAULT_ROUTES, DEFAULT_TAGGED_MODEL, TAGGED, TAGGED_ADAPTER,
                                              resolve_tagged, route_table, routed_lora_config, used_adapters)
 from nanovllm_voxcpm.dialect_tts import (DEFAULT_DIT, DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters,
-                                         read_as, resolve, turbo_config, use_model_calibration)
+                                         read_as, resolve, speakable, turbo_config, use_model_calibration)
 
 CLONE_MODES = ("prompt_ref", "ref", "prompt")
 VOICE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # voice names are also file names in --voice-dir
@@ -184,10 +186,11 @@ def wav_bytes(pcm: bytes, sample_rate: int) -> bytes:
 
 
 def build_app(args: argparse.Namespace):
-    # active: speech requests in progress (--max-streams); registering: voice names being uploaded; dead: the engine
-    # process died; on_engine_dead: what stops the server then (main: uvicorn's exit)
-    state: dict = {"voices": {}, "tags": None, "route": None, "active": 0, "registering": set(), "dead": False,
-                   "on_engine_dead": lambda: os.kill(os.getpid(), signal.SIGTERM)}
+    # active: speech requests in progress (--max-streams); registering: voice names being uploaded; voice_users: speech
+    # requests in progress per voice (no DELETE meanwhile); dead: the engine process died; on_engine_dead: what stops
+    # the server then (main: uvicorn's exit)
+    state: dict = {"voices": {}, "tags": None, "route": None, "active": 0, "registering": set(), "voice_users": {},
+                   "dead": False, "on_engine_dead": lambda: os.kill(os.getpid(), signal.SIGTERM)}
 
     async def warm_up(names: list[str]) -> None:
         """One short generation per voice and clone mode: fills the voice's caches (prefix KV, LocEnc embeddings,
@@ -342,6 +345,8 @@ def build_app(args: argparse.Namespace):
                         await register(v["id"], f.read(), os.path.splitext(v["wav"])[1].lstrip(".") or "wav",
                                        v.get("text"))
         await warm_up_kernels()
+        if args.hang_timeout and hasattr(pool, "watch_hangs"):  # (from now on: no more kernels to compile)
+            pool.watch_hangs(args.hang_timeout)
         dialects = (f"{len(state['route'])} dialects (routed), " if state["route"] is not None else
                     f"{len(state['tags'].names)} dialects (tagged model), " if state["tags"] else "")
         print(f"[server] ready: {len(state['voices'])} voices, {dialects}{len(state['adapters'])} LoRA adapters, "
@@ -418,8 +423,12 @@ def build_app(args: argparse.Namespace):
 
     @app.delete("/v1/audio/voices/{name}")
     async def delete_voice(name: str):
-        if state["voices"].pop(name, None) is None:
+        if name not in state["voices"]:
             raise HTTPException(404, f"voice '{name}' not found")
+        if state["voice_users"].get(name):  # (its next sentence would fail, and its response stop after a 200)
+            raise HTTPException(409, f"voice '{name}' is in use by {state['voice_users'][name]} speech requests; "
+                                     "try again once they end")
+        del state["voices"][name]
         await state["pool"].unregister_voice(name)
         if state["tags"] is not None:
             await state["tags"].drop_voice(state["pool"], name)
@@ -498,7 +507,8 @@ def build_app(args: argparse.Namespace):
         """Audio chunks of ``text`` (the input as read): one engine request per sentence, in order. tag: a tagged
         model's dialect token, in front of every sentence (or of the transcript: prompt_ref clones the voice's copy for
         the tag, its transcript read in ``dialect``)."""
-        parts = split_text(text, args.split_max_chars) if req.split else [text]
+        # (a piece of punctuation or symbols alone has nothing to speak: the model made up sounds for it)
+        parts = [p for p in split_text(text, args.split_max_chars) if speakable(p)] if req.split else [text]
         prefix = ""
         if tag is not None:
             if vk.get("clone_mode") in ("prompt_ref", "prompt"):  # the transcript comes first: the tag leads it
@@ -533,6 +543,8 @@ def build_app(args: argparse.Namespace):
         text = read_as(req.input, dialect) if req.normalize else req.input
         if not text.strip():  # after normalization: tatweel or marks alone read as nothing
             raise HTTPException(400, "input is empty")
+        if not speakable(text):
+            raise HTTPException(400, "input has nothing to speak (only punctuation, symbols or emoji)")
         return synthesize(req, text, {**vk, **lk}, tag, dialect)
 
     async def speech(scope, receive, send):
@@ -585,10 +597,17 @@ def build_app(args: argparse.Namespace):
         except HTTPException as e:
             return await send_json(send, e.status_code, {"detail": e.detail})
         state["active"] += 1
+        users = state["voice_users"]
+        if req.voice is not None:
+            users[req.voice] = users.get(req.voice, 0) + 1
         try:
             await respond_audio(req, send)
         finally:
             state["active"] -= 1
+            if req.voice is not None:
+                users[req.voice] -= 1
+                if not users[req.voice]:
+                    del users[req.voice]
 
     async def respond_audio(req: SpeechRequest, send) -> None:
         try:
@@ -689,11 +708,17 @@ def main():
     ap.add_argument("--max-input-chars", type=int, default=4096, help="longest input of a speech request")
     ap.add_argument("--max-voice-mb", type=float, default=10.0, help="largest uploaded voice clip")
     ap.add_argument("--max-voice-seconds", type=float, default=30.0, help="longest uploaded voice clip")
+    ap.add_argument("--hang-timeout", type=float, default=60.0,
+                    help="an engine that sends nothing for this many seconds while requests wait on it is taken as "
+                         "hung: the server exits with code 1 (0: not watched)")
+    ap.add_argument("--shutdown-timeout", type=float, default=10.0,
+                    help="on SIGTERM, speech requests in progress get this many seconds to end, then they are cut")
     args = ap.parse_args()
     os.environ.setdefault("NANOVLLM_SUBMIT_FLUSH_EVERY", "4")  # requests reach the engine as a steady stream
     app = build_app(args)
     server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port, loop="uvloop", http="httptools",
-                                           backlog=4096, timeout_keep_alive=30, log_level="warning"))
+                                           backlog=4096, timeout_keep_alive=30, log_level="warning",
+                                           timeout_graceful_shutdown=args.shutdown_timeout))
     app.state["on_engine_dead"] = lambda: setattr(server, "should_exit", True)
     server.run()
     if app.state["dead"]:  # (exit code 1: a supervisor starts the server again)

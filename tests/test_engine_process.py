@@ -118,3 +118,110 @@ def test_a_second_cancel_leaves_no_stream_behind():
         return sent[1]["type"], seq_id in srv.stream_table
 
     assert asyncio.run(main()) == ("cancel", False)
+
+
+FLOOD = textwrap.dedent("""
+    import asyncio, multiprocessing as mp, os, sys, time
+    from queue import Empty
+
+    N = 1000  # commands of ~2 KB: ~2 MB in one event-loop turn
+
+
+    def engine(q_in, q_out):  # main_loop's way: a step's output written blocking, commands read between steps
+        q_in._q._writer.close()
+        q_out._q._reader.close()
+        got = 0
+        while got < N:
+            while True:
+                try:
+                    q_in.get_nowait()
+                except Empty:
+                    break
+                got += 1
+            q_out.put({"type": "audio", "data": b"x" * 20000})
+        q_out.put({"type": "done", "got": got})
+
+
+    async def client(q_in, q_out, blocking):
+        from nanovllm_voxcpm.models.voxcpm2.server import _PipeWriter
+
+        loop = asyncio.get_running_loop()
+        done, reader = loop.create_future(), q_out._q._reader
+
+        def on_readable():
+            while reader.poll():
+                m = q_out.get()
+                if m["type"] == "done" and not done.done():
+                    done.set_result(m["got"])
+
+        loop.add_reader(reader.fileno(), on_readable)
+        os.set_blocking(reader.fileno(), True)
+        time.sleep(1.0)  # the loop busy for a while: the engine fills its pipe and waits
+        put = q_in.put if blocking else _PipeWriter(loop, q_in._q._writer).put
+        for _ in range(N):  # a burst flushed before the loop reads again
+            put({"type": "cmd", "pad": b"y" * 2000})
+        return await done
+
+
+    if __name__ == "__main__":
+        from nanovllm_voxcpm.models.voxcpm2.server import _Channel
+
+        ctx = mp.get_context("spawn")
+        q_in, q_out = _Channel(ctx), _Channel(ctx)
+        p = ctx.Process(target=engine, args=(q_in, q_out), daemon=True)
+        p.start()
+        print(asyncio.run(client(q_in, q_out, sys.argv[1:] == ["blocking"])), flush=True)
+""")
+
+
+def test_both_pipes_full_is_no_deadlock(tmp_path):
+    # the client writing its pipe blocking from its event loop (the engine's output unread meanwhile) and the engine
+    # writing its own blocking waited for each other for good once both pipes were full
+    script = tmp_path / "flood.py"
+    script.write_text(FLOOD)
+    env = {**os.environ, "PYTHONPATH": f"{REPO}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"}
+    out = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, env=env, timeout=120)
+    assert out.stdout.strip() == "1000", out.stderr[-2000:]
+
+
+def _watched(open_streams: set, hang_timeout: float | None):
+    """A client whose engine process never answers (e.g. a CUDA hang), watched for ~0.8 s: (killed, dead, what
+    its stream's consumer got)."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+
+    class Process:
+        exitcode, killed = None, False
+
+        def kill(self):
+            self.killed = True
+
+    async def main():
+        srv = object.__new__(AsyncVoxCPM2Server)
+        srv.op_table, srv._pending_cmds, srv.stream_table = {}, [], {"s": asyncio.Queue()}
+        srv.process, srv.dead, srv._reader = Process(), asyncio.Event(), SimpleNamespace(poll=lambda: False)
+        srv._open, srv._last_msg, srv.hang_timeout = open_streams, time.monotonic(), hang_timeout
+        srv._init_fut = asyncio.get_running_loop().create_future()
+        srv._init_fut.set_result(None)  # (started)
+        try:
+            await asyncio.wait_for(srv._watch_engine(), 0.8)
+        except asyncio.TimeoutError:
+            pass
+        q = srv.stream_table["s"]
+        return srv.process.killed, srv.dead.is_set(), q.get_nowait() if q.qsize() else None
+
+    return asyncio.run(main())
+
+
+def test_a_hung_engine_is_killed_and_its_requests_fail():
+    killed, dead, got = _watched({"s"}, 0.3)
+    assert killed and dead and isinstance(got, RuntimeError) and "hung" in str(got)
+
+
+def test_no_hang_without_work_owed_or_before_watch_hangs():
+    # a stream whose end the engine sent, its consumer slow (e.g. an HTTP client reading at its own pace): the
+    # engine owes nothing; and before watch_hangs (warm-up: kernels compiling) nothing is watched
+    assert _watched(set(), 0.3) == (False, False, None)
+    assert _watched({"s"}, None) == (False, False, None)
