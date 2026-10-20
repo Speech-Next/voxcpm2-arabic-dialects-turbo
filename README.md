@@ -12,9 +12,20 @@ One NVIDIA A10 (24 GB), default settings.
 [`VoxCPM-Kernel/benchmark-test-data-ar`](https://huggingface.co/datasets/VoxCPM-Kernel/benchmark-test-data-ar)
 (its scripts and `text.txt`, unchanged):
 
-WS_RESULTS_TABLE
+| requests at once | TTFA p99 | TTFB p95 | TTFB max | stalls | underruns |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 24-29 ms | 178-185 ms | 178-185 ms | 0 | 0 |
+| 10 | 29-36 ms | 187-195 ms | 187-196 ms | 0 | 0 |
+| 40 | 58-70 ms | 219-239 ms | 219-245 ms | 0 | 0 |
+| 80 | 69-73 ms | 241-256 ms | 241-256 ms | 0 | 0 |
+| 100 | 76-81 ms | 257-270 ms | 257-270 ms | 0 | 0 |
+| 150 | 94-148 ms | 275-330 ms | 288-330 ms | 0 | 0 |
 
-- TTFA: time to first audio, from the text arriving at the server to the engine's first audio.
+Three runs (both scripts of the dataset), the range over the runs. The script prints no p99 for TTFB; its max is the
+upper bound. Results and the check against the server's own timestamps:
+[`results/`](https://huggingface.co/datasets/VoxCPM-Kernel/benchmark-test-data-ar/tree/main/results).
+
+- TTFA: time to first audio, from the text arriving at the server to the engine's first audio (server side).
 - TTFB: time to the first 4096-byte chunk (128 ms of audio) at the client, as the benchmark measures it. The server
   holds the first chunk 150 ms (`--pace-start-ms`); this buys the engine the time for no stalls.
 - Stalls: gaps between two chunks longer than one chunk's audio. Underruns: a player starting at the first chunk
@@ -64,7 +75,8 @@ async def main():
         ...
     await tts.close()
 
-asyncio.run(main())
+if __name__ == "__main__":   # needed: the engine runs in a process of its own
+    asyncio.run(main())
 ```
 
 Dialects (`tts.dialects`): msa, egyptian, palestinian, lebanese, syrian, iraqi, saudi, najdi, hejazi, gulf,
