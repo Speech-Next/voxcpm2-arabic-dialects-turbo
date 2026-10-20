@@ -150,7 +150,8 @@ the pitch in good quality). `cfg_value` has no effect with the distilled LocDiT 
 | `DELETE /v1/audio/voices/{name}` | | 409 while a speech request uses the voice |
 | logs (`--log-level`, `info`) | a line per connection opened and closed (code, reason) and per utterance not spoken; shutdown, engine death | a line per speech request refused or failed (status, why) and per voice registered or deleted; shutdown, engine death |
 | metrics | `GET /metrics` on the same port, behind the API key | `GET /metrics`, behind the API key |
-| audio cache (`--audio-cache-mb`, 512; `0`: off) | each sentence's first audio, by sentence, dialect, voice and `cfg_value` | each sentence's first audio, by sentence as read, voice (as registered), dialect, `seed`, `cfg_value` and `max_tokens` |
+| audio cache (`--audio-cache-mb`, 512; `0`: off) | each sentence's first audio, by sentence, dialect, voice (its file's content) and `cfg_value` | each sentence's first audio, by sentence as read, voice (its latents and transcript), dialect, `seed`, `cfg_value` and `max_tokens` |
+| audio cache on disk (`--audio-cache-dir`, `--audio-cache-dir-mb` 4096) | the kept sentences as files: they outlive restarts, replicas on a shared disk share them | the same |
 
 Run a server under a supervisor that starts it again when it exits (systemd `Restart=always`, Docker
 `--restart unless-stopped`, Kubernetes), and send traffic once `/health` answers (~75 s after start). A stop
@@ -190,10 +191,18 @@ costs no GPU. A seed alone does not: a head start's split follows the queue, and
 the engine's float results. It keeps each sentence's first complete generation in the server's memory (cut or failed
 ones are not kept) and drops the least recently used beyond `--audio-cache-mb`: 512 MB hold ~780 sentences of 7 s
 (the engine's 48 kHz PCM16, 96 KB a second). A kept sentence plays its first second at once and the rest at 4 x real
-time (a whole HTTP response at once). Requests for the same sentence that
-run at the same time each generate, and the first one to finish is kept. `voxcpm_audio_cache_hits_total`,
-`voxcpm_audio_cache_misses_total` (sentences), `voxcpm_audio_cache_bytes` and `voxcpm_audio_cache_entries` are in
-`/metrics`. Benchmark the engine with `--audio-cache-mb 0`: a benchmark that repeats its sentences measures the cache.
+time (a whole HTTP response at once). Requests for the same sentence that run at the same time share one generation:
+a request that comes while it runs gets the audio made so far, then the rest as it comes; the generation goes on while
+any of them still listens (its first client may leave) and ends when none does.
+
+With `--audio-cache-dir` each kept sentence is also a file there (written whole, the files used longest ago removed
+beyond `--audio-cache-dir-mb`): it outlives a restart, and replicas on a shared disk share it. A file is read only by a
+server with the same model and settings (they are part of its name), and a file that does not read back whole is
+removed and the sentence generated again. `voxcpm_audio_cache_hits_total` (of which
+`voxcpm_audio_cache_disk_hits_total` from the directory), `voxcpm_audio_cache_misses_total` (sentences generated),
+`voxcpm_audio_cache_joins_total` (requests that joined a generation in progress), `voxcpm_audio_cache_bytes` and
+`voxcpm_audio_cache_entries` are in `/metrics`. Benchmark the engine with `--audio-cache-mb 0`: a benchmark that
+repeats its sentences measures the cache.
 
 ## Docker
 

@@ -61,7 +61,8 @@ ends its engine request. /health is 503 once the engine process has died or hung
 for that long while requests wait), and the server then exits with code 1, for its supervisor to start it again. On
 SIGTERM the requests in progress get ``--shutdown-timeout`` seconds to end. A voice in use is not deleted (409). The
 audio cache (``--audio-cache-mb``, nanovllm_voxcpm.audio_cache) gives a sentence asked again in the same voice and
-settings the audio it got first, at any load, without the engine.
+settings the audio it got first, at any load, without the engine; requests for a sentence in progress share its
+generation, and ``--audio-cache-dir`` keeps the sentences as files (restarts, replicas on a shared disk).
 A line is logged per speech request that fails or is refused and per voice registered or deleted (``--log-level``),
 by a thread of its own (telemetry). ``GET /metrics`` (behind the API key, as a bearer token): Prometheus' text format,
 speech requests by outcome and in progress, time to first audio (from the request to the engine's first audio),
@@ -72,8 +73,8 @@ import argparse
 import asyncio
 import contextlib
 import hmac
+import hashlib
 import io
-import itertools
 import json
 import logging
 import os
@@ -91,7 +92,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from nanovllm_voxcpm import warmup
-from nanovllm_voxcpm.audio_cache import AudioCache
+from nanovllm_voxcpm.audio_cache import AudioCache, namespace
 from nanovllm_voxcpm.dialect_routing import (DEFAULT_ROUTES, DEFAULT_TAGGED_MODEL, TAGGED, TAGGED_ADAPTER,
                                              resolve_tagged, route_table, routed_lora_config, used_adapters)
 from nanovllm_voxcpm.dialect_tts import (DEFAULT_DIT, DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters,
@@ -347,15 +348,27 @@ def brief(detail) -> str:
     return str(detail)[:300]
 
 
+def audio_cache(args) -> AudioCache | None:
+    """--audio-cache-mb (0: none), with --audio-cache-dir: its files' namespace, the settings that decide the audio."""
+    mb = getattr(args, "audio_cache_mb", 0)
+    if mb <= 0:
+        return None
+    from nanovllm_voxcpm.hub import HUB_REVISIONS
+
+    settings = {k: getattr(args, k, None) for k in ("model", "dit", "dit_cache", "head_tokens", "inference_timesteps",
+                                                     "tagged_model", "no_route", "lora_dir", "lora", "default_lora")}
+    return AudioCache(int(mb * 2**20), directory=getattr(args, "audio_cache_dir", None),
+                      dir_max_bytes=int(getattr(args, "audio_cache_dir_mb", 0) * 2**20),
+                      namespace=namespace(server="openai_server", revisions=HUB_REVISIONS, **settings))
+
+
 def build_app(args: argparse.Namespace):
     # active: speech requests in progress (--max-streams); registering: voice names being uploaded; voice_users: speech
     # requests in progress per voice (no DELETE meanwhile); dead: the engine process died; on_engine_dead: what stops
     # the server then (main: uvicorn's exit); cache: the audio cache (--audio-cache-mb, None: off)
     state: dict = {"voices": {}, "tags": None, "route": None, "active": 0, "registering": set(), "voice_users": {},
                    "dead": False, "on_engine_dead": lambda: os.kill(os.getpid(), signal.SIGTERM)}
-    cache_mb = getattr(args, "audio_cache_mb", 0)
-    state["cache"] = AudioCache(int(cache_mb * 2**20)) if cache_mb > 0 else None
-    voice_versions = itertools.count(1)  # a voice registered again under its name is another voice (the cache's key)
+    state["cache"] = audio_cache(args)
 
     async def warm_up(names: list[str]) -> None:
         """One short generation per voice and clone mode: fills the voice's caches (prefix KV, LocEnc embeddings,
@@ -442,7 +455,10 @@ def build_app(args: argparse.Namespace):
         await state["pool"].register_voice(name, latents, read_as(text) if text and normalize else text)
 
     def voice_entry(latents: bytes, text: str | None, created_at, normalize: bool = True) -> dict:
-        v = {"text": text, "created_at": created_at, "normalize": normalize, "version": next(voice_versions)}
+        # digest: the voice in the audio cache's key, by its content (a voice registered again under its name with
+        # other audio is another voice; its files in --audio-cache-dir are read by every replica that has it)
+        digest = hashlib.sha256(latents + json.dumps([text, normalize]).encode()).hexdigest()[:16]
+        v = {"text": text, "created_at": created_at, "normalize": normalize, "digest": digest}
         if state["tags"] is not None and text:
             v["latents"] = latents  # its per-dialect copies are registered from these
         return v
@@ -766,10 +782,10 @@ def build_app(args: argparse.Namespace):
         the tag, its transcript read in ``dialect``). cached: through the audio cache (--audio-cache-mb)."""
         # (a piece of punctuation or symbols alone has nothing to speak: the model made up sounds for it)
         parts = [p for p in split_text(text, args.split_max_chars) if speakable(p)] if req.split else [text]
-        # the audio cache's key, but for the sentence and its seed: what else decides the audio (the voice as
-        # registered: a voice registered again under its name is another)
+        # the audio cache's key, but for the sentence and its seed: what else decides the audio (the voice by its
+        # content: a voice registered again under its name with other audio is another)
         voice = state["voices"].get(vk.get("voice")) if vk.get("voice") else None
-        base = (repr(sorted(vk.items())), voice["version"] if voice else None, tag, dialect, req.cfg_value,
+        base = (repr(sorted(vk.items())), voice["digest"] if voice else None, tag, dialect, req.cfg_value,
                 req.max_tokens or args.max_tokens)
         cache = state["cache"] if cached else None
         prefix = ""
@@ -1053,6 +1069,11 @@ def main():
                          "cfg_value, max_tokens): the same sentence gets the same audio at any load, and a repeated "
                          "one costs no GPU (least recently used dropped beyond this size; 0: off, e.g. to benchmark "
                          "the engine)")
+    ap.add_argument("--audio-cache-dir", default=None,
+                    help="the audio cache's sentences also kept as files here: they outlive the server, and replicas "
+                         "on a shared disk share them (a file is read only with the same model and settings)")
+    ap.add_argument("--audio-cache-dir-mb", type=float, default=4096.0,
+                    help="--audio-cache-dir's size: the files used longest ago removed beyond it")
     args = ap.parse_args()
     os.environ.setdefault("NANOVLLM_SUBMIT_FLUSH_EVERY", "4")  # requests reach the engine as a steady stream
     listener = setup_logging("openai_server", args.log_level)

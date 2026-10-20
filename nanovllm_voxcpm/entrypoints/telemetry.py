@@ -137,6 +137,10 @@ def add_audio_cache(metrics: Metrics, stats: Callable[[], dict | None]) -> None:
     metrics.add(ReadCounter("voxcpm_audio_cache_hits_total", "sentences played from the audio cache", read("hits")))
     metrics.add(ReadCounter("voxcpm_audio_cache_misses_total", "sentences generated (not in the audio cache)",
                             read("misses")))
+    metrics.add(ReadCounter("voxcpm_audio_cache_disk_hits_total", "sentences of the hits read from --audio-cache-dir",
+                            read("disk_hits")))
+    metrics.add(ReadCounter("voxcpm_audio_cache_joins_total", "requests that joined a generation of their sentence "
+                            "in progress (single flight)", read("joins")))
     metrics.add(Gauge("voxcpm_audio_cache_bytes", "audio kept in the audio cache, bytes", read("bytes")))
     metrics.add(Gauge("voxcpm_audio_cache_entries", "sentences kept in the audio cache", read("entries")))
 

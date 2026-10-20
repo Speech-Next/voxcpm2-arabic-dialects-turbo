@@ -16,7 +16,9 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
 - dialect: a name RoutedDialectTTS routes (--dialect: the default). The seed is the text's CRC32 (the same text, the
   same seed; its audio still varies with the load: a head start's split follows the queue). The audio cache
   (--audio-cache-mb, 512; nanovllm_voxcpm.audio_cache) keeps each sentence's first complete audio by sentence,
-  dialect, voice and cfg_value: the same sentence then sounds the same at any load, and a repeated one costs no GPU.
+  dialect, voice (its file's content) and cfg_value: the same sentence then sounds the same at any load, and a
+  repeated one costs no GPU; requests for a sentence in progress share its generation, and --audio-cache-dir keeps
+  the sentences as files (restarts, replicas on a shared disk).
 - Pacing (default; --no-pace sends each chunk the moment it is complete): streaming.ChunkPacer per utterance, the
   first chunk --pace-start-ms (150) after it is complete, the next ones on a grid of --pace-alpha (0.9) x a chunk's audio (--pace-alpha-last, 0.92,
   for the last chunk queued), more than --pace-reserve-ms queued and the rest at the end sooner (at least
@@ -49,6 +51,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import hashlib
 import hmac
 import json
 import logging
@@ -64,7 +67,7 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
-from nanovllm_voxcpm.audio_cache import AudioCache
+from nanovllm_voxcpm.audio_cache import AudioCache, namespace
 from nanovllm_voxcpm.entrypoints.telemetry import (CONTENT_TYPE, FIRST_AUDIO_BUCKETS, Counter, Gauge, Histogram,
                                                    ServerMetrics, add_audio_cache, setup_logging)
 from nanovllm_voxcpm.streaming import ChunkPacer, ChunkStream, StreamSender
@@ -99,10 +102,12 @@ def pcm16(y: np.ndarray) -> bytes:
     return (np.clip(y, -1.0, 1.0) * 32767.0).round().astype("<i2").tobytes()
 
 
-async def speak(tts, req: dict, yields: list | None = None, cache: AudioCache | None = None) -> AsyncIterator[bytes]:
+async def speak(tts, req: dict, yields: list | None = None, cache: AudioCache | None = None,
+                voice_ids: dict[str, str] | None = None) -> AsyncIterator[bytes]:
     """One utterance's PCM16 at req["rate"]: req = text, dialect, voice, cfg_value, rate, chunk_ms, pace, segmenting.
     yields: [time, samples from the engine, ms resampling, bytes out] per engine chunk. cache: each sentence's audio
-    as the engine gave it, by sentence, dialect, voice and cfg_value (--audio-cache-mb): played again when kept."""
+    as the engine gave it, by sentence, dialect, voice and cfg_value (--audio-cache-mb): played again when kept;
+    voice_ids: a voice's identity in that key, its file's content hash (voice_ids), else its name."""
     parts = [req["text"]]
     if req["segmenting"]:
         from nanovllm_voxcpm.dialect_tts import speakable
@@ -122,7 +127,7 @@ async def speak(tts, req: dict, yields: list | None = None, cache: AudioCache | 
             return tts.stream(part, dialect=req["dialect"], voice=req["voice"], seed=seed, cfg_value=req["cfg_value"],
                               chunk_ms=req["chunk_ms"], pace=req.get("pace"))
 
-        key = (part, req["dialect"], req["voice"], req["cfg_value"])
+        key = (part, req["dialect"], (voice_ids or {}).get(req["voice"], req["voice"]), req["cfg_value"])
         # (a kept sentence at most 4 x real time: the pacer sends it at 1 x; 150 at once in one go held the loops)
         async for c in generate() if cache is None else cache.through(key, generate, speed=4.0):
             t = time.perf_counter()
@@ -140,13 +145,13 @@ async def speak(tts, req: dict, yields: list | None = None, cache: AudioCache | 
 Feed = Callable[[dict, list, ChunkStream], Callable[[], None]]
 
 
-def local_feed(tts, cache: AudioCache | None = None) -> Feed:
+def local_feed(tts, cache: AudioCache | None = None, voice_ids: dict[str, str] | None = None) -> Feed:
     """An utterance's audio from the engine's client in this process: a task fills the stream (speak); the
     returned callable stops it (the client gone: its engine request ends)."""
 
     def feed(req: dict, yields: list, stream: ChunkStream) -> Callable[[], None]:
         async def read():
-            gen = speak(tts, req, yields, cache)
+            gen = speak(tts, req, yields, cache, voice_ids)
             try:
                 async for data in gen:
                     stream.push(data)
@@ -466,12 +471,14 @@ async def read_frame(reader: asyncio.StreamReader) -> tuple[int, int, bytes]:
     return kind, utt, await reader.readexactly(n) if n else b""
 
 
-async def serve_engine(tts, reader: asyncio.StreamReader, writers, log=None, cache: AudioCache | None = None) -> None:
+async def serve_engine(tts, reader: asyncio.StreamReader, writers, log=None, cache: AudioCache | None = None,
+                       voice_ids: dict[str, str] | None = None) -> None:
     """The engine's side: START (an utterance's request, JSON) -> DATA frames, then END (or ERROR); CANCEL stops
     one. Returns when the connections' side closes. writers: the link's sockets (a StreamWriter or a list): an
     utterance's frames all go to writers[utt % len]. log: a file, one jsonl line per utterance (perf_counter times:
-    the START frame read, the task started, the yields [t, samples, ms resampling, bytes]). cache: the audio cache
-    (speak); an END frame carries its stats (JSON) to the connections' process, which exports them (/metrics)."""
+    the START frame read, the task started, the yields [t, samples, ms resampling, bytes]). cache, voice_ids: the
+    audio cache (speak); an END frame carries its stats (JSON) to the connections' process, which exports them
+    (/metrics)."""
     jobs: dict[int, asyncio.Task] = {}
     writers = writers if isinstance(writers, list) else [writers]
 
@@ -479,7 +486,7 @@ async def serve_engine(tts, reader: asyncio.StreamReader, writers, log=None, cac
         t_task, yields = time.perf_counter(), []
         writer = writers[utt % len(writers)]
         try:
-            async for out in speak(tts, req, yields if log is not None else None, cache):
+            async for out in speak(tts, req, yields if log is not None else None, cache, voice_ids):
                 writer.write(frame(DATA, utt, out))
             writer.write(frame(END, utt, json.dumps(cache.stats()).encode() if cache is not None else b""))
             if log is not None:
@@ -601,6 +608,31 @@ class EngineLink(asyncio.Protocol):
         return stop
 
 
+def voice_ids(args) -> dict[str, str]:
+    """Each --voice's identity in the audio cache's key: its file's content hash (a name may name another file after
+    a restart: the kept audio in --audio-cache-dir is the old voice's)."""
+    ids = {}
+    for spec in args.voice:
+        name, _, path = spec.partition("=")
+        with contextlib.suppress(OSError), open(path, "rb") as f:
+            ids[name] = hashlib.sha256(f.read()).hexdigest()[:16]
+    return ids
+
+
+def audio_cache(args, sample_rate: int) -> AudioCache | None:
+    """--audio-cache-mb (0: none), with --audio-cache-dir: its files' namespace, the settings that decide the audio."""
+    mb = getattr(args, "audio_cache_mb", 0)
+    if mb <= 0:
+        return None
+    from nanovllm_voxcpm.hub import HUB_REVISIONS
+
+    directory = getattr(args, "audio_cache_dir", None)
+    ns = namespace(server="ws_server", model=args.model, tagged_model=args.tagged_model, dit=args.dit,
+                   head_tokens=args.head_tokens, sample_rate=sample_rate, revisions=HUB_REVISIONS)
+    return AudioCache(int(mb * 2**20), sample_rate, directory,
+                      int(getattr(args, "audio_cache_dir_mb", 0) * 2**20), ns)
+
+
 async def load_tts(args):
     from nanovllm_voxcpm import RoutedDialectTTS
     from nanovllm_voxcpm.warmup import warm_up
@@ -669,9 +701,9 @@ async def main_engine(args, socks, front_pid: int) -> int:
                 raise RuntimeError("the connections' process did not start")
             announce(args)
             log = open(args.log + ".engine", "a", buffering=1) if args.log else None
-            mb = getattr(args, "audio_cache_mb", 0)
-            cache = AudioCache(int(mb * 2**20), tts.sample_rate) if mb > 0 else None
-            engine = asyncio.create_task(serve_engine(tts, reader, [w for _, w in conns], log, cache))
+            cache = audio_cache(args, tts.sample_rate)
+            engine = asyncio.create_task(serve_engine(tts, reader, [w for _, w in conns], log, cache,
+                                                      voice_ids(args)))
             if args.hang_timeout and hasattr(tts.server, "watch_hangs"):  # (warmed up: no more kernels to compile)
                 tts.server.watch_hangs(args.hang_timeout)
             dead = asyncio.ensure_future(tts.server.wait_dead())
@@ -793,6 +825,11 @@ def cli():
                     help="each sentence's audio kept by sentence, dialect, voice and cfg_value: the same sentence gets "
                          "the same audio at any load, and a repeated one costs no GPU (least recently used dropped "
                          "beyond this size; 0: off, e.g. to benchmark the engine)")
+    ap.add_argument("--audio-cache-dir", default=None,
+                    help="the audio cache's sentences also kept as files here: they outlive the server, and replicas "
+                         "on a shared disk share them (a file is read only with the same model and settings)")
+    ap.add_argument("--audio-cache-dir-mb", type=float, default=4096.0,
+                    help="--audio-cache-dir's size: the files used longest ago removed beyond it")
     args = ap.parse_args()
     if args.default_voice is None and args.voice:
         args.default_voice = args.voice[0].partition("=")[0]
