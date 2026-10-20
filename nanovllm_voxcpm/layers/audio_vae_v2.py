@@ -323,6 +323,17 @@ class CausalDecoder(nn.Module):
         return x
 
 
+def encoder_context(rates: List[int]) -> int:
+    """Input samples before a latent frame's own that CausalEncoder reads for it (its receptive field, all to the
+    left): the first conv (kernel 7), per block three residual units (kernel 7, dilations 1, 3, 9) and the strided conv
+    (left padding = its stride), each at the block's input spacing, then fc_mu (kernel 3) at the latent rate."""
+    context, spacing = 6, 1
+    for stride in rates:
+        context += (6 * (1 + 3 + 9) + 2 * math.ceil(stride / 2) - stride % 2) * spacing
+        spacing *= stride
+    return context + 2 * spacing
+
+
 class AudioVAEConfigV2(BaseModel):
     encoder_dim: int = 128
     encoder_rates: List[int] = [2, 5, 8, 8]
@@ -340,6 +351,10 @@ class AudioVAEConfigV2(BaseModel):
 
 
 class AudioVAEV2(nn.Module):
+    # encode() reads a clip in pieces of about this many seconds: the encoder's activations take ~47 MiB of GPU memory
+    # a second of audio, and a 45 s clip in one pass ran out of memory next to the KV cache (#47)
+    encode_chunk_seconds = 10.0
+
     def __init__(self, config: Optional[AudioVAEConfigV2] = None, **kwargs):
         if config is None:
             config = AudioVAEConfigV2(**kwargs) if kwargs else AudioVAEConfigV2()
@@ -362,6 +377,7 @@ class AudioVAEV2(nn.Module):
 
         self.latent_dim = latent_dim
         self.encoder_chunk_size = math.prod(config.encoder_rates)
+        self.encoder_context = encoder_context(config.encoder_rates)
         self.decoder_chunk_size = math.prod(config.decoder_rates)
         self.encoder = CausalEncoder(
             config.encoder_dim,
@@ -405,10 +421,25 @@ class AudioVAEV2(nn.Module):
 
     @torch.inference_mode()
     def encode(self, audio_data: torch.Tensor, sample_rate: int):
+        """The latents' means. A clip longer than encode_chunk_seconds is encoded piece by piece, so that its GPU
+        memory stays that of one piece: the encoder is causal, a frame reads encoder_context samples before its
+        own, so each piece starts that much earlier (in whole frames) and the frames that saw the piece's zero
+        padding instead are dropped. The same latents as in one pass, up to float rounding."""
         if audio_data.ndim == 2:
             audio_data = audio_data.unsqueeze(1)
         audio_data = self.preprocess(audio_data, sample_rate)
-        return self.encoder(audio_data)["mu"]
+        hop = self.encoder_chunk_size
+        step = max(1, round(self.encode_chunk_seconds * self.sample_rate / hop)) * hop
+        context = math.ceil(self.encoder_context / hop) * hop
+        length = audio_data.shape[-1]
+        if length <= step + context:
+            return self.encoder.fc_mu(self.encoder.block(audio_data))
+        mus = []
+        for start in range(0, length, step):
+            left = min(start, context)  # (the first piece starts at the clip's start: its padding is the clip's)
+            piece = audio_data[..., start - left : start + step]
+            mus.append(self.encoder.fc_mu(self.encoder.block(piece))[..., left // hop :])
+        return torch.cat(mus, dim=-1)
 
 
 __all__ = ["AudioVAEConfigV2", "AudioVAEV2"]
