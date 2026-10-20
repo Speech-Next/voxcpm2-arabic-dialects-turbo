@@ -102,9 +102,9 @@ def resolve_tagged(spec: str) -> str:
 
     path = os.path.expanduser(spec)
     if not os.path.exists(path):
-        from huggingface_hub import snapshot_download
+        from nanovllm_voxcpm.hub import download
 
-        path = snapshot_download(spec, allow_patterns=TAGGED_FILES)
+        path = download(spec, allow_patterns=TAGGED_FILES)  # (its pinned revision or repo@revision)
     if not is_tagged_adapter(path):
         raise ValueError(f"{spec}: not a tagged model with its training state (lora/trainable.safetensors, "
                          "lora/train_state.json, dialects.json)")

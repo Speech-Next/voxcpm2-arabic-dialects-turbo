@@ -36,12 +36,13 @@ VOICES = "VoxCPM-Kernel/Arabic-Hindi-Reference-Voices"
 
 
 def voice_folder(spec: str) -> str:
-    """A local folder as is; otherwise a Hugging Face dataset id, downloaded (its .wav files) on first use."""
+    """A local folder as is; otherwise a Hugging Face dataset id (its pinned revision or id@revision), downloaded
+    (its .wav files) on first use."""
     if os.path.isdir(spec):
         return spec
-    from huggingface_hub import snapshot_download
+    from nanovllm_voxcpm.hub import download
 
-    return snapshot_download(spec, repo_type="dataset", allow_patterns=["*.wav"])
+    return download(spec, repo_type="dataset", allow_patterns=["*.wav"])
 
 
 def lines(name):
