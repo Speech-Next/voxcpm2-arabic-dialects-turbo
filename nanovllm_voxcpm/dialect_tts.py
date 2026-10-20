@@ -54,7 +54,7 @@ def resolve(spec: str) -> str:
 
 
 def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | None = None, w8a8: bool = True) -> dict:
-    """The measured low-latency configuration: distilled 2-step LocDiT (``dit``), int8 layers, head start of
+    """The measured low-latency configuration: distilled 3-step LocDiT (``dit``), int8 layers, head start of
     ``head_tokens`` tokens (0 = off), int16 audio chunks, a stream's leading silence capped at 2 patches (320 ms),
     no new request admitted while a playing stream has less than 100 ms of audio queued at its player, and for
     requests that start together (#28): heads of up to 7 patches, enough audio for their continuations' prefill,
@@ -251,7 +251,7 @@ class DialectTTS:
                    prefill_tokens: int = 16384) -> "DialectTTS":
         """Start the engine on ``model`` (local directory or Hugging Face repo with ``adapters/<dialect>/``).
 
-        dit: the distilled 2-step LocDiT (path or ``repo:file``; None = the model's own LocDiT, slower).
+        dit: the distilled 3-step LocDiT (path or ``repo:file``; None = the model's own LocDiT, slower).
         head_tokens: the first audio comes from the text's first <= head_tokens tokens (0 = from the whole text).
         dit_cache: with dit=None, "light" or "medium": reuse the LocDiT's middle layers on 2 or 4 of its 9 steps.
         prefill_tokens: the most tokens one prefill step computes (16384: a burst's continuations in fewer steps).

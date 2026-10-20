@@ -21,7 +21,6 @@ dependencies = [
     "numpy",
     "librosa",
     "soundfile>=0.13.1",
-    "torchaudio",
     "pydantic",
 ]
 

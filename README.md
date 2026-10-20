@@ -56,8 +56,15 @@ Linux, an NVIDIA GPU (Ampere or newer) and the CUDA toolkit (`nvcc`).
 git clone https://github.com/Speech-Next/voxcpm2-arabic-dialects-turbo && cd voxcpm2-arabic-dialects-turbo
 ./setup.sh                  # Python 3.12 env, torch, flash-attn, this package with the servers, its CUDA kernels
 source .venv/bin/activate
-hf auth login               # only for the gated benchmark voices
+hf auth login               # the models are gated: request access first (below)
 ```
+
+The models are gated on Hugging Face, and access is approved by hand: request it on the pages of
+[VoxCPM2-Arabic-Dialects](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Dialects),
+[VoxCPM2-Arabic-Teacher-v3](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3) and
+[VoxCPM2-Arabic-Dialects-Distilled-DiT](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT)
+(and of [Arabic-Hindi-Reference-Voices](https://huggingface.co/datasets/VoxCPM-Kernel/Arabic-Hindi-Reference-Voices)
+for the examples' voices).
 
 `setup.sh` builds the two CUDA kernels (nvcc, ~1.5 minutes). Models download on first use. The first start takes
 ~3 minutes (the Triton kernels compile, CUDA graphs are captured), later starts ~1 minute.
@@ -132,4 +139,10 @@ python examples/streaming_benchmark.py       # requests arriving at random
 | precision | int8 | `--precision bf16` (benchmark.py) |
 | first chunk delay (ws_server) | `--pace-start-ms 150` | `0`: TTFB p99 0.20-0.22 s at 150 at once, rare stalls |
 
-License: MIT. VoxCPM2 weights: Apache-2.0.
+## License
+
+| | license |
+|---|---|
+| this code | MIT |
+| [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2), VoxCPM2-Arabic-Dialects (the adapters) | Apache-2.0 |
+| VoxCPM2-Arabic-Teacher-v3, VoxCPM2-Arabic-Dialects-Distilled-DiT (both used by default) | CC BY-NC-SA 4.0: non-commercial |
