@@ -1,6 +1,6 @@
 import os
 import json
-from huggingface_hub import snapshot_download
+from nanovllm_voxcpm.hub import download
 from typing import Any, List
 import asyncio
 
@@ -34,7 +34,7 @@ class VoxCPM:
                 raise ValueError(f"Model path {model_path} does not exist")
         else:
             if not os.path.isdir(model):
-                model_path = snapshot_download(repo_id=model)
+                model_path = download(model)  # (a pinned repo's revision, or repo@revision)
             else:
                 model_path = model
 

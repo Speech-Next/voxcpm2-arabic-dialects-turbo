@@ -66,8 +66,12 @@ The models are gated on Hugging Face, and access is approved by hand: request it
 (and of [Arabic-Hindi-Reference-Voices](https://huggingface.co/datasets/VoxCPM-Kernel/Arabic-Hindi-Reference-Voices)
 for the examples' voices).
 
-`setup.sh` builds the two CUDA kernels (nvcc, ~1.5 minutes). Models download on first use. The first start takes
-~3 minutes (the Triton kernels compile, CUDA graphs are captured), later starts ~1 minute.
+`setup.sh` builds the two CUDA kernels (nvcc, ~1.5 minutes); the build is cached per kernel source, one for every
+checkout and worktree. Models download on first use, at the commits the numbers here were measured with
+(`nanovllm_voxcpm/hub.py`): a new upload to a model repo changes nothing until it is pinned there. `repo@revision`
+(e.g. `--model VoxCPM-Kernel/VoxCPM2-Arabic-Dialects@main`) takes another commit, branch or tag, and
+`VOXCPM_HUB_LATEST=1` the main branch of every repo. The first start takes ~3 minutes (the Triton kernels compile,
+CUDA graphs are captured), later starts ~1 minute.
 
 ## Python
 

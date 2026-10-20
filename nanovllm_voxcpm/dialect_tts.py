@@ -57,15 +57,13 @@ def check_text(text: str, normalized: bool = False) -> None:
 
 
 def resolve(spec: str) -> str:
-    """A local path as is; otherwise a Hugging Face repo id (downloaded snapshot) or ``repo:file`` (one file)."""
+    """A local path as is; otherwise a Hugging Face repo id (downloaded snapshot) or ``repo:file`` (one file), at the
+    repo's pinned revision or ``repo@revision`` (nanovllm_voxcpm.hub)."""
     if os.path.exists(os.path.expanduser(spec)):
         return os.path.expanduser(spec)
-    from huggingface_hub import hf_hub_download, snapshot_download
+    from nanovllm_voxcpm.hub import download
 
-    if ":" in spec:
-        repo, filename = spec.split(":", 1)
-        return hf_hub_download(repo, filename)
-    return snapshot_download(spec)
+    return download(spec)
 
 
 def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | None = None, w8a8: bool = True) -> dict:
