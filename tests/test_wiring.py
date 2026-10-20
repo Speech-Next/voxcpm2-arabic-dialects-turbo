@@ -868,3 +868,70 @@ def test_client_keys_and_limits(server, monkeypatch, tmp_path):
     assert values['voxcpm_client_requests_total{client="b",outcome="ok"}'] == 2
     assert values['voxcpm_requests_total{outcome="limited"}'] == 2 and b"kb" not in out["metrics_m"][2]
     assert out["after"] == [200, 401]
+
+
+def test_voice_owners(server, monkeypatch, tmp_path):
+    """--api-keys-file: a voice belongs to the client that registered it. Another client's DELETE is a 403 (an admin
+    may delete any); a private voice is its owner's and the admins' alone (to the others: 404, not listed); a voice
+    with no owner (from before the keys) is the admins' to delete. Replicas on one --voice-dir enforce the same."""
+    pytest.importorskip("multipart")
+    replica_engines(monkeypatch)
+    keys = tmp_path / "keys.txt"
+    keys.write_text("a ka\nb kb\nadm kadm admin=true\n")
+    voice_dir = tmp_path / "voices"
+    first, second = (server.build_app(server_args(tmp_path, api_keys_file=str(keys), voice_dir=str(voice_dir),
+                                                  voice_sync_s=0)) for _ in range(2))
+
+    def key(k):
+        return [(b"authorization", b"Bearer " + k)]
+
+    async def upload(app, k, name, **fields):
+        body, ctype = multipart({"name": name, **fields}, {"audio_sample": ("clip.wav", wav(1.0))})
+        return (await request(app, "POST", "/v1/audio/voices", body, headers=key(k), content_type=ctype))[0]
+
+    async def speak(app, k, voice):
+        return (await request(app, "POST", "/v1/audio/speech", speech_body(voice=voice), headers=key(k)))[0]
+
+    async def delete(app, k, voice):
+        return (await request(app, "DELETE", f"/v1/audio/voices/{voice}", headers=key(k)))[0]
+
+    async def listed(app, k):
+        voices = json.loads((await request(app, "GET", "/v1/audio/voices", headers=key(k)))[2])["voices"]
+        return {v["name"]: (v["owner"], v["private"]) if "owner" in v else None for v in voices}
+
+    async def main():
+        out = {}
+        async with running(first), running(second):
+            out["uploads"] = [await upload(first, b"ka", "pub"), await upload(first, b"ka", "mine", private="true")]
+            out["listed"] = [await listed(first, k) for k in (b"ka", b"kb", b"kadm")]
+            out["speak mine"] = [await speak(first, k, "mine") for k in (b"ka", b"kb", b"kadm")]
+            out["b speaks pub"] = await speak(first, b"kb", "pub")
+            # the other replica reads them from --voice-dir: the same rules
+            out["second: speak mine"] = [await speak(second, k, "mine") for k in (b"kb", b"ka")]
+            out["second: b deletes"] = [await delete(second, b"kb", v) for v in ("pub", "mine")]
+            out["deletes"] = [await delete(first, b"kb", "pub"), await delete(first, b"ka", "pub"),
+                              await delete(first, b"kadm", "mine")]
+            # a voice from before the keys: no owner, every client's to speak with, the admins' to delete
+            (voice_dir / "old.latents").write_bytes(b"latents")
+            (voice_dir / "old.json").write_text(json.dumps({"name": "old", "text": None}), encoding="utf-8")
+            await first.state["sync_voices"]()
+            out["old"] = [await speak(first, b"kb", "old")] + [await delete(first, k, "old") for k in (b"ka", b"kadm")]
+            out["left"] = sorted(p.name for p in voice_dir.iterdir())
+        return out
+
+    assert run(main()) == {
+        "uploads": [200, 200],
+        "listed": [{"pub": ("a", False), "mine": ("a", True)}, {"pub": None},
+                   {"pub": ("a", False), "mine": ("a", True)}],
+        "speak mine": [200, 404, 200], "b speaks pub": 200,
+        "second: speak mine": [404, 200], "second: b deletes": [403, 404],
+        "deletes": [403, 200, 200],
+        "old": [200, 403, 200], "left": []}
+
+    single = server.build_app(server_args(tmp_path, api_key="k"))  # one key, as before: its client is an admin
+
+    async def plain():
+        async with running(single):
+            return [await upload(single, b"k", "v"), await listed(single, b"k"), await delete(single, b"k", "v")]
+
+    assert run(plain()) == [200, {"v": ("default", False)}, 200]

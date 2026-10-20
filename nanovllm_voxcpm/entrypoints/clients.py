@@ -3,10 +3,11 @@
 ``--api-key`` (or VOXCPM_API_KEY) is one client, named "default". ``--api-keys-file`` names a client per key, each
 with optional limits, in lines (``#`` comments)::
 
-    # name   key          [max_streams=N] [rpm=N] [metrics=true]
+    # name   key          [max_streams=N] [rpm=N] [metrics=true] [admin=true]
     acme     sk-acme-1    max_streams=20  rpm=600
     beta     sk-beta-2    rpm=60
     monitor  sk-prom-3    metrics=true
+    ops      sk-ops-4     admin=true
 
 or JSON: ``[{"name": "acme", "key": "sk-acme-1", "max_streams": 20, "rpm": 600}, ...]``.
 
@@ -14,6 +15,8 @@ or JSON: ``[{"name": "acme", "key": "sk-acme-1", "max_streams": 20, "rpm": 600},
 - rpm: its requests a minute, a token bucket of rpm tokens (a minute's worth) refilled at rpm / 60 a second; more get
   429 with the seconds until the next one (Retry-After).
 - metrics: whether its key reads ``GET /metrics`` (the clients' names and counts); --api-key's client does.
+- admin: whether it may delete any client's voice, and speak with a private one (openai_server: a voice belongs to
+  the client that registered it); --api-key's client is one (the operator's key).
 
 The file is read again when it changes (its modification time and size, looked at no more than once a second, on a
 request): keys rotate and limits change without a restart (replace the file whole, e.g. write and rename). A file
@@ -39,6 +42,7 @@ class Client:
     max_streams: int = 0  # at once (0: no limit)
     rpm: float = 0.0  # a minute (0: no limit)
     metrics: bool = False  # may read /metrics
+    admin: bool = False  # may delete any client's voice, and speak with a private one (openai_server)
 
 
 @dataclass
@@ -50,8 +54,12 @@ class _Use:
     stamp: float = 0.0
 
 
+def _flag(v) -> bool:
+    return str(v).lower() in ("true", "1", "yes")
+
+
 def parse(text: str) -> list[Client]:
-    """The clients of a keys file (JSON, or lines: name key [max_streams=N] [rpm=N] [metrics=true])."""
+    """The clients of a keys file (JSON, or lines: name key [max_streams=N] [rpm=N] [metrics=true] [admin=true])."""
     text = text.strip()
     if text.startswith("["):
         rows = json.loads(text)
@@ -67,17 +75,17 @@ def parse(text: str) -> list[Client]:
             for w in words[2:]:
                 k, eq, v = w.partition("=")
                 if not eq:
-                    raise ValueError(f"line {n}: {k!r}: max_streams=N, rpm=N or metrics=true")
+                    raise ValueError(f"line {n}: {k!r}: max_streams=N, rpm=N, metrics=true or admin=true")
                 row[k] = v
             rows.append(row)
     clients, names, keys = [], set(), set()
     for row in rows:
-        unknown = set(row) - {"name", "key", "max_streams", "rpm", "metrics"}
+        unknown = set(row) - {"name", "key", "max_streams", "rpm", "metrics", "admin"}
         if unknown or not row.get("name") or not row.get("key"):
-            raise ValueError(f"client {row.get('name')!r}: name, key, max_streams, rpm, metrics "
+            raise ValueError(f"client {row.get('name')!r}: name, key, max_streams, rpm, metrics, admin "
                              f"(not {sorted(unknown)})")
         c = Client(str(row["name"]), str(row["key"]).encode(), int(row.get("max_streams", 0)),
-                   float(row.get("rpm", 0)), str(row.get("metrics", False)).lower() in ("true", "1", "yes"))
+                   float(row.get("rpm", 0)), _flag(row.get("metrics")), _flag(row.get("admin")))
         if c.name in names or c.key in keys or c.max_streams < 0 or c.rpm < 0 or not c.name.isprintable():
             raise ValueError(f"client {c.name!r}: a name or key given twice, or a negative limit")
         names.add(c.name)
@@ -113,7 +121,7 @@ class Clients:
 
     def _load(self, force: bool = False) -> None:
         if not self.keys_file:
-            self.clients = [Client("default", self.api_key.encode(), metrics=True)] if self.api_key else []
+            self.clients = [self._operator()] if self.api_key else []
             return
         now = self.clock()
         if not force and now - self._checked < self.RECHECK_S:
@@ -132,11 +140,15 @@ class Clients:
             self.log.error("--api-keys-file %s: %s: the clients read before stay", self.keys_file, e)
             return
         if self.api_key:  # (--api-key too: one more client)
-            clients.append(Client("default", self.api_key.encode(), metrics=True))
+            clients.append(self._operator())
         if self._seen is not None:
             self.log.info("--api-keys-file read again: %d clients (%s)", len(clients),
                           ", ".join(c.name for c in clients))
         self.clients, self._seen = clients, seen
+
+    def _operator(self) -> Client:
+        """--api-key's client: "default", the operator's key (it reads /metrics, and is an admin)."""
+        return Client("default", self.api_key.encode(), metrics=True, admin=True)
 
     def identify(self, presented: bytes) -> Client | None:
         """The client whose key was presented, else None. Every key is compared, in constant time: how long it

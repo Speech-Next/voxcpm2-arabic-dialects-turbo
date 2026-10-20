@@ -29,6 +29,8 @@ def test_parse_lines_and_json():
                     '{"name": "beta", "key": "sk-beta", "metrics": true}]')
     assert lines == as_json == [Client("acme", b"sk-acme", 2, 60.0), Client("beta", b"sk-beta", 0, 0.0, True)]
     assert "sk-acme" not in repr(lines)  # (a key never in a log line or an error message)
+    assert parse("ops sk-ops admin=true")[0].admin and not lines[0].admin
+    assert Clients("k").identify(b"k").admin  # (--api-key's client: the operator's key)
     for bad in ("acme", "acme sk-1 fast", "acme sk-1 burst=3", "acme sk-1\nacme sk-2", "acme sk-1\nbeta sk-1",
                 "acme sk-1 rpm=-1", '[{"name": "acme"}]'):
         with pytest.raises(ValueError):
