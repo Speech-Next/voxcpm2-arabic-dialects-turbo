@@ -1,9 +1,9 @@
 """OpenAI-compatible streaming TTS server for VoxCPM2, built around voice cloning.
 
-    python -m nanovllm_voxcpm.entrypoints.openai_server --model <model dir or repo id> \
-        --dit <distilled LocDiT, path or repo:file> --voice-dir /path/to/voices --port 8092
+    python -m nanovllm_voxcpm.entrypoints.openai_server [--voice-dir /path/to/voices] [--port 8092]
 
-(or NANOVLLM_VOXCPM2_TURBO='{...}' for a configuration of its own). A model with an ``adapters/`` directory serves its
+The defaults are the library's: the dialect model, routed, with the distilled 3-step LocDiT and int8 layers
+(--dit none: the model's own LocDiT, 10 steps). A model with an ``adapters/`` directory serves its
 adapters (see LoRA below).
 
 Endpoints (request shapes follow vLLM-Omni's, so one client can drive both servers):
@@ -63,8 +63,8 @@ from pydantic import BaseModel, ValidationError
 
 from nanovllm_voxcpm.dialect_routing import (DEFAULT_ROUTES, DEFAULT_TAGGED_MODEL, TAGGED, TAGGED_ADAPTER,
                                              resolve_tagged, route_table, routed_lora_config, used_adapters)
-from nanovllm_voxcpm.dialect_tts import (DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters, read_as,
-                                         resolve, turbo_config, use_model_calibration)
+from nanovllm_voxcpm.dialect_tts import (DEFAULT_DIT, DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters,
+                                         read_as, resolve, turbo_config, use_model_calibration)
 
 CLONE_MODES = ("prompt_ref", "ref", "prompt")
 VOICE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")  # voice names are also file names in --voice-dir
@@ -214,8 +214,9 @@ def build_app(args: argparse.Namespace):
         if args.kv_blocks:
             os.environ["NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS"] = str(args.kv_blocks)
         turbo = json.loads(os.environ.get("NANOVLLM_VOXCPM2_TURBO") or "{}")
-        if (args.dit or args.dit_cache) and not turbo:  # the low-latency configuration
-            turbo = turbo_config(args.dit, args.head_tokens, args.dit_cache)
+        if not turbo:
+            turbo = turbo_config(None if args.dit in ("", "none") or args.dit_cache else args.dit, args.head_tokens,
+                                 args.dit_cache)
         turbo.setdefault("pcm16_output", True)  # int16 from the GPU: half the bytes per chunk, no conversion here
         os.environ["NANOVLLM_VOXCPM2_TURBO"] = json.dumps(turbo)
         model_path = resolve(args.model)
@@ -508,8 +509,8 @@ def build_app(args: argparse.Namespace):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model", default=DEFAULT_MODEL, help="VoxCPM2 model directory or Hugging Face repo id")
-    ap.add_argument("--dit", help="distilled LocDiT checkpoint (path or repo:file): the low-latency configuration, "
-                                  "unless NANOVLLM_VOXCPM2_TURBO is set")
+    ap.add_argument("--dit", default=DEFAULT_DIT, help="distilled LocDiT checkpoint (path or repo:file); 'none': the "
+                                                       "model's own LocDiT (10 steps, quality mode)")
     ap.add_argument("--head-tokens", type=int, default=8, help="with --dit: head start length in tokens (0 = off)")
     ap.add_argument("--dit-cache", choices=["light", "medium"],
                     help="instead of --dit: the original LocDiT, its middle layers reused on 2 (light) or 4 (medium) "

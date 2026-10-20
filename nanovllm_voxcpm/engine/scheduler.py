@@ -103,6 +103,8 @@ class Scheduler:
         # _admit_loop
         self.step_cap = (getattr(turbo, "step_cap_ms", 0) or 0) / 1000
         self.mix_decode = bool(getattr(turbo, "mix_decode", False))
+        self.mix_heads = self.mix_decode and bool(getattr(turbo, "mix_heads", False))  # (TurboConfig.mix_heads)
+        self.heads_deadline = self.mix_heads and bool(getattr(turbo, "heads_deadline", False))
         margin = getattr(turbo, "realtime_margin_ms", -1)
         self.realtime_margin = margin / 1000 if isinstance(margin, (int, float)) and margin >= 0 else None
         # the last step: (is_prefill, rows, tokens computed), for the callbacks' step time model; mixed: the running
@@ -111,6 +113,7 @@ class Scheduler:
         self.mixed: list[Sequence] = []
         self._playing = False  # the last admission pass saw a playing stream
         self._resumes = False  # the next prefill step resumes a stream (a continuation, a preempted sequence)
+        self.resuming = False  # the last prefill step resumed one (no first-patch LocDiT settings for it)
         self._paused = False  # the last step was a prefill step that paused playing streams (no mixed rows)
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
@@ -257,7 +260,7 @@ class Scheduler:
             if not waiting or budget[0] >= max_seqs:
                 break
             seq = waiting.popleft()
-            mixed = mixable and (self._resumes or seq.has_stream)  # the step decodes the short streams too
+            mixed = mixable and (self._resumes or seq.has_stream or self.mix_heads)  # the short streams ride too
             if slack is not None and not (mixed and seq.has_stream):
                 b = buffer_of(seq) if seq.has_stream else None
                 if b is None or b > slack:  # a new request, or a stream with more audio left than a running one
@@ -269,6 +272,10 @@ class Scheduler:
             if cap is not None:
                 t = cost(budget[0] + 1 + ride, budget[1] + seq.num_tokens - hint + ride, True)
                 first = max(cap, least - _PAUSE_MARGIN + (patch if mixed else 0.0))
+                if self.heads_deadline and mixed and not seq.has_stream and not self._resumes:
+                    # a step of new heads that streams ride (mix_heads): over by the time the least of them needs
+                    # its next audio (else the heads wait for the decode step)
+                    first = min(cap, least - _PAUSE_MARGIN)
                 late = t > (first if budget[0] == 0 else cap)
             if not seq.has_stream and not late and realtime is not None:
                 rows = len(running) + 1
@@ -316,9 +323,9 @@ class Scheduler:
         self.mixed = []
         if self._admitted:
             scheduled_seqs, self._admitted, (_, tokens), self._budget = self._admitted, [], self._budget, [0, 0]
-            if self.mix_decode and self._playing and self._resumes:
+            if self.mix_decode and self._playing and (self._resumes or self.mix_heads):
                 self._ride(scheduled_seqs, tokens)
-            self._resumes = False
+            self.resuming, self._resumes = self._resumes, False
             self.last_step = (True, len(scheduled_seqs) + len(self.mixed), tokens + len(self.mixed))
             self._paused = self._playing and not self.mixed
             return _by_adapter(scheduled_seqs + self.mixed), True

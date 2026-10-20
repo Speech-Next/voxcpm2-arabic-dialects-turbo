@@ -45,7 +45,7 @@ implementations.
 
 Concrete example: VoxCPM
 ------------------------
-``nanovllm_voxcpm/models/voxcpm/engine.py`` implements an audio generation loop
+``nanovllm_voxcpm/models/voxcpm2/engine.py`` implements an audio generation loop
 on top of this base engine:
 
 - ``Sequence.token_ids`` is used as a hashable prefix stream (ints for text token
@@ -59,6 +59,7 @@ on top of this base engine:
 """
 
 import atexit
+import os
 import contextlib
 import sys
 from collections import deque
@@ -81,6 +82,8 @@ def get_distributed_port():
         s.bind(("localhost", 0))
         return s.getsockname()[1]
 
+
+_FIRST_PATCH_RESUMING = os.environ.get("NANOVLLM_FIRST_PATCH_RESUMING", "0") != "0"
 
 class LLMEngineBase:
     model_runner: BaseModelRunner
@@ -259,6 +262,7 @@ class LLMEngineBase:
         with self.stepping():
             _profile.begin_step()  # NANOVLLM_PROFILE: the step record's t_begin (and GPU reference)
             seqs, is_prefill = self.scheduler.schedule()
+            _profile.host_mark("schedule")
             if not seqs:
                 return seqs
 
@@ -275,16 +279,24 @@ class LLMEngineBase:
                 prepared.clear()
             else:
                 runner_tasks = [self.preprocess_seq(seq, is_prefill and id(seq) not in ride) for seq in seqs]
-            outputs = self.model_runner.call("run", runner_tasks, is_prefill)
+            # a prefill step of only new streams: their first patch, with the first patch's LocDiT settings
+            # (NANOVLLM_FIRST_PATCH_RESUMING=1, for evaluations: also steps that resume streams, e.g. continuations)
+            resuming = getattr(self.scheduler, "resuming", False)
+            first = is_prefill and not ride and (_FIRST_PATCH_RESUMING or not resuming)
+            _profile.host_mark("preprocess")
+            outputs = self.model_runner.call("run", runner_tasks, is_prefill, first)
+            _profile.host_mark("run")
 
             for seq, output in zip(seqs, outputs):
                 self.postprocess_seq(seq, output, is_prefill and id(seq) not in ride)
+            _profile.host_mark("postprocess")
             if is_prefill:
                 self.after_prefill(fresh)
 
             for seq in seqs:
                 if seq.stoped:
                     self.scheduler.finish(seq)
+            _profile.host_mark("finish")
 
             return seqs
 
@@ -323,7 +335,7 @@ class LLMEngineBase:
 
         Concrete example: VoxCPM
         ------------------------
-        See ``nanovllm_voxcpm/models/voxcpm/engine.py``:
+        See ``nanovllm_voxcpm/models/voxcpm2/engine.py``:
 
         - Prefill (``is_prefill=True``):
           ``RunnerTask.num_cached_tokens = seq.num_cached_tokens`` and the engine
@@ -373,7 +385,7 @@ class LLMEngineBase:
 
         Concrete example: VoxCPM
         ------------------------
-        In ``nanovllm_voxcpm/models/voxcpm/engine.py``:
+        In ``nanovllm_voxcpm/models/voxcpm2/engine.py``:
 
         - The runner returns ``latents`` (one patch), ``stop_flag``, and a decoded
           waveform chunk ``waveforms``.

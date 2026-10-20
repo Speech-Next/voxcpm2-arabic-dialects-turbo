@@ -1,5 +1,6 @@
 import os
 import random
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from multiprocessing.synchronize import Event
@@ -10,10 +11,11 @@ import xxhash
 from torch.nn.utils import remove_weight_norm
 
 from nanovllm_voxcpm.config import Config
-from nanovllm_voxcpm.engine.model_runner import BaseModelRunner, HostPack, RunnerTask
+from nanovllm_voxcpm.engine.model_runner import BaseModelRunner, HostPack, PinnedStaging, RunnerTask
 from nanovllm_voxcpm.layers.audio_vae_v2 import AudioVAEV2
 from nanovllm_voxcpm.models.voxcpm2.config import VoxCPM2Config
 from nanovllm_voxcpm.models.voxcpm2.model import VoxCPM2Model
+from nanovllm_voxcpm.utils.context import get_context
 from nanovllm_voxcpm.utils.loader import load_model, load_state_dict_into
 from nanovllm_voxcpm.utils.profile import StepProfile
 from nanovllm_voxcpm.utils.seed import _UINT64_MASK, derive_step_seed, derive_step_seeds
@@ -44,27 +46,34 @@ def _pinned_concat(arrays: list[np.ndarray]) -> torch.Tensor:
 
 
 # NANOVLLM_KERNEL_TRACE=<file>: a torch.profiler kernel table of prefill steps with at least
-# NANOVLLM_KERNEL_TRACE_MIN_BS sequences (default 128), the first NANOVLLM_KERNEL_TRACE_SKIP (default 2) skipped
+# NANOVLLM_KERNEL_TRACE_MIN_BS sequences (default 128), the first NANOVLLM_KERNEL_TRACE_SKIP (default 2) skipped;
+# NANOVLLM_KERNEL_TRACE_COUNT (default 1) steps, the k-th (k > 0) to <file>.<k>
 _TRACE_PATH = os.environ.get("NANOVLLM_KERNEL_TRACE")
 _trace_seen = [0]
 
 
-def _kernel_trace(is_prefill: bool, bs: int):
+def _kernel_trace(is_prefill: bool, bs: int, tokens: int = 0):
     if not _TRACE_PATH or not is_prefill or bs < int(os.environ.get("NANOVLLM_KERNEL_TRACE_MIN_BS", "128")):
+        return None
+    if tokens > int(os.environ.get("NANOVLLM_KERNEL_TRACE_MAX_TOKENS", "1000000000")):  # e.g. heads only
         return None
     _trace_seen[0] += 1
     skip = int(os.environ.get("NANOVLLM_KERNEL_TRACE_SKIP", "2"))
-    if _trace_seen[0] <= skip or _trace_seen[0] > skip + 1:
+    count = int(os.environ.get("NANOVLLM_KERNEL_TRACE_COUNT", "1"))
+    if _trace_seen[0] <= skip or _trace_seen[0] > skip + count:
         return None
     from torch.profiler import ProfilerActivity, profile
 
     return profile(activities=[ProfilerActivity.CUDA])
 
 
-def _dump_kernel_trace(trace) -> None:
-    with open(_TRACE_PATH, "w") as f:
+def _dump_kernel_trace(trace, bs: int) -> None:
+    k = _trace_seen[0] - int(os.environ.get("NANOVLLM_KERNEL_TRACE_SKIP", "2")) - 1
+    path = _TRACE_PATH if k == 0 else f"{_TRACE_PATH}.{k}"
+    with open(path, "w") as f:
+        f.write(f"prefill step, {bs} rows\n")
         f.write(trace.key_averages().table(sort_by="cuda_time_total", row_limit=60, max_name_column_width=70))
-    trace.export_chrome_trace(_TRACE_PATH + ".json")
+    trace.export_chrome_trace(path + ".json")
 
 
 @dataclass
@@ -82,18 +91,6 @@ class VoxCPM2Payload:
     prefix_src_block: int | None = None  # ref_prefix_cache hit: block holding the prefix KV
     prefix_len: int = 0
     feat_keys: np.ndarray | list | None = None  # uint64 per position, LocEnc cache keys (0 = not cacheable)
-
-
-_SILENCE_RMS = 10 ** (-50 / 20)  # -50 dBFS
-
-
-def _patch_silent(wave) -> bool:
-    """A patch's audio (float in [-1, 1] or int16 PCM) below -50 dBFS RMS."""
-    x = np.asarray(wave)
-    if x.size == 0:
-        return True
-    x = x.astype(np.float32) / (32768.0 if x.dtype == np.int16 else 1.0)
-    return float(np.sqrt(np.mean(x * x))) < _SILENCE_RMS
 
 
 # NANOVLLM_FIRST_AUDIO_FRAMES=k: a prefill step's patch is decoded and sent as its first k latent frames (40 ms of
@@ -189,9 +186,8 @@ class VoxCPM2Runner(BaseModelRunner):
                 fuse_prefixes=["base_lm", "residual_lm", "feat_encoder", "feat_decoder"],
                 min_rows=turbo.w8a8_min_rows,
             )
-            sparse = sum(getattr(getattr(m, "forward", None), "sp24", None) is not None for m in self.model.modules())
-            print(f"[turbo] fused {fused} decoder layers ({quantized} W8A8 for rows >= {turbo.w8a8_min_rows}"
-                  + (f", {sparse} with a 2:4 sparse FFN" if sparse else "") + ")", flush=True)
+            print(f"[turbo] fused {fused} decoder layers ({quantized} W8A8 for rows >= {turbo.w8a8_min_rows})",
+                  flush=True)
         elif turbo.w8a8:
             from voxcpm_kernels import quantize_linears
 
@@ -354,14 +350,20 @@ class VoxCPM2Runner(BaseModelRunner):
         return lambda views: {"enc_pos": views[i_pos], "enc_rows": views[i_rows], "enc_miss": views[i_miss],
                               "enc_cache": self._enc_cache}
 
-    def run(self, seqs: list[RunnerTask[VoxCPM2Payload]], is_prefill: bool):
-        trace = _kernel_trace(is_prefill, len(seqs))
+    _first_patch = True  # this prefill step's Context.first_patch (run's first_patch)
+
+    def run(self, seqs: list[RunnerTask[VoxCPM2Payload]], is_prefill: bool, first_patch: bool = True):
+        """first_patch: a prefill step whose sequences all start their stream (the engine's step: no resumed stream,
+        no decode riding along); its LocDiT solves with the first patch's settings."""
+        self._first_patch = first_patch
+        trace = _kernel_trace(is_prefill, len(seqs), sum(len(t.custom_payload.text_tokens) for t in seqs)
+                              if _TRACE_PATH and is_prefill else 0)
         if trace is None:
             return self._run(seqs, is_prefill)
         with trace:
             out = self._run(seqs, is_prefill)
             torch.cuda.synchronize()
-        _dump_kernel_trace(trace)
+        _dump_kernel_trace(trace, len(seqs))
         return out
 
     def _noise_seeds(self, seqs: list[RunnerTask[VoxCPM2Payload]]) -> np.ndarray:
@@ -432,7 +434,9 @@ class VoxCPM2Runner(BaseModelRunner):
         if hits:  # cached reference prefixes -> this step's sequences, before they attend to them (unless the engine
             # copied them at admission already: VoxCPM2Engine.on_prefill_admitted)
             self.copy_kv_blocks([(src, dst) for src, dst, _ in hits], [n for _, _, n in hits])
-        pack = HostPack(getattr(self, "pack_device", "cuda"))
+        if getattr(self, "_pack_staging", None) is None:
+            self._pack_staging = PinnedStaging()
+        pack = HostPack(getattr(self, "pack_device", "cuda"), self._pack_staging)
         finish_ctx = self.stage_prefill_context(seqs, pack)
         prof.mark("ctx")
 
@@ -460,7 +464,10 @@ class VoxCPM2Runner(BaseModelRunner):
         if self._fast_noise:
             seeds = self._noise_seeds(seqs)
             i_seed = pack.add(seeds)
+        t_up = time.perf_counter() if prof.enabled else 0.0
         views = pack.upload()
+        if prof.enabled:  # (the pinned staging and the one copy, inside the "h2d" stage)
+            prof.rec["upload"] = (time.perf_counter() - t_up) * 1000
         inputs = {"positions": finish_ctx(views)}
         inputs["text_tokens"] = views[i_tok]
         inputs["feat"] = views[i_feat].to(self.dtype)
@@ -535,6 +542,8 @@ class VoxCPM2Runner(BaseModelRunner):
     def _run_with_inputs(self, seqs, inputs, is_prefill, prof):
         if prof.enabled:
             prof.rec["tokens"] = int(inputs["text_tokens"].numel())
+        if is_prefill:
+            get_context().first_patch = self._first_patch
         prof.mark("prep")
 
         outputs = self.run_model(inputs, is_prefill)
@@ -645,8 +654,10 @@ class VoxCPM2Runner(BaseModelRunner):
         prof.mark("tail")
         prof.write()
         full = full_waveforms or ret_waveforms
+        # the whole patch's audio (the step may stream only its rest): the engine tests its silence where it needs to
+        # (heads, leading silence), not for every stream (#31: ~2 ms at 200 streams)
         return [
             {"latents": np_latents[i], "stop_flag": stop_flag[i], "waveforms": ret_waveforms[i],
-             "patch_silent": _patch_silent(full[i])}
+             "patch_audio": full[i]}
             for i in range(len(seqs))
         ]

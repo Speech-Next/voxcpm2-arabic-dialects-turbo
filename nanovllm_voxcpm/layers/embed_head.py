@@ -60,26 +60,3 @@ class VocabParallelEmbedding(nn.Module):
         return F.embedding(x, self.weight)
 
 
-class ParallelLMHead(VocabParallelEmbedding):
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        bias: bool = False,
-    ):
-        assert not bias
-        super().__init__(num_embeddings, embedding_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        context = get_context()
-        if context.is_prefill:
-            assert context.cu_seqlens_q is not None
-            last_indices = context.cu_seqlens_q[1:] - 1
-            x = x[last_indices].contiguous()
-        logits = F.linear(x, self.weight)
-        if self.tp_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)]
-            dist.all_gather(all_logits, logits)
-            logits = torch.cat(all_logits, -1)
-
-        return logits

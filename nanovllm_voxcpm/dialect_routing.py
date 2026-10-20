@@ -39,8 +39,7 @@ table uses are loaded.
 Cost (one A10, int8, 600 KV blocks): the speed of the unrouted engine and less memory than it (5 adapters instead
 of 11, plus teacher-v3's merged MLP weights, 1 GB; README). In int8 the tagged requests run the merged int8 weights
 at every batch size, as the adapters do; SmoothQuant statistics are the base model's (teacher-v3's own, max-combined
-with them, changed nothing on #2). A 2:4 sparse FFN (sparse24) cannot take the tagged adapter's MLP LoRA: the engine
-refuses to start.
+with them, changed nothing on #2).
 """
 
 from __future__ import annotations
@@ -213,7 +212,8 @@ class RoutedDialectTTS:
 
     async def stream(self, text: str, dialect: str | None = None, voice: str | None = None, *,
                      clone_mode: str | None = None, seed: int | None = None, cfg_value: float = 2.0,
-                     max_patches: int = 600, normalize: bool = True) -> AsyncIterator[np.ndarray]:
+                     max_patches: int = 600, normalize: bool = True,
+                     chunk_ms: float | None = None, pace: float | dict | None = None) -> AsyncIterator[np.ndarray]:
         """As DialectTTS.stream, through the adapter, or the tagged adapter and tag, that ``dialect`` routes to."""
         r = self.route(dialect)
         if normalize:
@@ -234,6 +234,10 @@ class RoutedDialectTTS:
                                                          read_as(transcript, r.dialect) if norm else transcript)
             else:
                 text = tag + text
+        if chunk_ms is not None:
+            kw["client_chunk_ms"] = chunk_ms
+        if pace is not None:
+            kw["client_pace"] = pace
         async for chunk in self.server.generate(target_text=text, lora_name=lora, seed=seed, cfg_value=cfg_value,
                                                 max_generate_length=max_patches, **kw):
             yield np.multiply(chunk, np.float32(1 / 32768), dtype=np.float32) if chunk.dtype == np.int16 else chunk

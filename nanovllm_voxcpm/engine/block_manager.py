@@ -68,7 +68,7 @@ It calls into :class:`BlockManager` to:
 Concrete example: VoxCPM
 ------------------------
 VoxCPM requests encode both text and audio context. In
-``nanovllm_voxcpm/models/voxcpm/engine.py``, the sequence's ``token_ids``
+``nanovllm_voxcpm/models/voxcpm2/engine.py``, the sequence's ``token_ids``
 (``hash_tokens``) contains:
 
 - ``int`` token ids for (prompt_text + target_text) plus a special

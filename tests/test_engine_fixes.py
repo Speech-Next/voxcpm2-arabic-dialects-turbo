@@ -3,6 +3,7 @@ cancels, head start, streamed-audio errors. Nothing runs on a GPU (CUDA calls ar
 the real model are tests/gpu/verify_engine_fixes.py."""
 
 import asyncio
+import time
 from collections import OrderedDict
 from types import SimpleNamespace
 
@@ -547,7 +548,7 @@ class _FakeRunner:
 
     def call(self, name, *args):
         if name == "run":
-            tasks, is_prefill = args
+            tasks, is_prefill = args[:2]
             if self.overlap_hook is not None:
                 self.overlap_hook()
             for t in tasks:
@@ -584,6 +585,29 @@ def _run(engine, max_steps=50):
             return
         engine.step()
     raise AssertionError("engine did not finish")
+
+
+def test_only_a_prefill_step_of_new_streams_is_a_first_patch_step():
+    """The runner's first_patch (the first patch's LocDiT settings, TurboConfig.dit_first_t_span): a prefill step of
+    new streams only; a step that resumes a stream (a preempted one, a continuation) or decodes running ones is not."""
+    eng = _Engine(stop_at=4)
+    firsts = []
+    call = eng.model_runner.call
+
+    def record(name, *args):
+        if name == "run":
+            firsts.append((args[1], args[2]))
+        return call(name, *args)
+
+    eng.model_runner.call = record
+    for i in range(2):
+        eng.add_sequence(_seq(f"s{i}", [i + 1]))
+    eng.step()  # the two new streams' prefill
+    eng.step()  # a decode step
+    resumed = eng.scheduler.running.pop()
+    eng.scheduler.preempt(resumed)
+    eng.step()  # the preempted stream resumes: a prefill step, not a first patch
+    assert firsts == [(True, True), (False, False), (True, False)]
 
 
 def test_cancel_during_a_step_runs_after_it():
@@ -788,6 +812,240 @@ def _steps_until_chained(eng, seq_id):
             if s.seq_id == seq_id and s.custom_payload.chained:
                 return s
     raise AssertionError("the head was not continued")
+
+
+def _staged(per_token, mid_tokens=(16,)):
+    """_loaded with #31's intermediate stages (head: 3 ids, a stage: its mid_tokens ids, whole: one per word) and
+    stage KV reuse; records the KV copies."""
+    eng = _loaded(per_token)
+    eng.mid_stages, eng.mid_patches_max, eng.stage_kv_reuse, eng._stream_prefix = mid_tokens, 6, True, {}
+    eng._split_head = lambda prompt_text, target_text, voice, clone_mode, limit=None: (
+        [7] * (limit or 3), [7] * len((prompt_text + target_text).split()))
+    eng.copies, call = [], eng.model_runner.call
+
+    def spy(name, *args):
+        if name == "copy_kv_blocks":
+            eng.copies.append(args[1])
+        return call(name, *args)
+
+    eng.model_runner.call = spy
+    return eng
+
+
+def test_a_continuation_copies_the_prefix_it_shares_with_its_head():
+    eng = _staged(0.0001)  # fast prefill: the whole continuation is in time, no intermediate stage
+    bm = eng.scheduler.block_manager
+    free = len(bm.free_block_ids)
+    eng.add_request("r", _words(40), max_generate_length=40)
+    _steps_until_chained(eng, "r")
+    cont = eng.scheduler.waiting[0]
+    assert cont.custom_payload.chain is None and cont.num_tokens == 40 + 1 + 3  # text, audio start, the head's patches
+    assert "r" in eng._stream_prefix and len(bm.free_block_ids) == free - 1  # the head's block, kept
+    eng.step()  # the continuation's prefill: the head's 3 text ids come from its block
+    assert eng.copies[-1] == [3] and not eng._stream_prefix and len(bm.free_block_ids) == free - 1
+    _run(eng, 80)
+    assert len(bm.free_block_ids) == free and not eng._head_phase and eng._head_sum == 0
+
+
+def test_a_late_head_speaks_the_intermediate_stage_first():
+    eng = _staged(0.01)  # 10 ms a token: the whole continuation (~41 tokens) would outlast the head's 480 ms
+    bm = eng.scheduler.block_manager
+    free = len(bm.free_block_ids)
+    eng.add_request("r", _words(40), max_generate_length=40)
+    assert eng._head_phase["r"] == 16 + 1 - 3 + 3  # the head's next prefill: the intermediate stage's
+    _steps_until_chained(eng, "r")
+    mid = eng.scheduler.waiting[0]
+    chain = mid.custom_payload.chain
+    assert chain is not None and chain["stage"] == 1 and chain["done"] == 3
+    assert mid.custom_payload.max_generate_length == 4  # 0.5 a token of its 16 (2 kept back), less the head's 3
+    assert mid.num_tokens == 16 + 1 + 3
+    eng.step()  # its prefill, with the head's 3 ids copied
+    assert eng.copies[-1] == [3] and eng._head_phase["r"] == 40 + 1 - 16 + 3 + 4  # next: the whole continuation
+    for _ in range(10):
+        if eng.scheduler.waiting:
+            break
+        eng.step()
+    whole = eng.scheduler.waiting[0]
+    assert whole.custom_payload.chain is None and whole.num_tokens == 40 + 1 + 3 + 4  # every earlier patch
+    assert whole.custom_payload.max_generate_length == 40 - 7
+    eng.step()
+    assert eng.copies[-1] == [16]  # the intermediate stage's 16 ids
+    _run(eng, 80)
+    assert len(bm.free_block_ids) == free and not eng._stream_prefix and not eng._head_phase
+
+
+def _next_queued(eng):
+    for _ in range(12):
+        if eng.scheduler.waiting:
+            return eng.scheduler.waiting[0]
+        eng.step()
+    raise AssertionError("nothing was queued")
+
+
+def test_stages_go_on_until_the_whole_continuation_is_in_time():
+    eng = _staged(0.032, mid_tokens=(16, 32))  # 32 ms a token: from the head no stage is in time (the shortest)
+    eng.head_patches_max = 3  # (heads not lengthened: 3 patches)
+    bm = eng.scheduler.block_manager
+    free = len(bm.free_block_ids)
+    eng.add_request("r", _words(40), max_generate_length=60)
+    _steps_until_chained(eng, "r")
+    one = eng.scheduler.waiting[0]
+    assert one.custom_payload.chain["stage"] == 1 and one.custom_payload.chain["stage_len"] == 16
+    assert one.custom_payload.max_generate_length == 4  # 0.5 a token of its 16 (2 kept back), less the head's 3
+    eng.step()  # its prefill: the head's 3 ids copied
+    two = _next_queued(eng)  # 7 patches (0.97 s to spare): the whole (32 tokens, 1.02 s) is late, the 32-id stage is not
+    assert two.custom_payload.chain["stage"] == 2 and two.custom_payload.chain["stage_len"] == 32
+    assert two.num_tokens == 32 + 1 + 7 and two.custom_payload.max_generate_length == 6  # mid_patches_max
+    eng.step()
+    whole = _next_queued(eng)  # 13 patches (2.1 s): the whole is in time
+    assert whole.custom_payload.chain is None and whole.num_tokens == 40 + 1 + 13
+    assert whole.custom_payload.max_generate_length == 60 - 13
+    eng.step()
+    assert eng.copies[-3:] == [[3], [16], [32]]  # every stage copies the prefix of the one before
+    _run(eng, 120)
+    assert len(bm.free_block_ids) == free and not eng._stream_prefix and not eng._head_phase
+
+
+def test_mid_stagger_ends_the_streams_stages_apart():
+    eng = _staged(0.032, mid_tokens=(16, 32))
+    eng.mid_patches_max = 16
+    ends = {eng._mid_patches({}, 32, 3, 60, f"r{i}") for i in range(32)}
+    assert ends == {12}  # 0.5 a token of 32 ids, 2 kept back, less the 3 spoken: every stream alike
+    eng.mid_stagger = 4
+    ends = {eng._mid_patches({}, 32, 3, 60, f"r{i}") for i in range(32)}
+    assert ends == {9, 10, 11, 12}
+
+
+def test_a_stage_in_time_is_preferred_to_shorter_ones():
+    eng = _staged(0.01, mid_tokens=(16, 32))  # 10 ms a token: the 32-id stage is in time from the head already
+    eng.add_request("r", _words(40), max_generate_length=60)
+    eng.head_margin = 0.1
+    _steps_until_chained(eng, "r")
+    assert eng.scheduler.waiting[0].custom_payload.chain["stage_len"] == 32
+
+
+def test_the_buffer_leaves_out_what_the_front_holds_back():
+    eng = _voxcpm2_engine()
+    seq = eng.add_request("r", _words(2), max_generate_length=8, head_start=False)
+    for _ in range(2):
+        eng.step()
+    p = seq.custom_payload
+    assert p.streamed == pytest.approx(0.32)
+    p.play_end = time.perf_counter() + 1.0
+    assert eng.stream_buffer(seq) == pytest.approx(1.0, abs=0.01)  # client_chunk_ms 0: every patch whole
+    p.client_chunk = 0.128  # 4096-byte chunks of 16 kHz PCM16: 0.32 s streamed, 0.064 s of it held back
+    assert eng.stream_buffer(seq) == pytest.approx(0.936, abs=0.01)
+    p.streamed = 0.64  # five whole chunks: nothing held back
+    assert eng.stream_buffer(seq) == pytest.approx(1.0, abs=0.01)
+
+
+def test_a_paced_front_s_send_clock_is_the_deadline():
+    eng = _voxcpm2_engine()
+    seq = eng.add_request("r", _words(2), max_generate_length=12, head_start=False, client_chunk_ms=128,
+                          client_pace=0.93)
+    p, interval = seq.custom_payload, 0.93 * 0.128
+    eng.step()  # one patch, 1.25 chunks: chunk 0 goes out at once, chunk 1 is due one interval later
+    assert p.pacer.sent == 1 and eng.stream_buffer(seq) == pytest.approx(interval, abs=0.01)
+    eng.step()  # 2.5 chunks: chunk 1 waits for its time; the next one is needed an interval after it
+    assert p.pacer.sent == 1 and eng.stream_buffer(seq) == pytest.approx(2 * interval, abs=0.01)
+    for _ in range(8):  # far ahead: what is queued beyond the 1 s reserve goes out at once
+        eng.step()
+    assert 0.9 < eng.stream_buffer(seq) < 1.25 and p.pacer.sent > 2
+    unpaced = eng.add_request("q", _words(2), max_generate_length=4, head_start=False, client_chunk_ms=128)
+    eng.step()
+    assert unpaced.custom_payload.pacer is None  # (pace 0: the real-time player from the first chunk)
+    own = eng.add_request("o", _words(2), max_generate_length=4, head_start=False, client_chunk_ms=128,
+                          client_pace={"alpha": 0.9, "alpha_last": 0.92, "reserve_ms": 1000.0, "phase_ms": 0.0,
+                                       "min_gap_ms": 8.0})  # (the front's own pacer settings, ws_server's)
+    eng.step()
+    pacer = own.custom_payload.pacer
+    assert (pacer.alpha, pacer.alpha_last, pacer.min_gap) == (0.9, 0.92, pytest.approx(0.008))
+
+
+def test_a_paced_stream_s_leading_silence_goes_out_when_its_front_would_run_dry():
+    eng = _voxcpm2_engine()
+    eng.lead_silence_patches = 1  # the first silent patch is streamed, later ones are dropped
+    eng.model_runner.make_output = lambda t, p: {"latents": np.full((PATCH, FEAT), 0.5, np.float32), "stop_flag": 0,
+                                                 "waveforms": np.zeros(8, np.float32), "patch_silent": True}
+    seq = eng.add_request("r", _words(2), max_generate_length=12, head_start=False, client_chunk_ms=128,
+                          client_pace=0.93)
+    p = seq.custom_payload
+    eng.step()  # silent, streamed: the front sends chunk 0 and needs chunk 1 in 119 ms
+    eng.step()  # silent again, past the cap, but dropping it would leave the front without audio: streamed
+    assert not p.muted and p.streamed == pytest.approx(0.32)
+    p.pace_dry = time.perf_counter() + 1.0  # (the front holds plenty)
+    eng.step()  # now the silence is dropped
+    assert p.muted and p.streamed == pytest.approx(0.32)
+
+
+def test_the_engine_s_counting_pacer_keeps_the_real_one_s_times():
+    from nanovllm_voxcpm.models.voxcpm2.engine import _ByteCount
+    from nanovllm_voxcpm.streaming import ChunkPacer
+
+    real, counted = (ChunkPacer(4096, 32000, alpha=0.9, alpha_last=0.92, reserve_ms=1000.0, min_gap_ms=8.0)
+                     for _ in range(2))
+    counted._buf = _ByteCount()
+    t = 0.0
+    for k, (n, dt) in enumerate([(5120, 0.0), (5120, 0.09), (1280, 0.3), (5120, 0.05)] + [(5120, 0.02)] * 12):
+        t += dt
+        for p in (real, counted):
+            p.push(bytes(n), t)
+            while p.due() is not None and p.due() <= t:
+                p.pop()
+        assert (real.due(), real.dry_at(), real.sent) == (counted.due(), counted.dry_at(), counted.sent), k
+
+
+def test_mix_heads_decodes_the_short_streams_in_a_step_of_new_requests():
+    buf = {"a": 0.05, "c": 0.5}
+    sch = _timed(buf, mix_decode=True, mix_heads=True)  # 10 ms a token
+    _playing(sch, a := _seq("a", [1]), c := _seq("c", [3]))
+    sch.add(b := _seq("b", [2]))
+    assert sch.schedule() == ([b, a], True) and sch.mixed == [a]  # a would run out during b's step: it rides
+
+
+def test_a_requests_chunk_size_goes_with_every_stage():
+    eng = _staged(0.032, mid_tokens=(16, 32))
+    eng.head_patches_max = 3
+    head = eng.add_request("r", _words(40), max_generate_length=60, client_chunk_ms=128)
+    plain = eng.add_request("q", _words(2), max_generate_length=4, head_start=False)  # the engine's default: 0
+    assert head.custom_payload.client_chunk == pytest.approx(0.128) and plain.custom_payload.client_chunk == 0.0
+    seen = set()
+    for _ in range(40):
+        for s in eng.step():
+            if s.seq_id == "r":
+                seen.add((s.custom_payload.chain or {}).get("stage", "whole") if s is not head else "head")
+                assert s.custom_payload.client_chunk == pytest.approx(0.128)
+        if eng.is_finished():
+            break
+    assert seen == {"head", 1, 2, "whole"}
+
+
+def test_intermediate_stages_are_not_first_patch_steps():
+    """#31's intermediate stages resume their stream, as continuations do: the first patch's LocDiT settings
+    (first_patch) are only for the heads' prefill."""
+    eng = _staged(0.032, mid_tokens=(16, 32))
+    eng.head_patches_max = 3
+    firsts, call = [], eng.model_runner.call
+
+    def record(name, *args):
+        if name == "run" and args[1]:
+            firsts.append((tuple(t.seq_id for t in args[0]), len(args[0][0].custom_payload.text_tokens), args[2]))
+        return call(name, *args)
+
+    eng.model_runner.call = record
+    eng.add_request("r", _words(40), max_generate_length=60)
+    _run(eng, 120)
+    assert [f[2] for f in firsts] == [True, False, False, False]  # the head; two stages; the whole continuation
+
+
+def test_a_cancelled_continuation_frees_the_block_it_would_copy():
+    eng = _staged(0.0001)
+    bm = eng.scheduler.block_manager
+    free = len(bm.free_block_ids)
+    eng.add_request("r", _words(40), max_generate_length=40)
+    _steps_until_chained(eng, "r")
+    eng.cancel_sequence("r")
+    assert not eng._stream_prefix and len(bm.free_block_ids) == free
 
 
 def test_continuation_survives_unregister_voice_and_goes_first():
@@ -998,3 +1256,105 @@ def test_turbo_config_rejects_unknown_keys_and_accepts_the_repos_own():
     for cfg in (turbo_config(None, 8), turbo_config(None, 0, "light"), turbo_config(None, 8, None, w8a8=False),
                 {**turbo_config(None, 8), "pcm16_output": True}):
         TurboConfig.model_validate(cfg)
+
+
+# --- 6. head and stage splits: one scan of the text (#31) -------------------------------------------------------
+
+
+def _split_head_reference(self, prompt_text, target_text, voice, clone_mode, limit=None):
+    """VoxCPM2Engine._split_head as it was before the shared scan (perf/ttfb-200 6eedc9b), for the test below."""
+    import re
+
+    limit = limit or self.head_tokens
+    if voice is not None:
+        entry = self.voices.get(voice)
+        if entry is not None and (clone_mode or ("prompt_ref" if entry.text else "ref")) != "ref":
+            prompt_text = entry.text or ""
+    text = prompt_text + target_text
+    ids, offs = self._tokens(text)
+    if offs is None:
+        return None
+    start = len(prompt_text)
+    tag = re.compile(r"<reserved_\d+>").match(text, start)
+    if tag is not None:
+        start = tag.end()
+    first = next((k for k, o in enumerate(offs) if o[1] > start), len(ids))
+    if len(ids) - first <= limit + self.head_min_rest:
+        return None
+    best = clause = None
+    for k in range(first + 1, min(first + limit, len(ids) - 1) + 1):
+        o = offs[k][0]
+        if o > start and o < len(text) and text[o] == " " and offs[k - 1][1] <= o:
+            best = k
+            if text[o - 1] in ",،;؛:":
+                clause = k
+    if best is None:
+        best = next((k for k in range(first + 1, min(first + 2 * limit, len(ids) - 1) + 1)
+                     if text[offs[k][0]:offs[k][0] + 1] == " " and offs[k - 1][1] <= offs[k][0]), None)
+        if best is None:
+            return None
+    cut = clause if clause is not None and (clause - first) * 2 >= best - first else best
+    return ids[:cut], ids
+
+
+def test_head_and_stage_splits_are_unchanged_by_the_shared_scan():
+    """_split_head reads one scan of the request's text for the head and its intermediate stages: the same cuts as
+    the per-call scan before it, for heads and stages (mid_tokens) in any order, prompt_ref voices, dialect tags,
+    clause marks, first words longer than the head, short texts and byte-fallback characters."""
+    import glob
+    import os
+    import random
+
+    from tokenizers import Tokenizer, models, normalizers
+
+    from nanovllm_voxcpm.models.voxcpm2.config import TurboConfig
+    from nanovllm_voxcpm.models.voxcpm2.engine import RegisteredVoice, VoxCPM2Engine
+
+    tokenizers = []
+    snaps = glob.glob(os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
+                                   "hub/models--VoxCPM-Kernel--VoxCPM2-Arabic-Dialects/snapshots/*/tokenizer.json"))
+    if snaps:
+        tokenizers.append(Tokenizer.from_file(snaps[0]))
+    chars = list("abcdefgh ,،:") + ["▁", "<unk>"] + [f"<0x{i:02X}>" for i in range(256)]
+    vocab = {c: i for i, c in enumerate(chars)}
+    merges = [("▁", "a"), ("b", "c"), ("▁a", "bc"), ("d", "e"), ("de", "f")]
+    for x, y in merges:
+        vocab.setdefault(x + y, len(vocab))
+    tiny = Tokenizer(models.BPE(vocab, merges, unk_token="<unk>", byte_fallback=True))
+    tiny.normalizer = normalizers.Sequence([normalizers.Prepend("▁"), normalizers.Replace(" ", "▁")])
+    tokenizers.append(tiny)
+
+    here = os.path.join(os.path.dirname(__file__), "..", "examples")
+    texts = [s.strip() for f in ("ar_dialects.txt", "hi_sentences.txt")
+             for s in open(os.path.join(here, f), encoding="utf-8") if s.strip()]
+    rng = random.Random(5)
+    alphabet = list("abcdefgh") + [" "] * 3 + list(",،:é") + ["defdef", "abc"]
+    texts += ["".join(rng.choice(alphabet) for _ in range(rng.randint(1, 90))) for _ in range(400)]
+    texts += ["<reserved_101>" + t for t in texts[:200]] + ["abcdefabcdefabcdef gh", "a", " ", "ab, cd: ef، gh ab"]
+
+    turbo = TurboConfig()
+    for tok in tokenizers:
+        eng = object.__new__(VoxCPM2Engine)
+        eng.head_tokens, eng.head_min_rest, eng.mid_stages = 8, turbo.head_min_rest, (24, 48)
+        eng.voices = {"v": RegisteredVoice(None, "gh, ab "), "r": RegisteredVoice(None, None)}
+        cache = {}
+
+        def tokens(text, tok=tok, cache=cache):
+            if text not in cache:
+                e = tok.encode(text, add_special_tokens=False)
+                cache[text] = (e.ids, e.offsets)
+            return cache[text]
+
+        eng._tokens = tokens
+        n = 0
+        for t in texts:
+            for prompt, voice, mode in (("", None, None), ("bc ", None, None), ("", "v", None), ("", "r", None),
+                                        ("", "v", "ref")):
+                limits = [None, 24, 48, 5, 100]
+                rng.shuffle(limits)
+                for limit in [None, 24, 48] + limits:  # a request's order, then any other
+                    got = eng._split_head(prompt, t, voice, mode, limit=limit)
+                    want = _split_head_reference(eng, prompt, t, voice, mode, limit=limit)
+                    assert got == want, (t, prompt, voice, mode, limit)
+                    n += want is not None
+        assert n > 1000  # (most of them split)

@@ -16,6 +16,9 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
+    # a prefill step whose sequences all start their stream (no resumed one, no decode riding along): the LocDiT
+    # solves with the first patch's settings (TurboConfig.dit_first_t_span / first_steps / first_cfg_steps)
+    first_patch: bool = True
 
 
 @dataclass
@@ -124,14 +127,6 @@ def build_lora_context_from_token_to_slot(
         no_lora_flag=False,
         num_active_loras=active_slot_ids.numel(),
     )
-
-
-def set_lora_context_from_token_to_slot(
-    token_to_slot: torch.Tensor | None,
-    *,
-    domain: str = LM_LORA_DOMAIN,
-) -> None:
-    set_lora_context(build_lora_context_from_token_to_slot(token_to_slot), domain=domain)
 
 
 def set_lora_context(

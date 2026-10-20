@@ -61,15 +61,7 @@ class VoxCPM:
         async_server_pool_cls: Any
         sync_server_pool_cls: Any
 
-        if arch == "voxcpm":
-            from nanovllm_voxcpm.models.voxcpm.server import (
-                AsyncVoxCPMServerPool,
-                SyncVoxCPMServerPool,
-            )
-
-            async_server_pool_cls = AsyncVoxCPMServerPool
-            sync_server_pool_cls = SyncVoxCPMServerPool
-        elif arch == "voxcpm2":
+        if arch == "voxcpm2":
             from nanovllm_voxcpm.models.voxcpm2.server import (
                 AsyncVoxCPM2ServerPool,
                 SyncVoxCPM2ServerPool,

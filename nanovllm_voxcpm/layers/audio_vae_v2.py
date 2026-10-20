@@ -10,14 +10,6 @@ from torch.nn.utils import weight_norm
 from nanovllm_voxcpm.layers.streaming_vae import BatchedStreamingVAEDecoder
 
 
-def WNConv1d(*args, **kwargs):
-    return weight_norm(nn.Conv1d(*args, **kwargs))
-
-
-def WNConvTranspose1d(*args, **kwargs):
-    return weight_norm(nn.ConvTranspose1d(*args, **kwargs))
-
-
 class CausalConv1d(nn.Conv1d):
     def __init__(self, *args, padding: int = 0, output_padding: int = 0, **kwargs):
         super().__init__(*args, **kwargs)

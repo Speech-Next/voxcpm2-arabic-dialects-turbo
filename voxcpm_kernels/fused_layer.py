@@ -479,19 +479,6 @@ class FusedCpm4Layer:
                 self.q8["qkv"] = rope_weights(self.q8["qkv"], attn.head_dim)
         self.swiglu = self.q8 is not None and _SWIGLU
         self.qkv_rope = self.q8 is not None and _ROPE_EPILOGUE and self.rope is not None and attn.head_dim == 128
-        # a 2:4-pruned FFN (at most 2 non-zeros in every 4 input channels, e.g. a 2:4-sparse base_lm checkpoint): its
-        # int8 GEMMs run on the sparse tensor cores (sparse24.py), bit-identical to the dense kernels on the same
-        # weights and faster at every row count measured, so the dense int8 FFN weights are dropped
-        self.sp24 = None
-        if self.swiglu:
-            from . import sparse24
-
-            gate_up, down = self.q8["gate_up"], self.q8["down"]
-            if sparse24.ENABLED and sparse24.is_24(gate_up.w_q) and sparse24.is_24(down.w_q) and sparse24.available():
-                self.sp24 = {"gate_up": sparse24.Sparse24Linear(gate_up, sparse24.swiglu_rows(gate_up.out_features,
-                                                                                               gate_up.w_q.device)),
-                             "down": sparse24.Sparse24Linear(down)}
-                gate_up.w_q = down.w_q = None
         # LoRA adapters merged into int8 q/k/v/o weights, one per slot ([0] = the base model): a batch mixing
         # adapters runs segmented GEMMs (rows grouped by adapter) and no LoRA kernels. refresh_lora(slot) rebuilds a
         # slot when the runner loads an adapter into it.
@@ -514,10 +501,6 @@ class FusedCpm4Layer:
         self.mlp_stacks = None
         self._mlp_entry: dict[int, int] = {}
         if self.q8 is not None and mlp_lora:
-            if self.sp24 is not None:  # merging an adapter into a 2:4-pruned weight would make it dense
-                raise NotImplementedError(
-                    f"{name}: LoRA on the MLP projections (a tagged model served as an adapter, e.g. dialect routing) "
-                    "is not supported on a 2:4 sparse FFN; use the dense model, or VOXCPM_KERNELS_SPARSE24=0")
             if self.stacks is None:
                 raise NotImplementedError("LoRA on the MLP projections in int8 layers needs the merged q/k/v/o "
                                           "weights too (attention LoRA, VOXCPM_KERNELS_LORA_MERGE=1)")
@@ -785,11 +768,6 @@ class FusedCpm4Layer:
                 hq = silu_mul_quant(seg_gemm(*xq, w_gu, sc_gu, None, dtype, *seg, remap=self.mlp_index),
                                     self.q8["down"].inv_smooth)
             return seg_gemm(*hq, w_dn, sc_dn, None, dtype, *seg, residual=x2, remap=self.mlp_index)
-        if self.sp24 is not None:
-            from . import sparse24
-
-            hq = sparse24.swiglu_gemm_quant(*xq, self.sp24["gate_up"], dtype)
-            return sparse24.gemm_res(*hq, self.sp24["down"], dtype, x2)
         if self.swiglu:
             hq = swiglu_gemm_quant(*xq, self.q8["gate_up"], dtype)
         else:

@@ -601,7 +601,7 @@ class _FakeRunner:
 
     def call(self, name, *args):
         if name == "run":
-            tasks, is_prefill = args
+            tasks, is_prefill = args[:2]
             self.runs.append((tasks, is_prefill, list(self.copies)))  # (the copies made before this run)
             if self.overlap_hook is not None:
                 self.overlap_hook()
@@ -722,6 +722,24 @@ def test_prepared_prefill_runs_the_same_tasks_as_the_step():
     assert strip(runs[0][0]) == strip(runs[1][0]) and runs[0][1] == runs[1][1]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_steps_upload_through_one_page_locked_buffer():
+    """PinnedStaging: every upload through the one buffer reaches the GPU with its own values (the next one waits
+    for the copy before writing), the buffer grows when a step needs more, and the views keep their alignment."""
+    from nanovllm_voxcpm.engine.model_runner import PinnedStaging
+
+    staging, rng = PinnedStaging(), np.random.default_rng(0)
+    for n in (100, 3000, 50, 20000):
+        a = rng.integers(0, 1 << 30, n, dtype=np.int64)
+        b = rng.standard_normal((n, 3)).astype(np.float32)
+        pack = HostPack("cuda", staging)
+        ia, ib = pack.add(a), pack.add_concat([b[: n // 2], b[n // 2:]])
+        views = pack.upload()
+        assert staging.buf.is_pinned() and staging.buf.numel() >= n * 8
+        assert np.array_equal(views[ia].cpu().numpy(), a) and np.array_equal(views[ib].cpu().numpy(), b)
+        assert all(v.data_ptr() % HostPack.ALIGN == views[0].data_ptr() % HostPack.ALIGN for v in views)
+
+
 def test_a_text_twice_in_a_registration_batch_is_tokenized_once():
     from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
 
@@ -747,6 +765,160 @@ def test_a_text_twice_in_a_registration_batch_is_tokenized_once():
     assert eng._text_ids("", "cd") == [99, 100] and singles == []
     assert eng._pretok_map == {} and eng._pretok_uses == {}  # nothing kept once every registration came
     assert eng._text_ids("", "xy") == [120, 121] and singles == ["xy"] and eng._pretok_map == {}
+
+
+def _tiny_tokenizer():
+    """A BPE tokenizer shaped like the model's (prepend + replace normalizer, no pre-tokenizer, byte fallback)."""
+    from tokenizers import Tokenizer, models, normalizers
+
+    chars = list("abcdefgh ") + ["▁", "<unk>"] + [f"<0x{i:02X}>" for i in range(256)]
+    vocab = {c: i for i, c in enumerate(chars)}
+    merges = [("▁", "a"), ("b", "c"), ("▁a", "bc")]
+    for x, y in merges:
+        vocab.setdefault(x + y, len(vocab))
+    tok = Tokenizer(models.BPE(vocab, merges, unk_token="<unk>", byte_fallback=True))
+    tok.normalizer = normalizers.Sequence([normalizers.Prepend("▁"), normalizers.Replace(" ", "▁")])
+    return tok
+
+
+def _add_cmd(seq_id, target, prompt=""):
+    return {"id": seq_id, "type": "add_request", "args": (seq_id, target, None, prompt, 400, 1.0, 2.0, None, None, 1),
+            "kwargs": {}}
+
+
+def test_the_client_tokenizes_a_batch_with_the_engines_tokenizer():
+    """NANOVLLM_CLIENT_TOKENIZE: the client's ids and offsets are the engine's (its tokenizer, sent with init_ok);
+    CJK texts and other commands are left to the engine, and the engine registers with the client's ids."""
+    from tokenizers import Tokenizer
+
+    from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, _request_text
+
+    backend = _tiny_tokenizer()
+    client = object.__new__(AsyncVoxCPM2Server)
+    client._tokenizer = Tokenizer.from_str(backend.to_str())
+    cmds = [_add_cmd("r0", "abc ab"), _add_cmd("r1", "h é", prompt="bc "), _add_cmd("r2", "ab 中文"),
+            {"id": "x", "type": "health", "args": (), "kwargs": {}}]
+    client._tokenize(cmds)
+    for c in cmds[:2]:
+        e = backend.encode(_request_text(c), add_special_tokens=False)
+        assert c["tok"] == (0, e.ids, e.offsets)  # (the tokenizer's version: init_ok's)
+    assert "tok" not in cmds[2] and "tok" not in cmds[3] and _request_text(cmds[3]) is None
+
+    batches = []
+    eng = object.__new__(VoxCPM2Engine)
+    eng.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(_tokenizer=SimpleNamespace(
+        encode_batch=lambda texts, add_special_tokens: batches.append(list(texts)) or backend.encode_batch(texts))))
+    texts = [_request_text(c) for c in cmds[:3]]
+    eng.pretokenize(texts, {_request_text(c): c["tok"][1:] for c in cmds[:2]})
+    assert batches == []  # the client's two; the CJK one is the per-text path's (not cached)
+    assert eng._text_ids("", "abc ab") == cmds[0]["tok"][1] and eng._text_ids("bc ", "h é") == cmds[1]["tok"][1]
+
+
+def test_the_client_follows_the_engines_tokenizer_when_it_changes():
+    """A tagged adapter registered after start replaces the engine's tokenizer (its dialect tags as single tokens):
+    the client gets the new one with a new version, and ids from the old one are not used (the engine tokenizes)."""
+    from tokenizers import AddedToken
+
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, _TokenizerSync
+
+    base, tagged = _tiny_tokenizer(), _tiny_tokenizer()
+    tagged.add_special_tokens([AddedToken("<eg>", normalized=False)])
+    llm = SimpleNamespace(pretokenize=None, tokenizer=SimpleNamespace(tokenizer=SimpleNamespace(_tokenizer=base)))
+    sync = _TokenizerSync(llm)
+    client = object.__new__(AsyncVoxCPM2Server)
+    client._init_fut = SimpleNamespace(done=lambda: True)
+    client._handle({"type": "init_ok", **sync.init_fields()})
+    old = [_add_cmd("r0", "<eg>abc")]
+    client._tokenize(old)
+    assert sync.changed() is None and sync.accept(old[0]["tok"]) == old[0]["tok"][1:]
+
+    llm.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(_tokenizer=tagged))  # register_lora's swap
+    msg = sync.changed()
+    assert msg["type"] == "tokenizer" and msg["version"] == 1 and sync.changed() is None
+    assert sync.accept(old[0]["tok"]) is None  # tokenized with the old one: not used
+    client._handle(msg)
+    new = [_add_cmd("r1", "<eg>abc")]
+    client._tokenize(new)
+    e = tagged.encode("<eg>abc", add_special_tokens=False)
+    assert new[0]["tok"] == (1, e.ids, e.offsets) and sync.accept(new[0]["tok"]) == (e.ids, e.offsets)
+    assert new[0]["tok"][1] != old[0]["tok"][1]  # the tag is one token now
+
+
+def test_the_models_tokenizer_round_trips_to_the_client():
+    """The engine's fast tokenizer (LlamaTokenizerFast's backend) and the client's copy of it (to_str / from_str)
+    give the same ids and offsets on the example texts (skipped without the model's files)."""
+    import glob
+
+    from tokenizers import Tokenizer
+
+    snaps = glob.glob(os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
+                                   "hub/models--VoxCPM-Kernel--VoxCPM2-Arabic-Dialects/snapshots/*/tokenizer.json"))
+    if not snaps:
+        pytest.skip("the model's tokenizer is not downloaded")
+    from transformers import LlamaTokenizerFast
+
+    backend = LlamaTokenizerFast.from_pretrained(os.path.dirname(snaps[0]))._tokenizer
+    client = Tokenizer.from_str(backend.to_str())
+    here = os.path.join(os.path.dirname(__file__), "..", "examples")
+    texts = [s.strip() for f in ("ar_dialects.txt", "hi_sentences.txt")
+             for s in open(os.path.join(here, f), encoding="utf-8") if s.strip()]
+    texts += ["<|im_start|>" + texts[0], texts[1] + "  ", " " + texts[2]]
+    a = backend.encode_batch(texts, add_special_tokens=False)
+    b = client.encode_batch(texts, add_special_tokens=False)
+    assert [(e.ids, e.offsets) for e in a] == [(e.ids, e.offsets) for e in b]
+
+
+def test_a_bursts_first_flush_is_small():
+    """NANOVLLM_SUBMIT_FLUSH_FIRST: a burst's commands reach the engine in batches of 16, then 48 (the engine starts
+    registering while the client builds the rest), the last one not marked "more", and the next burst starts with 16
+    again."""
+    import asyncio
+
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+
+    async def run():
+        sent = []
+        client = object.__new__(AsyncVoxCPM2Server)
+        client._engine_error, client._spin_task, client.op_table, client._pending_cmds = None, None, {}, []
+        client.queue_in = SimpleNamespace(put_nowait=lambda m: sent.append(
+            (len(m["cmds"]), bool(m.get("more"))) if "cmds" in m else (1, False)))
+        for burst in (70, 20, 64, 1):
+            tasks = [asyncio.ensure_future(client.submit("health")) for _ in range(burst)]
+            for _ in range(3):
+                await asyncio.sleep(0)
+            for t in tasks:
+                t.cancel()
+        return sent
+
+    # a turn whose commands all left in early flushes (64 = 16 + 48) still ends with an (empty) batch: the engine's
+    # admission window ends with the client's turn instead of waiting for more
+    assert asyncio.run(run()) == [(16, True), (48, True), (6, False), (16, True), (4, False),
+                                  (16, True), (48, True), (0, False), (1, False)]
+
+
+def test_a_prefill_steps_first_audio_reaches_the_client_as_its_chunks():
+    """NANOVLLM_EMIT_BLOCK: equal chunks travel through the ring as one block; the client hands each stream its own
+    chunk (the same bytes, in order); chunks that differ, or a single one, keep the per-chunk items."""
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, _AudioRing, _block_item
+
+    ring = _AudioRing(size=1 << 16)
+    try:
+        client = object.__new__(AsyncVoxCPM2Server)
+        client._ring = _AudioRing(name=ring.shm.name)
+        waves = [np.arange(k, k + 6, dtype=np.int16) for k in range(0, 30, 10)]
+        item = _block_item(ring, ["a", "b", "c"], waves)
+        assert item["type"] == "stream_block"
+        res = client._convert({"type": "batch", "items": [{"type": "response", "id": "x", "data": None}, item]})
+        assert [i["id"] for i in res["items"]] == ["x", "a", "b", "c"]
+        for i, w in zip(res["items"][1:], waves):
+            assert i["type"] == "stream" and i["data"].dtype == np.int16 and np.array_equal(i["data"], w)
+        assert _block_item(ring, ["a", "b"], [waves[0], waves[1][:5]]) is None
+        assert _block_item(ring, ["a"], waves[:1]) is None and _block_item(None, ["a", "b"], waves[:2]) is None
+        del client._ring.total, client._ring.data
+        client._ring.shm.close()
+    finally:
+        ring.close()
 
 
 # --- 6. the server's admission window ------------------------------------------------------------------------------

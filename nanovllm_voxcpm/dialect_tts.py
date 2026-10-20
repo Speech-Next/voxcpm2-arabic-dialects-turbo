@@ -56,21 +56,32 @@ def resolve(spec: str) -> str:
 def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | None = None, w8a8: bool = True) -> dict:
     """The measured low-latency configuration: distilled 2-step LocDiT (``dit``), int8 layers, head start of
     ``head_tokens`` tokens (0 = off), int16 audio chunks, a stream's leading silence capped at 2 patches (320 ms),
-    no new request admitted while a playing stream has less than 150 ms of audio queued at its player, and for
-    requests that start together (#28): heads of up to 5 patches, enough audio for their continuations' prefill,
-    prefill steps of at most 160 ms while streams play, the continuations' steps decoding the streams short of audio,
-    and new heads held while even 5 patches would not last (no dropouts; first audio waits instead in large bursts).
+    no new request admitted while a playing stream has less than 100 ms of audio queued at its player, and for
+    requests that start together (#28): heads of up to 7 patches, enough audio for their continuations' prefill,
+    prefill steps of at most 130 ms while streams play, every prefill step then also decoding the streams short of
+    audio (the continuations' and, #31, the heads' of a burst's late arrivals).
+    New heads are not held (#31: first audio stays at ~0.1 s at 200 at once): a head whose whole continuation would
+    come too late speaks the first 24, then 48 text tokens first (intermediate stages, each reusing the KV of the one
+    before; up to 16 patches each, up to 7 fewer by the stream's id: a burst's streams reach the seams apart). A front that sends the audio on in chunks passes their length (stream's
+    chunk_ms), so that the deadlines allow for what it holds back, and a paced front its pace (stream's pace, e.g.
+    0.9: one chunk per 0.9 x its audio at most), so that they follow its send clock.
+    With a distilled LocDiT, a prefill step of new streams solves their first patch in its grid's first step and one
+    jump to 0, t = [1.0, 0.7071, 0.0]: the 2-step student's grid (the 3-step one was trained from it and shares its
+    first step); 200 requests at once: TTFB -12 ms (#31).
     dit_cache: with the original LocDiT (``dit`` None), reuse its middle layers on some solver steps ("light",
     "medium" or a plan, see models/voxcpm2/dit_cache.py).
     w8a8=False: bf16 layers (quality measurements of a model whose SmoothQuant statistics were not calibrated)."""
     cfg = {"pcm16_output": True, "head_tokens": head_tokens, "head_patches": 3, "lead_silence_patches": 2,
-           "stream_guard_ms": 150, "head_patches_max": 5, "mix_decode": True, "step_cap_ms": 160, "head_hold": True}
+           "stream_guard_ms": 100, "head_patches_max": 7, "mix_decode": True, "mix_heads": True, "step_cap_ms": 130,
+           "head_hold": False,
+           "mid_tokens": [24, 48], "mid_patches_max": 16, "mid_stagger": 8, "stage_kv_reuse": True}
     if w8a8:
         cfg.update(w8a8=True, w8a8_targets=["base_lm", "residual_lm", "feat_encoder", "feat_decoder"])
     if dit and dit_cache:
         raise ValueError("dit_cache is for the original LocDiT (dit=None): the distilled one has no step to spare")
     if dit:
         cfg["dit_checkpoint"] = resolve(dit)
+        cfg["dit_first_t_span"] = [1.0, 0.7071, 0.0]
     if dit_cache:
         from nanovllm_voxcpm.models.voxcpm2.dit_cache import plan
 
@@ -282,11 +293,16 @@ class DialectTTS:
 
     async def stream(self, text: str, dialect: str | None = None, voice: str | None = None, *,
                      clone_mode: str | None = None, seed: int | None = None, cfg_value: float = 2.0,
-                     max_patches: int = 600, normalize: bool = True) -> AsyncIterator[np.ndarray]:
+                     max_patches: int = 600, normalize: bool = True,
+                     chunk_ms: float | None = None, pace: float | dict | None = None) -> AsyncIterator[np.ndarray]:
         """Audio chunks (float32 in [-1, 1], ``sample_rate``) of ``text`` in ``dialect`` (None: the base model),
         cloning ``voice`` (None: no cloning). max_patches: at most this many 160 ms patches. normalize: Arabic text
         read as the model was trained on it (read_as: digits, dates, times, amounts as words; formal when the dialect,
-        aliases resolved, is msa); hindi_english and text without Arabic script stay as they are."""
+        aliases resolved, is msa); hindi_english and text without Arabic script stay as they are. chunk_ms: the
+        caller sends the audio on in chunks of this many ms, holding the rest back until a chunk is full (e.g. 128 for
+        4096-byte chunks of 16 kHz PCM16): the engine's deadlines allow for it (None: TurboConfig.client_chunk_ms).
+        pace: the caller paces the chunks, one per pace x chunk_ms at most (a jitter buffer): the deadlines follow its
+        send clock (None: TurboConfig.client_pace)."""
         if dialect is not None and dialect not in self.dialects:
             raise ValueError(f"unknown dialect {dialect!r}; dialects: {', '.join(self.dialects)}")
         canonical = self.tags.canonical(dialect) if self.tags is not None and dialect is not None else dialect
@@ -310,6 +326,10 @@ class DialectTTS:
                                                              read_as(transcript, canonical) if norm else transcript)
                 else:
                     text = tag + text
+        if chunk_ms is not None:
+            kw["client_chunk_ms"] = chunk_ms
+        if pace is not None:
+            kw["client_pace"] = pace
         async for chunk in self.server.generate(target_text=text, lora_name=lora, seed=seed, cfg_value=cfg_value,
                                                 max_generate_length=max_patches, **kw):
             # one pass to float32 (a burst's 200 first chunks reach their streams one after another)

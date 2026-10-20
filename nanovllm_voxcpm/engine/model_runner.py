@@ -58,7 +58,7 @@ Concrete model families subclass :class:`BaseModelRunner` and implement:
 
 Concrete example: VoxCPM
 ------------------------
-``nanovllm_voxcpm/models/voxcpm/runner.py`` shows a typical implementation:
+``nanovllm_voxcpm/models/voxcpm2/runner.py`` shows a typical implementation:
 
 - Prefill: the engine slices away ``num_cached_tokens`` and sends the remaining
   prompt segment (text tokens + audio features + masks) to the runner.
@@ -161,10 +161,6 @@ class RunnerTask(Generic[PlayloadType]):
         return (self.seq_length + self.block_size - 1) // self.block_size
 
     @property
-    def num_cached_blocks(self):
-        return self.num_cached_tokens // self.block_size
-
-    @property
     def last_block_num_tokens(self):
         return self.seq_length - (self.num_blocks - 1) * self.block_size
 
@@ -211,6 +207,33 @@ _TORCH_DTYPES = {np.dtype(d): t for d, t in (
     (np.float16, torch.float16))}
 
 
+class PinnedStaging:
+    """One page-locked buffer that every prefill step's HostPack writes into (grown when a step needs more), in
+    place of a fresh page-locked allocation per step: the caching host allocator hands a block out again only once
+    nothing views it, and the streams' audio rows (views of their step's page-locked copies) keep blocks alive for
+    whole requests; a burst's head step's upload took 1.7 instead of 0.5 ms in some bursts at 200 at once. Before
+    the buffer is written again, the previous upload's copy out of it must be done (queued a step earlier: the wait
+    is a check)."""
+
+    def __init__(self) -> None:
+        self.buf: torch.Tensor | None = None
+        self.copied: torch.cuda.Event | None = None
+
+    def get(self, nbytes: int) -> torch.Tensor:
+        if self.copied is not None:
+            self.copied.synchronize()
+        if self.buf is None or self.buf.numel() < nbytes:
+            grow = 2 * self.buf.numel() if self.buf is not None else 0
+            self.buf = torch.empty(max(nbytes, grow), dtype=torch.uint8, device="cpu", pin_memory=True)
+        return self.buf[:nbytes]
+
+    def copied_out(self) -> None:
+        """The upload's copy is queued: the buffer is not written again before it is done."""
+        ev = torch.cuda.Event()
+        ev.record()
+        self.copied = ev
+
+
 class HostPack:
     """A step's host inputs staged in one page-locked buffer and copied to the GPU in one transfer. Every small H2D
     copy costs a pinned allocation, a device allocation and a cudaMemcpyAsync: a prefill step made ~17 of them
@@ -220,9 +243,10 @@ class HostPack:
 
     ALIGN = 256
 
-    def __init__(self, device="cuda"):
+    def __init__(self, device="cuda", staging: PinnedStaging | None = None):
         self.device = torch.device(device)
         self.parts: list[tuple[tuple, np.dtype, object]] = []  # (shape, dtype, array or arrays to concatenate)
+        self.staging = staging  # (a step's page-locked buffer: PinnedStaging, else a fresh allocation)
 
     def add(self, array) -> int:
         a = np.asarray(array)  # (np.ascontiguousarray would make a 0-d array 1-d)
@@ -243,7 +267,9 @@ class HostPack:
             total += -(-n * dtype.itemsize // self.ALIGN) * self.ALIGN
         total = max(total, self.ALIGN)
         on_gpu = self.device.type == "cuda"
-        host = torch.empty(total, dtype=torch.uint8, device="cpu", pin_memory=on_gpu)
+        staged = on_gpu and self.staging is not None and not torch.cuda.is_current_stream_capturing()
+        host = self.staging.get(total) if staged else torch.empty(total, dtype=torch.uint8, device="cpu",
+                                                                  pin_memory=on_gpu)
         buf = host.numpy()
         typed_host: dict = {}  # the buffer viewed once per dtype (offsets are multiples of every item size)
         for (shape, dtype, src), off, n in zip(self.parts, offsets, counts):
@@ -258,6 +284,8 @@ class HostPack:
             else:
                 dst[...] = src
         dev = host.to(self.device, non_blocking=True) if on_gpu else host
+        if staged:
+            self.staging.copied_out()
         typed: dict = {}
         out = []
         for (shape, dtype, _), off, n in zip(self.parts, offsets, counts):
@@ -382,7 +410,7 @@ class BaseModelRunner:
     ) -> torch.Tensor:
         raise NotImplementedError()
 
-    def run(self, seqs: list[RunnerTask], is_prefill: bool):
+    def run(self, seqs: list[RunnerTask], is_prefill: bool, first_patch: bool = True):
         raise NotImplementedError()
 
     def _dit_lora_sequence_length(self) -> int:
@@ -508,9 +536,6 @@ class BaseModelRunner:
 
     def lora_on_sequence_enqueued(self, adapter_id: int | None) -> None:
         self.lora_runtime.on_sequence_enqueued(adapter_id)
-
-    def lora_on_sequence_started(self, adapter_id: int | None) -> None:
-        self.lora_runtime.on_sequence_started(adapter_id)
 
     def lora_on_sequences_started(self, adapter_ids: list[int | None]) -> None:
         for adapter_id in adapter_ids:
@@ -1245,36 +1270,46 @@ class BaseModelRunner:
                 )
             },
         }
+        # graphs of the first patch's LocDiT solve ("base" / "lora"); when the first patch has settings of its own
+        # (dit_first_t_span, first_steps), also of the others' ("rest_base" / "rest_lora"), for prefill steps that
+        # resume streams or decode running ones (Context.first_patch False)
         self.prefill_diffusion_graphs: dict[str, dict[int, torch.cuda.CUDAGraph]] = {"base": {}, "lora": {}}
         capture_lora_graphs = bool(
             self._config.lora_config is not None
             and getattr(self._config.lora_config, "enable_dit", False)
             and is_lora_available()
         )
+        differs = getattr(self.model, "first_patch_differs", None)
+        firsts = [True, False] if callable(differs) and differs() else [True]
 
-        for bs in reversed(self.graph_bs):
-            dit_rows = dit_rows_per_sample * bs
-            base_context = build_lora_context_from_slot_list([-1] * dit_rows)
-            self._set_graph_lora_context(graph_vars, DIT_LORA_DOMAIN, base_context)
-            outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
-
-            base_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(base_graph, self.graph_pool):
-                outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
-            self.prefill_diffusion_graphs["base"][bs] = base_graph
-
-            if capture_lora_graphs:
-                lora_context = build_lora_context_from_slot_list([0] * dit_rows)
-                self._set_graph_lora_context(graph_vars, DIT_LORA_DOMAIN, lora_context)
+        for first in firsts:
+            prefix = "" if first else "rest_"
+            self.prefill_diffusion_graphs.setdefault(prefix + "base", {})
+            self.prefill_diffusion_graphs.setdefault(prefix + "lora", {})
+            self._set_first_patch(first)
+            for bs in reversed(self.graph_bs):
+                dit_rows = dit_rows_per_sample * bs
+                base_context = build_lora_context_from_slot_list([-1] * dit_rows)
+                self._set_graph_lora_context(graph_vars, DIT_LORA_DOMAIN, base_context)
                 outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
 
-                lora_graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(lora_graph, self.graph_pool):
+                base_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(base_graph, self.graph_pool):
                     outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
-                self.prefill_diffusion_graphs["lora"][bs] = lora_graph
+                self.prefill_diffusion_graphs[prefix + "base"][bs] = base_graph
 
-            torch.cuda.synchronize()
-            reset_all_contexts()
+                if capture_lora_graphs:
+                    lora_context = build_lora_context_from_slot_list([0] * dit_rows)
+                    self._set_graph_lora_context(graph_vars, DIT_LORA_DOMAIN, lora_context)
+                    outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
+
+                    lora_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(lora_graph, self.graph_pool):
+                        outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
+                    self.prefill_diffusion_graphs[prefix + "lora"][bs] = lora_graph
+
+                torch.cuda.synchronize()
+                reset_all_contexts()
 
         self.prefill_diffusion_graph_vars = graph_vars
         self._set_first_patch(False)
@@ -1434,6 +1469,7 @@ class BaseModelRunner:
         _profile.mark("backbone")
         batch_size = diffusion_inputs["mu"].size(0)
         dit_context = lora_contexts[DIT_LORA_DOMAIN]
+        first = get_context().first_patch  # (Context.first_patch: no resumed stream, no decode riding along)
 
         def run_diffusion_eager():
             eager_dit_context = materialize_lora_context(dit_context)
@@ -1455,7 +1491,7 @@ class BaseModelRunner:
                         build_lora_context_from_token_to_slot(token_to_slot),
                         domain=DIT_LORA_DOMAIN,
                     )
-            self._set_first_patch(True)
+            self._set_first_patch(first)
             try:
                 outputs["latents"] = self.model.forward_diffusion(**diffusion_inputs)
             finally:
@@ -1468,6 +1504,8 @@ class BaseModelRunner:
 
         has_active_dit_lora = not dit_context.no_lora_flag and dit_context.token_count > 0
         graph_kind = "lora" if has_active_dit_lora else "base"
+        if not first and "rest_" + graph_kind in self.prefill_diffusion_graphs:
+            graph_kind = "rest_" + graph_kind
         graphs = self.prefill_diffusion_graphs[graph_kind]
         if not graphs:
             return run_diffusion_eager()
