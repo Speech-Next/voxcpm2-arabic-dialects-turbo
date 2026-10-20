@@ -1072,6 +1072,37 @@ def test_leading_silence_without_head_start():
     assert _streamed(eng, "r") == [True, False, False, True, True, True]
 
 
+def test_muted_leading_silence_holds_back_no_new_request(monkeypatch):
+    """#47: a front without pacing (the HTTP server, the library) gets nothing while its stream's leading silence is
+    muted; stream_guard_ms took that for a player running dry and held every new request back until the sound
+    began (24 steps instead of 1 behind 30 silent patches)."""
+    from nanovllm_voxcpm.models.voxcpm2 import engine as em
+
+    clock = [1000.0]
+    monkeypatch.setattr(em, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
+    eng = _voxcpm2_engine(max_model_len=256)
+    eng.scheduler.stream_guard = 0.1  # turbo_config's 100 ms
+    eng.lead_silence_patches = 2
+    eng.model_runner.make_output = _silent_first(30)
+    a = eng.add_request("a", _words(3), max_generate_length=200, head_start=False)
+    for _ in range(8):  # a's first patches: 2 streamed, then muted (a decode step: 50 ms, a patch: 160 ms)
+        eng.step()
+        clock[0] += 0.05
+    assert a.custom_payload.muted and eng.stream_buffer(a) is None
+    eng.add_request("b", _words(2), max_generate_length=200, head_start=False)
+    assert [s.seq_id for s in eng.step()] == ["b"]  # b's prefill comes next
+
+
+def test_a_muted_stream_s_next_stage_still_goes_by_its_empty_player():
+    eng = _staged(0.032, mid_tokens=(16, 32))
+    seq = eng.add_request("r", _words(2), max_generate_length=4, head_start=False)
+    p = seq.custom_payload
+    p.muted, p.play_end = True, time.perf_counter() - 1.0  # its player ran out a second ago, in muted silence
+    assert eng.stream_buffer(seq) is None and not eng._in_time(seq, 10)  # the stage that sounds soonest
+    p.play_end = None  # nothing streamed yet
+    assert eng._in_time(seq, 10)
+
+
 def test_cancel_while_the_head_ends_also_cancels_its_continuation():
     eng = _voxcpm2_engine(max_model_len=128)
     eng.add_request("r1", _words(20), max_generate_length=20)
@@ -1370,3 +1401,37 @@ def test_text_ids_past_the_vocabulary_are_the_requests_fault():
     with pytest.raises(ValueError, match="cannot read: <t10>, <t12>"):
         eng.add_request("a", "text", head_start=False)
     eng._check_ids([0, 9])  # (in range)
+
+
+def test_layers_with_the_same_rope_settings_share_one_table():
+    # each of the 52 rotary layers built its own [32768, 128] fp32 cos and sin: 1.6 GiB of GPU memory, all equal
+    from nanovllm_voxcpm.models.voxcpm2.model import MiniCPMLongRoPE
+    from nanovllm_voxcpm.models.voxcpm2.model_utils import build_rope_cos_sin_cache
+
+    long = [1.0 + i / 8 for i in range(4)]
+    a, b = (MiniCPMLongRoPE(8, 8, 64, 10000.0, [1.0] * 4, long, 32) for _ in range(2))
+    other = MiniCPMLongRoPE(8, 8, 64, 10000.0, [1.0] * 4, [1.0] * 4, 32)
+    assert a.cos_cached is b.cos_cached and a.sin_cached is b.sin_cached
+    assert other.cos_cached is not a.cos_cached and not torch.equal(other.cos_cached, a.cos_cached)
+    cos, sin = build_rope_cos_sin_cache(64, a.inv_freq, a.scaling_factor, a.short_factor, long, 32)
+    assert torch.equal(a.cos_cached, cos) and torch.equal(a.sin_cached, sin)  # the table each layer built itself
+
+
+def test_a_text_without_head_start_is_capped_by_its_length():
+    # a text of 16 tokens or fewer (no head start) had only max_generate_length: 600 patches (96 s) of a runaway
+    # (silence, babble); now the continuations' cap, 1.5 patches a token and 20 to spare
+    eng = _voxcpm2_engine(max_model_len=1024)
+    eng._split_head = lambda *args, **kw: None  # (short enough to prefill whole)
+    count = {}
+
+    def make(t, is_prefill):  # "one" stops after 12 patches (a word and its pauses), "run" never
+        k = count[t.seq_id] = count.get(t.seq_id, 0) + 1
+        return {"latents": np.full((PATCH, FEAT), 0.5, np.float32), "stop_flag": int(t.seq_id == "one" and k == 12),
+                "waveforms": np.ones(8, np.float32), "patch_silent": False}
+
+    eng.model_runner.make_output = make
+    run = eng.add_request("run", _words(4), max_generate_length=600)
+    one = eng.add_request("one", _words(1), max_generate_length=600)
+    assert run.custom_payload.chain is None and run.custom_payload.max_generate_length == 4 * 3 // 2 + 20
+    _run(eng, 100)
+    assert len(run.custom_payload.generated_waveforms) == 26 and len(one.custom_payload.generated_waveforms) == 12

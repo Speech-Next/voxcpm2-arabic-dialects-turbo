@@ -719,6 +719,9 @@ class BaseModelRunner:
                     "'gpu_memory_utilization'. Advanced users may set "
                     f"{_NUM_KVCACHE_BLOCKS_ENV} to bypass automatic KV cache sizing."
                 )
+            print(f"[VoxCPM] KV cache: {self._config.num_kvcache_blocks} blocks "
+                  f"({self._config.num_kvcache_blocks * total_attention_block_size / 1024**2:.2f} MB, sized to the "
+                  f"free memory)", file=sys.stderr, flush=True)
 
         assert self._config.num_kvcache_blocks > 0
 

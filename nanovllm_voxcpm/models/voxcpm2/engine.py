@@ -36,6 +36,13 @@ _LEADING_TAG = re.compile(r"<reserved_\d+>")  # a tagged model's dialect tag in 
 _PATCHES_PER_TOKEN = 0.5
 
 
+def _speech_cap(n_ids: int) -> int:
+    """The most patches a text gets (``n_ids``: its ids, the prompt text's too): 1.5 a token (never slower than ~4
+    tokens, characters, a second; over twice #28's speaking rate) and 20 to spare (3.2 s: leading silence, a one-word
+    text's pauses). A model that keeps generating past it (silence, babble) is cut off."""
+    return int(1.5 * n_ids) + 20
+
+
 class _ByteCount:
     """A ChunkPacer's buffer that only counts its bytes (the engine's pacer needs its times, not the audio): the
     same len, +=, slicing and deletion, without copying 5 KB in and 4 KB out per stream and patch (#31)."""
@@ -226,13 +233,15 @@ class VoxCPM2Engine(LLMEngineBase):
 
     def stream_buffer(self, seq: Sequence[VoxCPM2SeqPayload]) -> float | None:
         """Seconds of audio still queued at the stream's player (started at its first patch, waiting when empty);
-        negative: the player has been waiting that long. None: nothing streamed yet. A client that gets the audio in
-        chunks (add_request's client_chunk_ms): less what the front holds back
-        (what it has streamed beyond its last whole chunk)."""
+        negative: the player has been waiting that long. None: nothing streamed yet, or a front without pacing in
+        muted leading silence (lead_silence_patches): its player waits in silence until the sound begins, a wait no
+        one hears, so the stream holds back no new request (stream_guard_ms; it held one back 24 steps instead of 1
+        behind 30 silent patches). A client that gets the audio in chunks (add_request's client_chunk_ms): less what
+        the front holds back (what it has streamed beyond its last whole chunk)."""
         p = seq.custom_payload
         if p.pacer is not None:  # a paced front: until it needs a chunk not produced yet (pace_sync keeps it)
             return None if p.pace_dry is None else p.pace_dry - time.perf_counter()
-        if p.play_end is None:
+        if p.play_end is None or p.muted:
             return None
         held = math.fmod(p.streamed + 1e-9, p.client_chunk) - 1e-9 if p.client_chunk > 0 else 0.0
         return p.play_end - max(held, 0.0) - time.perf_counter()
@@ -683,6 +692,8 @@ class VoxCPM2Engine(LLMEngineBase):
         if text_tokens is None:
             text_tokens = self._text_ids(prompt_text, target_text)
         self._check_ids(text_tokens)
+        # a text without head start (16 tokens or fewer) had only max_generate_length (servers: 600 patches, 96 s)
+        max_generate_length = min(max_generate_length, _speech_cap(len(text_tokens)))
         remap = self._tag_remap.get(lora_name) if lora_name is not None and self._tag_remap else None
         if remap:  # a tagged adapter's request: its tags read their trained rows
             text_tokens = [remap.get(t, t) for t in text_tokens]
@@ -1042,6 +1053,9 @@ class VoxCPM2Engine(LLMEngineBase):
         of every other stream in its head phase (in a burst they all come due about when this one does, as in
         _plan_head)? The continuations' steps also carry every other stream (mix_decode), as _head_plan."""
         buf = self.stream_buffer(seq)
+        p = seq.custom_payload
+        if buf is None and p.muted and p.play_end is not None:  # its player ran out (muted leading silence)
+            buf = 0.0
         if buf is None or self.step_cost is None:
             return True
         a, b, c = self.step_cost.prefill.coef
@@ -1072,9 +1086,7 @@ class VoxCPM2Engine(LLMEngineBase):
         chain, payload = seq.custom_payload.chain, seq.custom_payload
         n = len(payload.generated_waveforms)
         done = chain.get("done", 0) + n  # the stream's patches so far (an intermediate stage: the head's too)
-        # cap: a continuation never speaks slower than ~4 tokens (characters) a second; a model that keeps
-        # generating past that (silence, babble) is cut off
-        rest = min(chain["max_generate_length"] - done, int(1.5 * len(chain["text_ids"])) + 20)
+        rest = min(chain["max_generate_length"] - done, _speech_cap(len(chain["text_ids"])))
         if rest < 1:
             return False
         # Leading silent patches (a sentence often starts with a short pause) are not given as prompt audio: a
