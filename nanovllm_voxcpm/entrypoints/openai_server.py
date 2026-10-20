@@ -279,18 +279,9 @@ def build_app(args: argparse.Namespace):
 
         gc.collect()  # startup objects frozen: no full collection over them while requests stream
         gc.freeze()
-        prof = None
-        if os.environ.get("NANOVLLM_HTTP_PROFILE"):  # cProfile of the event-loop thread, written at shutdown
-            import cProfile
-
-            prof = cProfile.Profile()
-            prof.enable()
         try:
             yield
         finally:
-            if prof is not None:
-                prof.disable()
-                prof.dump_stats(os.environ["NANOVLLM_HTTP_PROFILE"])
             await pool.stop()
 
     app = FastAPI(title="VoxCPM2 (nanovllm-voxcpm-turbo)", lifespan=lifespan)
@@ -393,8 +384,6 @@ def build_app(args: argparse.Namespace):
             raise HTTPException(404, f"LoRA adapter '{name}' not found; registered: {state['adapters']}")
         return {"lora_name": name}
 
-    trace = open(os.environ["NANOVLLM_HTTP_TRACE"], "a") if os.environ.get("NANOVLLM_HTTP_TRACE") else None
-
     async def send_json(send, status: int, obj: dict):
         body = json.dumps(obj).encode()
         await send({"type": "http.response.start", "status": status,
@@ -441,7 +430,6 @@ def build_app(args: argparse.Namespace):
         per-request work (dependency resolution, body handling) on the event loop that also drives the engine
         delays when later requests reach the engine; this path reads the body, validates it with pydantic's
         JSON parser and streams the PCM chunks itself. A failed send (client gone) cancels the request."""
-        t_arrive = time.perf_counter()
         body = b""
         while True:
             msg = await receive()
@@ -472,9 +460,6 @@ def build_app(args: argparse.Namespace):
             return await send_json(send, 422, {"detail": e.errors(include_url=False)})
         except HTTPException as e:
             return await send_json(send, e.status_code, {"detail": e.detail})
-        if trace is not None:  # NANOVLLM_HTTP_TRACE=<file>: perf_counter (CLOCK_MONOTONIC) per request
-            trace.write(json.dumps({"arrive": t_arrive, "first": time.perf_counter()}) + "\n")
-            trace.flush()
         sr = str(state["sample_rate"]).encode()
         if req.stream and req.response_format == "pcm":
             await send({"type": "http.response.start", "status": 200,
