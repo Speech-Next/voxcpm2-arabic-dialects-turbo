@@ -10,8 +10,6 @@ Tile sizes are picked by a fixed heuristic (no autotuning), so the kernels can
 be captured in CUDA graphs right after one warm-up call.
 """
 
-import os
-
 import torch
 import triton
 import triton.language as tl
@@ -82,9 +80,6 @@ def _w8a8_gemm(
     tl.store(c_ptr + rm.to(tl.int64)[:, None] * N + rn[None, :], out.to(c_ptr.dtype.element_ty), mask=cm)
 
 
-# VOXCPM_KERNELS_LARGE_TILES=0: 128x128x64 tiles for every kernel above 256 rows (A/B, debugging)
-_LARGE_TILES = os.environ.get("VOXCPM_KERNELS_LARGE_TILES", "1") != "0"
-
 # Above 256 rows, per kernel, measured at the A10's 150 W power cap (each GEMM in a CUDA graph). Under the
 # cap the clock follows energy per op, and bigger tiles move less data through shared memory / L2 per MAC: at
 # 1 CTA/SM they run at a higher clock than 128x128x64 tiles at 2 CTAs/SM. M=2030 (LM prefill): o / down 178 / 538 ->
@@ -114,10 +109,10 @@ def _tiles(M: int, N: int, kind: str = "plain"):
         # measured at the 150 W cap: 64x128x128 with 3 stages fits 2 CTAs/SM (48 KB smem;
         # 4 stages need 72 KB -> 1 CTA/SM); the wide gate_up (N >= 8192) has enough tiles for 128x128x64. LM decode
         # gate_up with the SwiGLU epilogue: M=128 / 192 / 256 90 / 141 / 153 -> 83 / 116 / 131 us
-        if _LARGE_TILES and kind == "swiglu" and N >= 8192:
+        if kind == "swiglu" and N >= 8192:
             return (128, 128, 128, 8, 3) if M > 192 else (64, 128, 128, 4, 3)
         return (128, 128, 64, 8, 4) if N >= 8192 else (64, 128, 128, 4, 3)
-    if _LARGE_TILES and kind in _LARGE:
+    if kind in _LARGE:
         cands = [c for c in _LARGE[kind] if N % c[1] == 0]
         if cands:
             return max(cands, key=lambda c: _wave_fill(M, N, c[0], c[1]))  # first one on ties

@@ -5,8 +5,9 @@ Reference layer (per call ~20 kernels; RoPE alone is ~6 elementwise passes):
     x2 = x + o_proj(attn(q, k, v)); out = x2 + down(silu(gate) * up)  with gate|up = gate_up(rmsnorm(x2))
 
 Here, for W8A8 calls (rows >= min_rows):
-    rmsnorm+quant -> int8 qkv GEMM -> in-place RoPE on q|k -> attention -> quant -> int8 o GEMM (+x in the
-    epilogue) -> rmsnorm+quant -> int8 gate_up GEMM -> silu*mul+quant -> int8 down GEMM (+x2 in the epilogue)
+    rmsnorm+quant -> int8 qkv GEMM (RoPE on q|k in the epilogue) -> attention -> quant -> int8 o GEMM (+x in the
+    epilogue) -> rmsnorm+quant -> int8 gate_up GEMM (silu*mul in the epilogue) -> quant -> int8 down GEMM (+x2 in
+    the epilogue)
 and for bf16 calls the same graph with cuBLAS GEMMs (RoPE stays fused).
 """
 
@@ -73,35 +74,6 @@ def rmsnorm_quant(x: torch.Tensor, weight: torch.Tensor, eps: float):
     return q, scale
 
 
-@triton.jit
-def _silu_mul_quant(x_ptr, inv_smooth_ptr, q_ptr, scale_ptr, I, stride_x, HAS_SMOOTH: tl.constexpr, BLOCK: tl.constexpr):
-    row = tl.program_id(0).to(tl.int64)
-    k = tl.arange(0, BLOCK)
-    km = k < I
-    g = tl.load(x_ptr + row * stride_x + k, mask=km, other=0.0).to(tl.float32)
-    u = tl.load(x_ptr + row * stride_x + I + k, mask=km, other=0.0).to(tl.float32)
-    a = g / (1.0 + tl.exp(-g)) * u
-    if HAS_SMOOTH:
-        a = a * tl.load(inv_smooth_ptr + k, mask=km, other=1.0)
-    scale = tl.maximum(tl.max(tl.abs(a), axis=0), 1e-6) / 127.0
-    tl.store(q_ptr + row * I + k, tl.extra.cuda.libdevice.rint(a / scale).to(tl.int8), mask=km)
-    tl.store(scale_ptr + row, scale)
-
-
-def silu_mul_quant(x: torch.Tensor, inv_smooth: torch.Tensor | None = None):
-    """x [M, 2I] = gate | up -> int8 silu(gate) * up / smooth [M, I] + per-row scale."""
-    M, two_i = x.shape
-    i = two_i // 2
-    q = torch.empty(M, i, device=x.device, dtype=torch.int8)
-    scale = torch.empty(M, device=x.device, dtype=torch.float32)
-    block = triton.next_power_of_2(i)
-    _silu_mul_quant[(M,)](
-        x, inv_smooth if inv_smooth is not None else scale, q, scale, i, x.stride(0),
-        HAS_SMOOTH=inv_smooth is not None, BLOCK=block, num_warps=8 if block >= 4096 else 4,
-    )
-    return q, scale
-
-
 # ---------------------------------------------------------------------------------------------------------------
 @triton.jit
 def _res_epilogue(acc, rm, rn, a_scale, b_scale_ptr, res_ptr, c_ptr, M, N):
@@ -155,10 +127,6 @@ def _w8a8_gemm_res(
         _res_epilogue(acc, rm, rn, a_scale, b_scale_ptr, res_ptr, c_ptr, M, N)
 
 
-# VOXCPM_KERNELS_RES_SPLIT=0: single-pass epilogue in the residual GEMMs (A/B, debugging)
-_RES_SPLIT = os.environ.get("VOXCPM_KERNELS_RES_SPLIT", "1") != "0"
-
-
 def _gemm(q, s, lin: W8A8Linear, out_dtype, residual=None):
     from .int8_linear import _tiles, w8a8_gemm
 
@@ -171,7 +139,7 @@ def _gemm(q, s, lin: W8A8Linear, out_dtype, residual=None):
     bm, bn, bk, warps, stages = _tiles(M, N, "res")
     _w8a8_gemm_res[(triton.cdiv(M, bm) * triton.cdiv(N, bn),)](
         q, lin.w_q, c, s, lin.w_scale, residual.contiguous(), M, N, K,
-        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=8, SPLIT_EPILOGUE=_RES_SPLIT and bm * bn >= 128 * 128,
+        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=8, SPLIT_EPILOGUE=bm * bn >= 128 * 128,
         num_warps=warps, num_stages=stages,
     )
     return c
@@ -182,7 +150,8 @@ def _gemm(q, s, lin: W8A8Linear, out_dtype, residual=None):
 # gate_j, row 2j+1 = up_j), so each N tile holds matching gate/up columns and the epilogue writes
 # h = silu(g) * u [M, I] directly (fp32 math, one bf16 rounding), plus the per-(row, tile) max |h|. A second, 2-D
 # tiled pass reduces those partials to the per-row scale and quantizes h for the down GEMM. Versus gate_up ->
-# bf16 [M, 2I] -> silu_mul_quant, the [M, 2I] round trip becomes [M, I], and the quant pass needs no row reduction.
+# bf16 [M, 2I] -> a silu*mul+quant pass, the [M, 2I] round trip becomes [M, I], and the quant pass needs no row
+# reduction.
 @triton.jit
 def _w8a8_gemm_swiglu(
     a_ptr, b_ptr, h_ptr, amax_ptr, a_scale_ptr, b_scale_ptr,
@@ -319,18 +288,6 @@ def _w8a8_gemm_qkv_rope(
     tl.store(c_ptr + offs + HALF, x2.to(c_ptr.dtype.element_ty), mask=rmask[:, None])
 
 
-# VOXCPM_KERNELS_SHORT_ATTN=0: FA2 + a separate quantize pass for LocDiT / LocEnc attention and short causal prefill
-# sequences (A/B, debugging)
-_SHORT_ATTN = os.environ.get("VOXCPM_KERNELS_SHORT_ATTN", "1") != "0"
-# VOXCPM_KERNELS_PREFILL_ATTN=0: FA2 + a separate quantize pass for paged prefill attention (A/B, debugging)
-_PREFILL_ATTN = os.environ.get("VOXCPM_KERNELS_PREFILL_ATTN", "1") != "0"
-# VOXCPM_KERNELS_LORA_MERGE=0: LoRA terms through the LoRA kernels (lora_delta_) instead of per-adapter merged int8
-# weights run by the segmented GEMMs (seg_gemm.py)
-_LORA_MERGE = os.environ.get("VOXCPM_KERNELS_LORA_MERGE", "1") != "0"
-# VOXCPM_KERNELS_ROPE_EPILOGUE=0: qkv GEMM, then the separate in-place RoPE pass (A/B, debugging)
-_ROPE_EPILOGUE = os.environ.get("VOXCPM_KERNELS_ROPE_EPILOGUE", "1") != "0"
-
-
 def rope_weights(qkv: W8A8Linear, head_dim: int) -> W8A8Linear:
     """A qkv W8A8Linear for ``qkv_rope_gemm``: within every head, rows (j, j + head_dim/2) become adjacent."""
     half = head_dim // 2
@@ -386,18 +343,16 @@ def swiglu_weights(gate_up: W8A8Linear, down: W8A8Linear) -> W8A8Linear:
 # --- SmoothQuant -------------------------------------------------------------------------------------------------
 # VOXCPM_KERNELS_CALIBRATE=<file>: bf16 everywhere, record per-channel |activation| maxima of the four linear inputs
 #   of every fused layer (inside CUDA graphs too) and save them at process exit.
-# VOXCPM_KERNELS_SMOOTH=<file> (+ VOXCPM_KERNELS_SMOOTH_ALPHA, default 0.7): per-input-channel factors
-#   s = max|X|^a / max|W|^(1-a); 1/s is folded into the RMSNorm weight (qkv, gate_up) or applied by the
+# VOXCPM_KERNELS_SMOOTH=<file>: per-input-channel factors
+#   s = max|X|^a / max|W|^(1-a), a = 0.7; 1/s is folded into the RMSNorm weight (qkv, gate_up) or applied by the
 #   quantizer (o, down), and s into the int8 weights. Default: smooth_stats.pt next to this file (VoxCPM2's
 #   calibration; layers without stats in it are not smoothed); "0" = no smoothing.
 _CALIBRATE = os.environ.get("VOXCPM_KERNELS_CALIBRATE")
 _SMOOTH = os.environ.get("VOXCPM_KERNELS_SMOOTH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "smooth_stats.pt"))
 if _SMOOTH in ("", "0") or not os.path.exists(_SMOOTH):
     _SMOOTH = None
-_SMOOTH_ALPHA = float(os.environ.get("VOXCPM_KERNELS_SMOOTH_ALPHA", "0.7"))
+_SMOOTH_ALPHA = 0.7
 _CALIB_STATS: dict[str, torch.Tensor] = {}
-# VOXCPM_KERNELS_SWIGLU=0: gate_up -> bf16 -> silu_mul_quant instead of the SwiGLU epilogue (A/B, debugging)
-_SWIGLU = os.environ.get("VOXCPM_KERNELS_SWIGLU", "1") != "0"
 _SMOOTH_STATS: dict | None = None
 
 
@@ -473,17 +428,15 @@ class FusedCpm4Layer:
                 if lin.inv_smooth is not None:
                     setattr(self, ln_attr, (getattr(self, ln_attr).float() * lin.inv_smooth).contiguous())
                     lin.inv_smooth = None
-            if _SWIGLU:
-                self.q8["gate_up"] = swiglu_weights(self.q8["gate_up"], self.q8["down"])
-            if _ROPE_EPILOGUE and self.rope is not None and attn.head_dim == 128:
+            self.q8["gate_up"] = swiglu_weights(self.q8["gate_up"], self.q8["down"])
+            if self.rope is not None and attn.head_dim == 128:
                 self.q8["qkv"] = rope_weights(self.q8["qkv"], attn.head_dim)
-        self.swiglu = self.q8 is not None and _SWIGLU
-        self.qkv_rope = self.q8 is not None and _ROPE_EPILOGUE and self.rope is not None and attn.head_dim == 128
+        self.qkv_rope = self.q8 is not None and self.rope is not None and attn.head_dim == 128
         # LoRA adapters merged into int8 q/k/v/o weights, one per slot ([0] = the base model): a batch mixing
         # adapters runs segmented GEMMs (rows grouped by adapter) and no LoRA kernels. refresh_lora(slot) rebuilds a
         # slot when the runner loads an adapter into it.
         self.stacks = None
-        if self.q8 is not None and _LORA_MERGE and getattr(attn.qkv_proj, "supports_lora", False) \
+        if self.q8 is not None and getattr(attn.qkv_proj, "supports_lora", False) \
                 and getattr(attn.o_proj, "supports_lora", False):
             n = attn.qkv_proj.max_loras + 1
             self.stacks = {}
@@ -503,7 +456,7 @@ class FusedCpm4Layer:
         if self.q8 is not None and mlp_lora:
             if self.stacks is None:
                 raise NotImplementedError("LoRA on the MLP projections in int8 layers needs the merged q/k/v/o "
-                                          "weights too (attention LoRA, VOXCPM_KERNELS_LORA_MERGE=1)")
+                                          "weights too (attention LoRA)")
             n_mlp = 1 + max(0, int(getattr(mlp, "max_mlp_loras", attn.qkv_proj.max_loras)))
             self.mlp_stacks = {}
             for key in ("gate_up", "down"):
@@ -611,8 +564,7 @@ class FusedCpm4Layer:
                 w_dn = w_dn + dn.lora_B[slot].float() @ dn.lora_A[slot].float()
         lin_gu = W8A8Linear(w_gu, None, self._smooth.get("gate_up"))
         lin_dn = W8A8Linear(w_dn, None, self._smooth.get("down"))
-        if self.swiglu:
-            lin_gu = swiglu_weights(lin_gu, lin_dn)
+        lin_gu = swiglu_weights(lin_gu, lin_dn)
         for key, lin in (("gate_up", lin_gu), ("down", lin_dn)):
             w, sc = self.mlp_stacks[key]
             w[entry].copy_(lin.w_q)
@@ -709,7 +661,7 @@ class FusedCpm4Layer:
         paged attention writes o already quantized for o_proj (int8 + per-token scale), or bf16 o without ``quant``
         (an adapter needs o_proj's input). None = not applicable."""
         attn = self.attn
-        if not _PREFILL_ATTN or not attn.is_causal or torch.cuda.is_current_stream_capturing():
+        if not attn.is_causal or torch.cuda.is_current_stream_capturing():
             return None
         from nanovllm_voxcpm.utils.context import get_context
 
@@ -734,7 +686,7 @@ class FusedCpm4Layer:
         FA2 gives each a 128-row query tile) with o already quantized for o_proj, or bf16 o without ``quant``.
         None = not applicable."""
         attn = self.attn
-        if not _SHORT_ATTN or not attn.is_causal or attn.num_kv_heads != 2 or attn.head_dim != 128:
+        if not attn.is_causal or attn.num_kv_heads != 2 or attn.head_dim != 128:
             return None
         from nanovllm_voxcpm.utils.context import get_context
 
@@ -762,16 +714,9 @@ class FusedCpm4Layer:
             from .seg_gemm import seg_gemm, seg_swiglu_gemm_quant
 
             (w_gu, sc_gu), (w_dn, sc_dn) = self.mlp_stacks["gate_up"], self.mlp_stacks["down"]
-            if self.swiglu:
-                hq = seg_swiglu_gemm_quant(*xq, w_gu, sc_gu, dtype, *seg, remap=self.mlp_index)
-            else:
-                hq = silu_mul_quant(seg_gemm(*xq, w_gu, sc_gu, None, dtype, *seg, remap=self.mlp_index),
-                                    self.q8["down"].inv_smooth)
+            hq = seg_swiglu_gemm_quant(*xq, w_gu, sc_gu, dtype, *seg, remap=self.mlp_index)
             return seg_gemm(*hq, w_dn, sc_dn, None, dtype, *seg, residual=x2, remap=self.mlp_index)
-        if self.swiglu:
-            hq = swiglu_gemm_quant(*xq, self.q8["gate_up"], dtype)
-        else:
-            hq = silu_mul_quant(_gemm(*xq, self.q8["gate_up"], dtype), self.q8["down"].inv_smooth)
+        hq = swiglu_gemm_quant(*xq, self.q8["gate_up"], dtype)
         return _gemm(*hq, self.q8["down"], dtype, residual=x2)
 
     def __call__(self, positions: torch.Tensor, hidden: torch.Tensor, residual=None):
@@ -793,7 +738,7 @@ class FusedCpm4Layer:
         oq = self._paged_prefill_q(q, k, v, quant=not lora_o) if use_q else None
         if oq is None and use_q:
             oq = self._short_prefill_q(q, k, v, quant=not lora_o)
-        if oq is None and use_q and not attn.is_causal and _SHORT_ATTN and shape[1] <= 16 and attn.num_kv_heads == 2:
+        if oq is None and use_q and not attn.is_causal and shape[1] <= 16 and attn.num_kv_heads == 2:
             from .short_attn import short_attention
 
             b = shape[0]
