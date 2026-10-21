@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from nanovllm_voxcpm.dialect_routing import RoutedDialectTTS
     from nanovllm_voxcpm.dialect_tts import DialectTTS
-    from nanovllm_voxcpm.llm import VoxCPM
+    from nanovllm_voxcpm.model.llm import VoxCPM
 
 try:
     from nanovllm_voxcpm._version import version as __version__
@@ -22,7 +22,7 @@ except Exception:
         __version__ = "0.0.0"
 
 _LAZY = {"DialectTTS": "nanovllm_voxcpm.dialect_tts", "RoutedDialectTTS": "nanovllm_voxcpm.dialect_routing",
-         "VoxCPM": "nanovllm_voxcpm.llm"}
+         "VoxCPM": "nanovllm_voxcpm.model.llm"}
 
 __all__ = [
     "DialectTTS",

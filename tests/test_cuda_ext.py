@@ -5,7 +5,7 @@ import re
 import pytest
 import torch
 
-from voxcpm_kernels import cuda_ext
+from nanovllm_voxcpm.kernels import cuda_ext
 
 
 def test_the_gpu_decides_and_without_one_voxcpm_cuda_arch(monkeypatch):

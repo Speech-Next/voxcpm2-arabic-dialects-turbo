@@ -1,7 +1,7 @@
 #!/bin/bash
 # The image's command: `http` (the OpenAI-compatible server, the default) or `ws` (the WebSocket server), then that
 # server's options; it listens on 0.0.0.0:$PORT unless --host / --port are given. Anything else runs as given
-# (bash, python -m voxcpm_kernels.cuda_ext, ...).
+# (bash, python -m nanovllm_voxcpm.kernels.cuda_ext, ...).
 set -euo pipefail
 case "${1:-http}" in
   http) module=nanovllm_voxcpm.entrypoints.openai_server ;;

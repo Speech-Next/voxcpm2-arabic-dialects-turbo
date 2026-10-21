@@ -7,7 +7,7 @@ capturing its CUDA graphs. Skipped without CUDA.
 import pytest
 import torch
 
-from nanovllm_voxcpm.lora_ops.triton_ops.lora_shrink_op import _use_small_m_shrink_path, lora_shrink
+from nanovllm_voxcpm.lora.triton import _use_small_m_shrink_path, lora_shrink
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 

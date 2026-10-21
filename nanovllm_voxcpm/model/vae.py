@@ -1,0 +1,670 @@
+"""VoxCPM2's AudioVAE V2 and its streaming decoder."""
+
+import math
+from collections.abc import Hashable, Sequence
+from typing import List, Optional
+
+import torch
+import torch.nn.functional as F
+from pydantic import BaseModel
+from torch import nn
+from torch.nn.utils import weight_norm
+
+__all__ = ['AudioVAEConfigV2', 'AudioVAEV2', 'BatchedStreamingVAEDecoder']
+
+
+# --- the streaming decoder
+
+class BatchedStreamingVAEDecoder:
+    """Stateful causal VAE decoder for dynamically batched request streams."""
+
+    def __init__(
+        self,
+        vae: nn.Module,
+        causal_conv_type: type[nn.Conv1d],
+        causal_transpose_conv_type: type[nn.ConvTranspose1d],
+        max_batch_size: int | None = None,
+    ):
+        if max_batch_size is not None and max_batch_size < 1:
+            raise ValueError("max_batch_size must be positive")
+        self._vae = vae
+        self._causal_conv_type = causal_conv_type
+        self._causal_transpose_conv_type = causal_transpose_conv_type
+        self._batch_size_buckets = self._make_batch_size_buckets(max_batch_size)
+        self._states: dict[int, dict[Hashable, torch.Tensor]] = {}
+        self._stream_ids: Sequence[Hashable] | None = None
+        self._initialized_streams: set[Hashable] = set()
+        self._install()
+
+    @staticmethod
+    def _make_batch_size_buckets(max_batch_size: int | None) -> tuple[int, ...]:
+        if max_batch_size is None:
+            return ()
+        buckets = []
+        batch_size = 1
+        while batch_size < max_batch_size:
+            buckets.append(batch_size)
+            batch_size *= 2
+        buckets.append(max_batch_size)
+        return tuple(buckets)
+
+    @torch.inference_mode()
+    def decode_chunks(
+        self,
+        z_chunks: torch.Tensor,
+        stream_ids: Sequence[Hashable],
+        initial_contexts: Sequence[torch.Tensor | None] | None = None,
+    ) -> torch.Tensor:
+        """Decode one new latent chunk for each stream in a dynamic batch."""
+        if z_chunks.ndim != 3:
+            raise ValueError(f"z_chunks must have shape [B, D, T], got {tuple(z_chunks.shape)}")
+        if len(stream_ids) != z_chunks.size(0):
+            raise ValueError("stream_ids length must match z_chunks batch size")
+        if len(set(stream_ids)) != len(stream_ids):
+            raise ValueError("stream_ids must be unique within a decode batch")
+        if initial_contexts is None:
+            initial_contexts = [None] * len(stream_ids)
+        if len(initial_contexts) != len(stream_ids):
+            raise ValueError("initial_contexts length must match stream_ids length")
+
+        missing = object()
+        state_snapshot = {
+            layer_id: {stream_id: layer_states.get(stream_id, missing) for stream_id in stream_ids}
+            for layer_id, layer_states in self._states.items()
+        }
+        initialized_snapshot = {stream_id for stream_id in stream_ids if stream_id in self._initialized_streams}
+        try:
+            for stream_id, context in zip(stream_ids, initial_contexts):
+                if stream_id in self._initialized_streams:
+                    continue
+                if context is not None and context.numel() > 0:
+                    if context.ndim != 3 or context.size(0) != 1:
+                        raise ValueError("each initial context must have shape [1, D, T]")
+                    self._decode(context, [stream_id])
+                self._initialized_streams.add(stream_id)
+
+            return self._decode_bucketed(z_chunks, stream_ids)
+        except Exception:
+            for layer_id, layer_states in self._states.items():
+                for stream_id, state in state_snapshot[layer_id].items():
+                    if state is missing:
+                        layer_states.pop(stream_id, None)
+                    else:
+                        layer_states[stream_id] = state
+            self._initialized_streams.difference_update(stream_ids)
+            self._initialized_streams.update(initialized_snapshot)
+            raise
+
+    @torch.inference_mode()
+    def warmup(self, latent_channels: int, chunk_size: int) -> None:
+        """Initialize decoder kernels for every configured batch-size bucket."""
+        if not self._batch_size_buckets:
+            return
+        if self._initialized_streams or any(self._states.values()):
+            raise RuntimeError("streaming VAE warmup requires empty stream state")
+
+        parameter = next(self._vae.decoder.parameters(), None)
+        if parameter is None:
+            raise RuntimeError("streaming VAE decoder has no parameters")
+        for batch_size in self._batch_size_buckets:
+            z_chunks = torch.zeros(
+                batch_size,
+                latent_channels,
+                chunk_size,
+                device=parameter.device,
+                dtype=parameter.dtype,
+            )
+            stream_ids = [object() for _ in range(batch_size)]
+            self.decode_chunks(z_chunks, stream_ids)
+            self.clear()
+        if parameter.device.type == "cuda":
+            torch.cuda.synchronize(parameter.device)
+
+    def release(self, stream_id: Hashable) -> None:
+        """Release all cached convolution state for a completed request."""
+        self._initialized_streams.discard(stream_id)
+        for layer_states in self._states.values():
+            layer_states.pop(stream_id, None)
+
+    def clear(self) -> None:
+        self._initialized_streams.clear()
+        for layer_states in self._states.values():
+            layer_states.clear()
+
+    def _decode(self, z_chunks: torch.Tensor, stream_ids: Sequence[Hashable]) -> torch.Tensor:
+        if self._stream_ids is not None:
+            raise RuntimeError("Streaming VAE decode is not reentrant")
+        self._stream_ids = stream_ids
+        try:
+            return self._vae.decode(z_chunks)
+        finally:
+            self._stream_ids = None
+
+    def _decode_bucketed(self, z_chunks: torch.Tensor, stream_ids: Sequence[Hashable]) -> torch.Tensor:
+        batch_size = z_chunks.size(0)
+        padded_batch_size = next(
+            (bucket for bucket in self._batch_size_buckets if bucket >= batch_size),
+            batch_size,
+        )
+        if padded_batch_size == batch_size:
+            return self._decode(z_chunks, stream_ids)
+
+        num_padding = padded_batch_size - batch_size
+        padding = z_chunks.new_zeros((num_padding, *z_chunks.shape[1:]))
+        dummy_stream_ids = [object() for _ in range(num_padding)]
+        try:
+            output = self._decode(
+                torch.cat([z_chunks, padding], dim=0),
+                [*stream_ids, *dummy_stream_ids],
+            )
+            return output[:batch_size]
+        finally:
+            for stream_id in dummy_stream_ids:
+                self.release(stream_id)
+
+    def _install(self) -> None:
+        for module in self._vae.decoder.modules():
+            if isinstance(module, self._causal_conv_type):
+                padding = module._CausalConv1d__padding * 2 - getattr(
+                    module,
+                    "_CausalConv1d__output_padding",
+                    0,
+                )
+                if padding > 0:
+                    self._patch_causal_conv(module, padding)
+            elif isinstance(module, self._causal_transpose_conv_type):
+                trim = module._CausalTransposeConv1d__padding * 2 - module._CausalTransposeConv1d__output_padding
+                context = module.kernel_size[0] // module.stride[0] - 1
+                if context > 0:
+                    self._patch_transpose_conv(module, context, trim)
+
+    def _current_stream_ids(self, batch_size: int) -> Sequence[Hashable]:
+        if self._stream_ids is None or len(self._stream_ids) != batch_size:
+            raise RuntimeError("Causal VAE layer executed outside decode_chunks")
+        return self._stream_ids
+
+    def _patch_causal_conv(self, module: nn.Conv1d, padding: int) -> None:
+        layer_states = self._states.setdefault(id(module), {})
+
+        def forward(x: torch.Tensor, *, _module=module, _padding=padding, _states=layer_states):
+            if self._stream_ids is None:
+                return type(_module).forward(_module, x)
+            stream_ids = self._current_stream_ids(x.size(0))
+            contexts = []
+            for index, stream_id in enumerate(stream_ids):
+                state = _states.get(stream_id)
+                if state is None:
+                    state = torch.zeros(
+                        x.size(1),
+                        _padding,
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+                contexts.append(state)
+                combined = torch.cat([state, x[index]], dim=-1)
+                _states[stream_id] = combined[:, -_padding:].detach()
+            padded = torch.cat([torch.stack(contexts, dim=0), x], dim=-1)
+            return nn.Conv1d.forward(_module, padded)
+
+        module.forward = forward
+
+    def _patch_transpose_conv(self, module: nn.ConvTranspose1d, context: int, trim: int) -> None:
+        layer_states = self._states.setdefault(id(module), {})
+
+        def forward(x: torch.Tensor, *, _module=module, _context=context, _trim=trim, _states=layer_states):
+            if self._stream_ids is None:
+                return type(_module).forward(_module, x)
+            stream_ids = self._current_stream_ids(x.size(0))
+            contexts = []
+            for index, stream_id in enumerate(stream_ids):
+                state = _states.get(stream_id)
+                if state is None:
+                    state = torch.zeros(
+                        x.size(1),
+                        _context,
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+                contexts.append(state)
+                combined = torch.cat([state, x[index]], dim=-1)
+                _states[stream_id] = combined[:, -_context:].detach()
+            full_input = torch.cat([torch.stack(contexts, dim=0), x], dim=-1)
+            output = nn.ConvTranspose1d.forward(_module, full_input)
+            left = _context * _module.stride[0]
+            return output[..., left:-_trim] if _trim > 0 else output[..., left:]
+
+        module.forward = forward
+
+
+# --- AudioVAE V2
+
+class CausalConv1d(nn.Conv1d):
+    def __init__(self, *args, padding: int = 0, output_padding: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.__padding = padding
+        self.__output_padding = output_padding
+
+    def forward(self, x):
+        x_pad = F.pad(x, (self.__padding * 2 - self.__output_padding, 0))
+        return super().forward(x_pad)
+
+
+class CausalTransposeConv1d(nn.ConvTranspose1d):
+    def __init__(self, *args, padding: int = 0, output_padding: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.__padding = padding
+        self.__output_padding = output_padding
+
+    def forward(self, x):
+        return super().forward(x)[..., : -(self.__padding * 2 - self.__output_padding)]
+
+
+def WNCausalConv1d(*args, **kwargs):
+    return weight_norm(CausalConv1d(*args, **kwargs))
+
+
+def WNCausalTransposeConv1d(*args, **kwargs):
+    return weight_norm(CausalTransposeConv1d(*args, **kwargs))
+
+
+@torch.compile
+def snake(x, alpha):
+    shape = x.shape
+    x = x.reshape(shape[0], shape[1], -1)
+    x = x + (alpha + 1e-9).reciprocal() * torch.sin(alpha * x).pow(2)
+    x = x.reshape(shape)
+    return x
+
+
+class Snake1d(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.ones(1, channels, 1))
+
+    def forward(self, x):
+        return snake(x, self.alpha)
+
+
+class CausalResidualUnit(nn.Module):
+    def __init__(self, dim: int = 16, dilation: int = 1, kernel: int = 7, groups: int = 1):
+        super().__init__()
+        pad = ((7 - 1) * dilation) // 2
+        self.block = nn.Sequential(
+            Snake1d(dim),
+            WNCausalConv1d(
+                dim,
+                dim,
+                kernel_size=kernel,
+                dilation=dilation,
+                padding=pad,
+                groups=groups,
+            ),
+            Snake1d(dim),
+            WNCausalConv1d(dim, dim, kernel_size=1),
+        )
+
+    def forward(self, x):
+        y = self.block(x)
+        pad = (x.shape[-1] - y.shape[-1]) // 2
+        assert pad == 0
+        if pad > 0:
+            x = x[..., pad:-pad]
+        return x + y
+
+
+class CausalEncoderBlock(nn.Module):
+    def __init__(self, output_dim: int = 16, input_dim=None, stride: int = 1, groups=1):
+        super().__init__()
+        input_dim = input_dim or output_dim // 2
+        self.block = nn.Sequential(
+            CausalResidualUnit(input_dim, dilation=1, groups=groups),
+            CausalResidualUnit(input_dim, dilation=3, groups=groups),
+            CausalResidualUnit(input_dim, dilation=9, groups=groups),
+            Snake1d(input_dim),
+            WNCausalConv1d(
+                input_dim,
+                output_dim,
+                kernel_size=2 * stride,
+                stride=stride,
+                padding=math.ceil(stride / 2),
+                output_padding=stride % 2,
+            ),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class CausalEncoder(nn.Module):
+    def __init__(
+        self,
+        d_model: int = 64,
+        latent_dim: int = 32,
+        strides: list[int] = [2, 4, 8, 8],
+        depthwise: bool = False,
+    ):
+        super().__init__()
+        self.block = [WNCausalConv1d(1, d_model, kernel_size=7, padding=3)]
+        for stride in strides:
+            d_model *= 2
+            groups = d_model // 2 if depthwise else 1
+            self.block += [CausalEncoderBlock(output_dim=d_model, stride=stride, groups=groups)]
+
+        self.fc_mu = WNCausalConv1d(d_model, latent_dim, kernel_size=3, padding=1)
+        self.fc_logvar = WNCausalConv1d(d_model, latent_dim, kernel_size=3, padding=1)
+        self.block = nn.Sequential(*self.block)
+        self.enc_dim = d_model
+
+    def forward(self, x):
+        hidden_state = self.block(x)
+        return {
+            "hidden_state": hidden_state,
+            "mu": self.fc_mu(hidden_state),
+            "logvar": self.fc_logvar(hidden_state),
+        }
+
+
+class NoiseBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.linear = WNCausalConv1d(dim, dim, kernel_size=1, bias=False)
+
+    def forward(self, x):
+        batch_size, _, length = x.shape
+        noise = torch.randn((batch_size, 1, length), device=x.device, dtype=x.dtype)
+        return x + noise * self.linear(x)
+
+
+class CausalDecoderBlock(nn.Module):
+    def __init__(
+        self,
+        input_dim: int = 16,
+        output_dim: int = 8,
+        stride: int = 1,
+        groups=1,
+        use_noise_block: bool = False,
+    ):
+        super().__init__()
+        layers = [
+            Snake1d(input_dim),
+            WNCausalTransposeConv1d(
+                input_dim,
+                output_dim,
+                kernel_size=2 * stride,
+                stride=stride,
+                padding=math.ceil(stride / 2),
+                output_padding=stride % 2,
+            ),
+        ]
+        if use_noise_block:
+            layers.append(NoiseBlock(output_dim))
+        layers.extend(
+            [
+                CausalResidualUnit(output_dim, dilation=1, groups=groups),
+                CausalResidualUnit(output_dim, dilation=3, groups=groups),
+                CausalResidualUnit(output_dim, dilation=9, groups=groups),
+            ]
+        )
+        self.block = nn.Sequential(*layers)
+        self.input_channels = input_dim
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class SampleRateConditionLayer(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        sr_bin_buckets: int | None = None,
+        cond_type: str = "scale_bias",
+        cond_dim: int = 128,
+        out_layer: bool = False,
+    ):
+        super().__init__()
+        self.cond_type = cond_type
+        out_layer_in_dim = input_dim
+
+        if cond_type == "scale_bias":
+            self.scale_embed = nn.Embedding(sr_bin_buckets, input_dim)
+            self.bias_embed = nn.Embedding(sr_bin_buckets, input_dim)
+            nn.init.ones_(self.scale_embed.weight)
+            nn.init.zeros_(self.bias_embed.weight)
+        elif cond_type == "scale_bias_init":
+            self.scale_embed = nn.Embedding(sr_bin_buckets, input_dim)
+            self.bias_embed = nn.Embedding(sr_bin_buckets, input_dim)
+            nn.init.normal_(self.scale_embed.weight, mean=1)
+            nn.init.normal_(self.bias_embed.weight)
+        elif cond_type == "add":
+            self.cond_embed = nn.Embedding(sr_bin_buckets, input_dim)
+            nn.init.normal_(self.cond_embed.weight)
+        elif cond_type == "concat":
+            self.cond_embed = nn.Embedding(sr_bin_buckets, cond_dim)
+            if not out_layer:
+                raise ValueError("out_layer must be True for concat cond_type")
+            out_layer_in_dim = input_dim + cond_dim
+        else:
+            raise ValueError(f"Invalid cond_type: {cond_type}")
+
+        self.out_layer = (
+            nn.Sequential(
+                Snake1d(out_layer_in_dim),
+                WNCausalConv1d(out_layer_in_dim, input_dim, kernel_size=1),
+            )
+            if out_layer
+            else nn.Identity()
+        )
+
+    def forward(self, x, sr_cond):
+        if self.cond_type in {"scale_bias", "scale_bias_init"}:
+            x = x * self.scale_embed(sr_cond).unsqueeze(-1) + self.bias_embed(sr_cond).unsqueeze(-1)
+        elif self.cond_type == "add":
+            x = x + self.cond_embed(sr_cond).unsqueeze(-1)
+        elif self.cond_type == "concat":
+            x = torch.cat([x, self.cond_embed(sr_cond).unsqueeze(-1).repeat(1, 1, x.shape[-1])], dim=1)
+        return self.out_layer(x)
+
+
+class CausalDecoder(nn.Module):
+    def __init__(
+        self,
+        input_channel,
+        channels,
+        rates,
+        depthwise: bool = False,
+        d_out: int = 1,
+        use_noise_block: bool = False,
+        sr_bin_boundaries: List[int] | None = None,
+        cond_type: str = "scale_bias",
+        cond_dim: int = 128,
+        cond_out_layer: bool = False,
+    ):
+        super().__init__()
+        if depthwise:
+            layers = [
+                WNCausalConv1d(input_channel, input_channel, kernel_size=7, padding=3, groups=input_channel),
+                WNCausalConv1d(input_channel, channels, kernel_size=1),
+            ]
+        else:
+            layers = [WNCausalConv1d(input_channel, channels, kernel_size=7, padding=3)]
+
+        for i, stride in enumerate(rates):
+            input_dim = channels // 2**i
+            output_dim = channels // 2 ** (i + 1)
+            groups = output_dim if depthwise else 1
+            layers += [
+                CausalDecoderBlock(
+                    input_dim,
+                    output_dim,
+                    stride,
+                    groups=groups,
+                    use_noise_block=use_noise_block,
+                )
+            ]
+
+        layers += [
+            Snake1d(output_dim),
+            WNCausalConv1d(output_dim, d_out, kernel_size=7, padding=3),
+            nn.Tanh(),
+        ]
+
+        if sr_bin_boundaries is None:
+            self.model = nn.Sequential(*layers)
+            self.sr_bin_boundaries = None
+            self.default_sr_idx = None
+        else:
+            self.model = nn.ModuleList(layers)
+            self.register_buffer("sr_bin_boundaries", torch.tensor(sr_bin_boundaries, dtype=torch.int32))
+            self.sr_bin_buckets = len(sr_bin_boundaries) + 1
+            self.default_sr_idx = len(sr_bin_boundaries)
+            cond_layers = []
+            for layer in self.model:
+                if layer.__class__.__name__ == "CausalDecoderBlock":
+                    cond_layers.append(
+                        SampleRateConditionLayer(
+                            input_dim=layer.input_channels,
+                            sr_bin_buckets=self.sr_bin_buckets,
+                            cond_type=cond_type,
+                            cond_dim=cond_dim,
+                            out_layer=cond_out_layer,
+                        )
+                    )
+                else:
+                    cond_layers.append(None)
+            self.sr_cond_model = nn.ModuleList(cond_layers)
+
+    def get_sr_idx(self, batch_size: int, device: torch.device):
+        if self.default_sr_idx is None:
+            raise RuntimeError("sr_cond is not configured for this decoder")
+        return torch.full((batch_size,), fill_value=self.default_sr_idx, dtype=torch.long, device=device)
+
+    def forward(self, x, sr_cond=None):
+        if self.sr_bin_boundaries is None:
+            return self.model(x)
+
+        if sr_cond is None:
+            sr_cond = self.get_sr_idx(x.shape[0], x.device)
+        for layer, sr_cond_layer in zip(self.model, self.sr_cond_model):
+            if sr_cond_layer is not None:
+                x = sr_cond_layer(x, sr_cond)
+            x = layer(x)
+        return x
+
+
+def encoder_context(rates: List[int]) -> int:
+    """Input samples before a latent frame's own that CausalEncoder reads for it (its receptive field, all to the
+    left): the first conv (kernel 7), per block three residual units (kernel 7, dilations 1, 3, 9) and the strided conv
+    (left padding = its stride), each at the block's input spacing, then fc_mu (kernel 3) at the latent rate."""
+    context, spacing = 6, 1
+    for stride in rates:
+        context += (6 * (1 + 3 + 9) + 2 * math.ceil(stride / 2) - stride % 2) * spacing
+        spacing *= stride
+    return context + 2 * spacing
+
+
+class AudioVAEConfigV2(BaseModel):
+    encoder_dim: int = 128
+    encoder_rates: List[int] = [2, 5, 8, 8]
+    latent_dim: int = 64
+    decoder_dim: int = 2048
+    decoder_rates: List[int] = [8, 6, 5, 2, 2, 2]
+    depthwise: bool = True
+    sample_rate: int = 16000
+    out_sample_rate: int = 48000
+    use_noise_block: bool = False
+    sr_bin_boundaries: Optional[List[int]] = [20000, 30000, 40000]
+    cond_type: str = "scale_bias"
+    cond_dim: int = 128
+    cond_out_layer: bool = False
+
+
+class AudioVAEV2(nn.Module):
+    # encode() reads a clip in pieces of about this many seconds: the encoder's activations take ~47 MiB of GPU memory
+    # a second of audio, and a 45 s clip in one pass ran out of memory next to the KV cache (#47)
+    encode_chunk_seconds = 10.0
+
+    def __init__(self, config: Optional[AudioVAEConfigV2] = None, **kwargs):
+        if config is None:
+            config = AudioVAEConfigV2(**kwargs) if kwargs else AudioVAEConfigV2()
+        elif kwargs:
+            raise ValueError("Pass either config or keyword args to AudioVAEV2, not both")
+        super().__init__()
+        self.encoder_dim = config.encoder_dim
+        self.encoder_rates = config.encoder_rates
+        self.decoder_dim = config.decoder_dim
+        self.decoder_rates = config.decoder_rates
+        self.depthwise = config.depthwise
+        self.use_noise_block = config.use_noise_block
+        self.sample_rate = config.sample_rate
+        self.out_sample_rate = config.out_sample_rate
+        self.sr_bin_boundaries = config.sr_bin_boundaries
+
+        latent_dim = config.latent_dim
+        if latent_dim is None:
+            latent_dim = config.encoder_dim * (2 ** len(config.encoder_rates))
+
+        self.latent_dim = latent_dim
+        self.encoder_chunk_size = math.prod(config.encoder_rates)
+        self.encoder_context = encoder_context(config.encoder_rates)
+        self.decoder_chunk_size = math.prod(config.decoder_rates)
+        self.encoder = CausalEncoder(
+            config.encoder_dim,
+            latent_dim,
+            config.encoder_rates,
+            depthwise=config.depthwise,
+        )
+        self.decoder = CausalDecoder(
+            latent_dim,
+            config.decoder_dim,
+            config.decoder_rates,
+            depthwise=config.depthwise,
+            use_noise_block=config.use_noise_block,
+            sr_bin_boundaries=config.sr_bin_boundaries,
+            cond_type=config.cond_type,
+            cond_dim=config.cond_dim,
+            cond_out_layer=config.cond_out_layer,
+        )
+
+    def preprocess(self, audio_data, sample_rate):
+        if sample_rate is None:
+            sample_rate = self.sample_rate
+        if sample_rate != self.sample_rate:
+            raise AssertionError(f"Expected sample_rate={self.sample_rate}, got {sample_rate}")
+        pad_to = self.encoder_chunk_size
+        length = audio_data.shape[-1]
+        right_pad = math.ceil(length / pad_to) * pad_to - length
+        return nn.functional.pad(audio_data, (0, right_pad))
+
+    @torch.inference_mode()
+    def decode(self, z: torch.Tensor, sr_cond: torch.Tensor | None = None):
+        return self.decoder(z, sr_cond)
+
+    def streaming_decoder(self, max_batch_size: int | None = None) -> BatchedStreamingVAEDecoder:
+        return BatchedStreamingVAEDecoder(
+            self,
+            CausalConv1d,
+            CausalTransposeConv1d,
+            max_batch_size=max_batch_size,
+        )
+
+    @torch.inference_mode()
+    def encode(self, audio_data: torch.Tensor, sample_rate: int):
+        """The latents' means. A clip longer than encode_chunk_seconds is encoded piece by piece, so that its GPU
+        memory stays that of one piece: the encoder is causal, a frame reads encoder_context samples before its
+        own, so each piece starts that much earlier (in whole frames) and the frames that saw the piece's zero
+        padding instead are dropped. The same latents as in one pass, up to float rounding."""
+        if audio_data.ndim == 2:
+            audio_data = audio_data.unsqueeze(1)
+        audio_data = self.preprocess(audio_data, sample_rate)
+        hop = self.encoder_chunk_size
+        step = max(1, round(self.encode_chunk_seconds * self.sample_rate / hop)) * hop
+        context = math.ceil(self.encoder_context / hop) * hop
+        length = audio_data.shape[-1]
+        if length <= step + context:
+            return self.encoder.fc_mu(self.encoder.block(audio_data))
+        mus = []
+        for start in range(0, length, step):
+            left = min(start, context)  # (the first piece starts at the clip's start: its padding is the clip's)
+            piece = audio_data[..., start - left : start + step]
+            mus.append(self.encoder.fc_mu(self.encoder.block(piece))[..., left // hop :])
+        return torch.cat(mus, dim=-1)

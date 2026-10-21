@@ -140,7 +140,7 @@ def test_ws_server_route_and_no_route(models, monkeypatch):
     every adapter of the adapters model, no teacher-v3 (DialectTTS)."""
     from types import SimpleNamespace
 
-    from nanovllm_voxcpm import warmup
+    from nanovllm_voxcpm.entrypoints import warmup
     from nanovllm_voxcpm.entrypoints import ws_server
 
     async def no_warm_up(speak):
@@ -271,7 +271,7 @@ def test_tagged_adapter_loader(tmp_path):
     torch = pytest.importorskip("torch")
     from safetensors.torch import save_file
 
-    from nanovllm_voxcpm.models.voxcpm2.lora_loader import is_tagged_adapter, load_voxcpm2_lora_checkpoint
+    from nanovllm_voxcpm.model.lora_loader import is_tagged_adapter, load_voxcpm2_lora_checkpoint
 
     (tmp_path / "lora").mkdir()
     g = torch.Generator().manual_seed(0)
@@ -300,7 +300,7 @@ def test_tagged_adapter_loader(tmp_path):
 
 def test_extra_embedding_rows():
     torch = pytest.importorskip("torch")
-    from nanovllm_voxcpm.layers.embed_head import VocabParallelEmbedding
+    from nanovllm_voxcpm.model.layers import VocabParallelEmbedding
 
     emb = VocabParallelEmbedding(10, 4, extra_rows=3)
     emb.weight_loader(emb.weight, torch.arange(40, dtype=torch.float32).view(10, 4))
@@ -319,7 +319,7 @@ def test_engine_maps_a_tagged_adapters_tags_to_its_rows(tmp_path, monkeypatch):
     pytest.importorskip("torch")
     from types import SimpleNamespace
 
-    from nanovllm_voxcpm.models.voxcpm2 import engine as E
+    from nanovllm_voxcpm.model import engine as E
 
     vocab = {"<reserved_100>": 189, "<reserved_101>": 190, "a": 5, "b": 6}
 

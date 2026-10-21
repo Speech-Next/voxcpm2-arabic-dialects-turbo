@@ -68,7 +68,7 @@ SIGTERM the requests in progress get ``--shutdown-timeout`` seconds to end. A vo
 voice belongs to the client that registered it: another client's DELETE is a 403 (an ``admin=true`` client, and
 --api-key's, may delete any; a voice with no owner, from before or from --voices, only they), and a ``private`` voice
 is its owner's (and the admins') alone: to anyone else it is not there (404, not listed). The
-audio cache (``--audio-cache-mb``, nanovllm_voxcpm.audio_cache) gives a sentence asked again in the same voice and
+audio cache (``--audio-cache-mb``, nanovllm_voxcpm.entrypoints.audio_cache) gives a sentence asked again in the same voice and
 settings the audio it got first, at any load, without the engine; requests for a sentence in progress share its
 generation, and ``--audio-cache-dir`` keeps the sentences as files (restarts, replicas on a shared disk).
 A line is logged per speech request that fails or is refused and per voice registered or deleted (``--log-level``),
@@ -101,8 +101,8 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from nanovllm_voxcpm import warmup
-from nanovllm_voxcpm.audio_cache import AudioCache, namespace
+from nanovllm_voxcpm.entrypoints import warmup
+from nanovllm_voxcpm.entrypoints.audio_cache import AudioCache, namespace
 from nanovllm_voxcpm.dialect_routing import (DEFAULT_TAGGED_MODEL, TAGGED, TAGGED_ADAPTER, describe, parse_routes,
                                              resolve_tagged, route_table, routed_lora_config, used_adapters)
 from nanovllm_voxcpm.dialect_tts import (DEFAULT_DIT, DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters,
@@ -483,7 +483,7 @@ def build_app(args: argparse.Namespace):
         await asyncio.gather(*jobs)
 
     async def warm_up_kernels() -> None:
-        """nanovllm_voxcpm.warmup's bursts over the dialects, with a throwaway voice (5 s of noise): Triton compiles
+        """nanovllm_voxcpm.entrypoints.warmup's bursts over the dialects, with a throwaway voice (5 s of noise): Triton compiles
         its kernel variants now, not during the first clients' requests (#39)."""
         name = "_warmup"
         buf = io.BytesIO()

@@ -8,7 +8,7 @@ import os
 import numpy as np
 import pytest
 
-from nanovllm_voxcpm.audio_cache import AudioCache
+from nanovllm_voxcpm.entrypoints.audio_cache import AudioCache
 
 
 def chunks(n: int, v: float = 0.1, size: int = 4) -> list[np.ndarray]:

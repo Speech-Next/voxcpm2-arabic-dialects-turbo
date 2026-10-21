@@ -592,7 +592,7 @@ def test_an_engine_value_error_is_one_across_the_link():
 def test_audio_cache_the_same_sentence_the_same_audio():
     """--audio-cache-mb: a sentence spoken again (another utterance, here segmented with another one) is played from
     the cache: the audio it got first, though the engine's would differ (another load), with no engine request."""
-    from nanovllm_voxcpm.audio_cache import AudioCache
+    from nanovllm_voxcpm.entrypoints.audio_cache import AudioCache
     from nanovllm_voxcpm.entrypoints.ws_server import speak
 
     tts, cache = FakeTTS(), AudioCache(1 << 24)
@@ -625,7 +625,7 @@ def test_audio_cache_across_the_link_in_the_metrics():
     connections' process, whose /metrics exports them."""
     import socket
 
-    from nanovllm_voxcpm.audio_cache import AudioCache
+    from nanovllm_voxcpm.entrypoints.audio_cache import AudioCache
 
     tts = FakeTTS(patches=3)
 
@@ -661,7 +661,7 @@ def test_audio_cache_across_the_link_in_the_metrics():
 def test_audio_cache_one_generation_for_utterances_at_the_same_time_and_a_directory(tmp_path):
     """Two utterances of the same sentence at the same time: one engine request, the same bytes; another process on
     --audio-cache-dir (a restart, a replica) plays it from the file; a voice is known by its file's content."""
-    from nanovllm_voxcpm.audio_cache import AudioCache
+    from nanovllm_voxcpm.entrypoints.audio_cache import AudioCache
     from nanovllm_voxcpm.entrypoints.ws_server import speak
 
     tts = FakeTTS()

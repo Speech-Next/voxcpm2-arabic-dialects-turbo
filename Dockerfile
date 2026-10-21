@@ -40,13 +40,12 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE THIRD_PARTY_NOTICES.md ./
 RUN uv pip install ninja -r pyproject.toml --extra server
 
-COPY voxcpm_kernels voxcpm_kernels
 COPY nanovllm_voxcpm nanovllm_voxcpm
 COPY examples examples
-RUN uv pip install --no-deps -e . && python -m compileall -q nanovllm_voxcpm voxcpm_kernels examples
+RUN uv pip install --no-deps -e . && python -m compileall -q nanovllm_voxcpm examples
 
-# the CUDA kernels for CUDA_ARCH (voxcpm_kernels.cuda_ext, VOXCPM_CUDA_ARCH): a start loads them, no nvcc
-RUN VOXCPM_CUDA_ARCH=${CUDA_ARCH} python -m voxcpm_kernels.cuda_ext > /tmp/kernels.log 2>&1; status=$?; \
+# the CUDA kernels for CUDA_ARCH (nanovllm_voxcpm.kernels.cuda_ext, VOXCPM_CUDA_ARCH): a start loads them, no nvcc
+RUN VOXCPM_CUDA_ARCH=${CUDA_ARCH} python -m nanovllm_voxcpm.kernels.cuda_ext > /tmp/kernels.log 2>&1; status=$?; \
     cat /tmp/kernels.log; [ $status -eq 0 ] && ! grep -q "not built" /tmp/kernels.log && rm /tmp/kernels.log
 
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/voxcpm-entrypoint

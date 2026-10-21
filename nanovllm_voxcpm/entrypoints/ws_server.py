@@ -16,7 +16,7 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
 - dialect: a name RoutedDialectTTS routes (--dialect: the default; --route DIALECT=ADAPTER or DIALECT=teacher
   changes its table, --no-route: the adapters model alone, DialectTTS). The seed is the text's CRC32 (the same text, the
   same seed; its audio still varies with the load: a head start's split follows the queue). The audio cache
-  (--audio-cache-mb, 512; nanovllm_voxcpm.audio_cache) keeps each sentence's first complete audio by sentence,
+  (--audio-cache-mb, 512; nanovllm_voxcpm.entrypoints.audio_cache) keeps each sentence's first complete audio by sentence,
   dialect, voice (its file's content) and cfg_value: the same sentence then sounds the same at any load, and a
   repeated one costs no GPU; requests for a sentence in progress share its generation, and --audio-cache-dir keeps
   the sentences as files (restarts, replicas on a shared disk).
@@ -69,7 +69,7 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
-from nanovllm_voxcpm.audio_cache import AudioCache, namespace
+from nanovllm_voxcpm.entrypoints.audio_cache import AudioCache, namespace
 from nanovllm_voxcpm.dialect_routing import parse_routes
 from nanovllm_voxcpm.entrypoints.clients import Client, Clients
 from nanovllm_voxcpm.entrypoints.telemetry import (CONTENT_TYPE, FIRST_AUDIO_BUCKETS, Counter, Gauge, Histogram,
@@ -673,7 +673,7 @@ async def load_tts(args):
     adapters model, no teacher-v3)."""
     from nanovllm_voxcpm import DialectTTS, RoutedDialectTTS
     from nanovllm_voxcpm.dialect_routing import describe
-    from nanovllm_voxcpm.warmup import warm_up
+    from nanovllm_voxcpm.entrypoints.warmup import warm_up
 
     kw = {k: v for k, v in dict(model=args.model, head_tokens=args.head_tokens, max_concurrency=args.max_concurrency,
                                 kv_blocks=args.kv_blocks).items() if v is not None}

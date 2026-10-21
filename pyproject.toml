@@ -31,8 +31,8 @@ server = ["fastapi", "uvicorn", "python-multipart", "websockets>=13", "soxr", "u
 dev = ["pytest"]
 
 [tool.setuptools.packages.find]
-include = ["nanovllm_voxcpm*", "voxcpm_kernels*"]
+include = ["nanovllm_voxcpm*"]
 
 [tool.setuptools.package-data]
 # CUDA sources compiled on first use, VoxCPM2's SmoothQuant calibration for the int8 layers
-voxcpm_kernels = ["cuda/*.cu", "smooth_stats.pt"]
+"nanovllm_voxcpm.kernels" = ["*.cu", "smooth_stats.pt"]

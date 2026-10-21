@@ -53,7 +53,7 @@ def test_a_local_path_is_not_downloaded(calls, tmp_path):
 def test_one_kernel_build_for_every_checkout_of_a_source(monkeypatch, tmp_path):
     """ninja's command line holds the source's path: the build compiles a copy under the build directory, the same
     path from every checkout (a start from another worktree compiled everything again, ~160 s)."""
-    from voxcpm_kernels import cuda_ext
+    from nanovllm_voxcpm.kernels import cuda_ext
 
     monkeypatch.setenv("TORCH_EXTENSIONS_DIR", str(tmp_path / "ext"))
     paths = []

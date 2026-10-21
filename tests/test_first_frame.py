@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nanovllm_voxcpm.models.voxcpm2.runner import first_audio_phases
-from voxcpm_kernels.vae_stream import flatten_states
+from nanovllm_voxcpm.model.runner import first_audio_phases
+from nanovllm_voxcpm.kernels.vae_stream import flatten_states
 
 
 @pytest.mark.parametrize("ms, phases", [(20, 4), (5, 1), (35, 7), (10, 2), (0, 0), (-5, 0), (40, 0), (80, 0)])
@@ -58,7 +58,7 @@ def test_flatten_states_leaves_mixed_states_alone():
 
 
 def _tiny_decoder():
-    from nanovllm_voxcpm.layers.audio_vae_v2 import AudioVAEConfigV2, AudioVAEV2
+    from nanovllm_voxcpm.model.vae import AudioVAEConfigV2, AudioVAEV2
 
     cfg = AudioVAEConfigV2(encoder_dim=8, encoder_rates=[2, 2], latent_dim=8, decoder_dim=32, decoder_rates=[2, 2],
                            sr_bin_boundaries=None)
@@ -66,7 +66,7 @@ def _tiny_decoder():
 
 
 def test_released_slots_are_zero_for_the_next_stream():
-    from voxcpm_kernels import SlotStreamingVAEDecoder
+    from nanovllm_voxcpm.kernels import SlotStreamingVAEDecoder
 
     dec = SlotStreamingVAEDecoder(_tiny_decoder(), max_streams=2, latent_dim=8, chunk_frames=2, use_cuda_graph=False)
     assert dec._flat is not None and len(dec.states) > 1
