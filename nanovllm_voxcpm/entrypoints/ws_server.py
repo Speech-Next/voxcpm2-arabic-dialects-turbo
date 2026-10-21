@@ -702,9 +702,10 @@ def announce(args):
     if args.ready:
         with open(args.ready, "w") as f:
             f.write(str(os.getpid()))
-    print(f"[ws_server] ws://{args.host}:{args.port}{PATH} ready (pacing "
-          f"{'alpha %.2f, reserve %g ms' % (args.pace_alpha, args.pace_reserve_ms) if args.pace else 'off'}, "
-          f"{', uvloop' if 'uvloop' in type(asyncio.get_running_loop()).__module__ else ''})", flush=True)
+    pacing = ("alpha %.2f, reserve %g ms, first chunk +%g ms" % (
+        args.pace_alpha, args.pace_reserve_ms, getattr(args, "pace_start_ms", 0.0)) if args.pace else "off")
+    loop = ", uvloop" if "uvloop" in type(asyncio.get_running_loop()).__module__ else ""
+    print(f"[ws_server] ws://{args.host}:{args.port}{PATH} ready (pacing {pacing}{loop})", flush=True)
 
 
 def stop_signal() -> asyncio.Future:
