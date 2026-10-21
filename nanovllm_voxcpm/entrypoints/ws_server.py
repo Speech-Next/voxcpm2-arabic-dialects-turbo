@@ -13,7 +13,8 @@ longer than a chunk's audio where the engine has the audio (#31, nanovllm_voxcpm
   last one shorter), then {"type": "end_of_audio"}. transport=json_base64: {"type": "audio_chunk", "chunk_data":
   <base64>} instead of binary messages. segmenting=true: a long text spoken sentence by sentence into the same stream
   (openai_server.split_text). Errors: {"type": "error", "message": ..}.
-- dialect: a name RoutedDialectTTS routes (--dialect: the default). The seed is the text's CRC32 (the same text, the
+- dialect: a name RoutedDialectTTS routes (--dialect: the default; --route DIALECT=ADAPTER or DIALECT=teacher
+  changes its table, --no-route: the adapters model alone, DialectTTS). The seed is the text's CRC32 (the same text, the
   same seed; its audio still varies with the load: a head start's split follows the queue). The audio cache
   (--audio-cache-mb, 512; nanovllm_voxcpm.audio_cache) keeps each sentence's first complete audio by sentence,
   dialect, voice (its file's content) and cfg_value: the same sentence then sounds the same at any load, and a
@@ -69,6 +70,7 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 
 from nanovllm_voxcpm.audio_cache import AudioCache, namespace
+from nanovllm_voxcpm.dialect_routing import parse_routes
 from nanovllm_voxcpm.entrypoints.clients import Client, Clients
 from nanovllm_voxcpm.entrypoints.telemetry import (CONTENT_TYPE, FIRST_AUDIO_BUCKETS, Counter, Gauge, Histogram,
                                                    ServerMetrics, add_audio_cache, setup_logging)
@@ -658,22 +660,33 @@ def audio_cache(args, sample_rate: int) -> AudioCache | None:
     from nanovllm_voxcpm.hub import HUB_REVISIONS
 
     directory = getattr(args, "audio_cache_dir", None)
+    no_route = getattr(args, "no_route", False)
     ns = namespace(server="ws_server", model=args.model, tagged_model=args.tagged_model, dit=args.dit,
-                   head_tokens=args.head_tokens, sample_rate=sample_rate, revisions=HUB_REVISIONS)
+                   head_tokens=args.head_tokens, sample_rate=sample_rate, revisions=HUB_REVISIONS, no_route=no_route,
+                   routes=None if no_route else parse_routes(getattr(args, "route", None)))
     return AudioCache(int(mb * 2**20), sample_rate, directory,
                       int(getattr(args, "audio_cache_dir_mb", 0) * 2**20), ns)
 
 
 async def load_tts(args):
-    from nanovllm_voxcpm import RoutedDialectTTS
+    """RoutedDialectTTS with the default routes as --route changes them; --no-route: DialectTTS (every adapter of the
+    adapters model, no teacher-v3)."""
+    from nanovllm_voxcpm import DialectTTS, RoutedDialectTTS
+    from nanovllm_voxcpm.dialect_routing import describe
     from nanovllm_voxcpm.warmup import warm_up
 
-    kw = {k: v for k, v in dict(model=args.model, tagged_model=args.tagged_model, head_tokens=args.head_tokens,
-                                max_concurrency=args.max_concurrency, kv_blocks=args.kv_blocks).items()
-          if v is not None}
+    kw = {k: v for k, v in dict(model=args.model, head_tokens=args.head_tokens, max_concurrency=args.max_concurrency,
+                                kv_blocks=args.kv_blocks).items() if v is not None}
     if args.dit is not None:
         kw["dit"] = None if args.dit in ("", "none") else args.dit
-    tts = await RoutedDialectTTS.load(**kw)
+    if getattr(args, "no_route", False):
+        tts = await DialectTTS.load(**kw)
+        print(f"[ws_server] no routing: the adapters {', '.join(tts.dialects)}", flush=True)
+    else:
+        if args.tagged_model is not None:
+            kw["tagged_model"] = args.tagged_model
+        tts = await RoutedDialectTTS.load(**kw, routes=parse_routes(getattr(args, "route", None)))
+        print(f"[ws_server] routes: {describe(tts.table)}", flush=True)
     for spec in args.voice:
         name, _, path = spec.partition("=")
         await tts.add_voice(name, path)
@@ -808,6 +821,11 @@ def cli():
     ap.add_argument("--port", type=int, default=8092)
     ap.add_argument("--model", default=None, help="the adapters model (default: RoutedDialectTTS's)")
     ap.add_argument("--tagged-model", default=None)
+    ap.add_argument("--route", action="append", metavar="DIALECT=ADAPTER",
+                    help="speak DIALECT with that adapter of the adapters model, or with teacher-v3 (DIALECT=teacher), "
+                         "instead of the default table (repeatable; nanovllm_voxcpm.dialect_routing)")
+    ap.add_argument("--no-route", action="store_true",
+                    help="no routing: every adapter of the adapters model on its own name, no teacher-v3 (DialectTTS)")
     ap.add_argument("--dit", default=None, help="distilled LocDiT (default: RoutedDialectTTS's; none: the model's own)")
     ap.add_argument("--head-tokens", type=int, default=None)
     ap.add_argument("--max-concurrency", type=int, default=None)
@@ -866,6 +884,12 @@ def cli():
     ap.add_argument("--audio-cache-dir-mb", type=float, default=4096.0,
                     help="--audio-cache-dir's size: the files used longest ago removed beyond it")
     args = ap.parse_args()
+    if args.route and args.no_route:
+        ap.error("--route changes the routing that --no-route turns off")
+    try:
+        parse_routes(args.route)
+    except ValueError as e:
+        ap.error(str(e))
     if args.default_voice is None and args.voice:
         args.default_voice = args.voice[0].partition("=")[0]
     try:  # a faster event loop: at 150-200 streams the loop's delays decide whether a paced chunk is late

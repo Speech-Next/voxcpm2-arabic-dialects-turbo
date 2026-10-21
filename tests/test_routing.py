@@ -8,8 +8,9 @@ import os
 import numpy as np
 import pytest
 
-from nanovllm_voxcpm.dialect_routing import (ADAPTERS, DEFAULT_ROUTES, TAGGED, TAGGED_ADAPTER, Route,
-                                             RoutedDialectTTS, route_table, routed_lora_config, used_adapters)
+from nanovllm_voxcpm.dialect_routing import (ADAPTERS, DEFAULT_ROUTES, TAGGED, TAGGED_ADAPTER, TEACHER, Route,
+                                             RoutedDialectTTS, describe, parse_routes, route_table, routed_lora_config,
+                                             used_adapters)
 from nanovllm_voxcpm.dialect_tts import DialectTags
 
 # the default models' names: adapters.json of VoxCPM-Kernel/VoxCPM2-Arabic-Dialects, dialects.json of
@@ -111,6 +112,55 @@ def test_route_overrides_and_errors():
     assert route_table(ADAPTER_NAMES, tags, {})["egyptian"] == Route(TAGGED, "egyptian")  # no routes: all tagged
     with pytest.raises(ValueError, match="bahraini"):
         route_table(ADAPTER_NAMES, tags, {"bahraini": "bahraini"})  # no such adapter
+
+
+def test_route_options_and_teacher_target():
+    """--route DIALECT=ADAPTER / DIALECT=teacher (parse_routes) over the default table."""
+    tags = DialectTags(V3)
+    routes = parse_routes(["najdi=najdi", " egyptian = teacher "])
+    assert routes == {**DEFAULT_ROUTES, "najdi": "najdi", "egyptian": TEACHER}
+    table = route_table(ADAPTER_NAMES, tags, routes)
+    assert table["najdi"] == Route(ADAPTERS, "najdi") and table["egyptian"] == Route(TAGGED, "egyptian")
+    assert used_adapters(table) == ["hejazi", "hindi_english", "najdi", "qatari", "saudi"]
+    assert describe(table) == "adapters: bahraini->qatari, hejazi, hindi_english, najdi, saudi; teacher: 19 names"
+    teacher_only = parse_routes([f"{d}={TEACHER}" for d in DEFAULT_ROUTES])  # every dialect of teacher-v3 on it
+    assert used_adapters(route_table(ADAPTER_NAMES, tags, teacher_only)) == ["hindi_english"]
+    assert parse_routes(None) == DEFAULT_ROUTES and parse_routes([], base={}) == {}
+    for bad in ("najdi", "=najdi", "najdi="):
+        with pytest.raises(ValueError, match="DIALECT=ADAPTER"):
+            parse_routes([bad])
+    with pytest.raises(ValueError, match="does not speak"):
+        route_table(ADAPTER_NAMES, tags, parse_routes(["hindi_english=teacher"]))
+    with pytest.raises(ValueError, match="lacks"):
+        route_table(ADAPTER_NAMES, tags, parse_routes(["najdi=nadji"]))
+
+
+def test_ws_server_route_and_no_route(models, monkeypatch):
+    """ws_server's --route changes the routed engine's table (and the audio cache's namespace); --no-route serves
+    every adapter of the adapters model, no teacher-v3 (DialectTTS)."""
+    from types import SimpleNamespace
+
+    from nanovllm_voxcpm import warmup
+    from nanovllm_voxcpm.entrypoints import ws_server
+
+    async def no_warm_up(speak):
+        pass
+
+    monkeypatch.setattr(warmup, "warm_up", no_warm_up)
+
+    def args(**kw):
+        return SimpleNamespace(**{**dict(model=str(models / "adapters-model"), tagged_model=str(models / "tagged-model"),
+                                         dit="none", head_tokens=None, max_concurrency=None, kv_blocks=None, voice=[],
+                                         dialect="egyptian", default_voice=None, route=None, no_route=False,
+                                         audio_cache_mb=1, audio_cache_dir=None, audio_cache_dir_mb=0), **kw})
+
+    tts = run(ws_server.load_tts(args(route=["najdi=najdi", "egyptian=teacher"])))
+    assert sorted(FakeEngine.started[-1].loras) == ["@tagged", "hejazi", "hindi_english", "najdi", "qatari", "saudi"]
+    assert tts.route("egyptian") == Route(TAGGED, "egyptian") and tts.route("najdi") == Route(ADAPTERS, "najdi")
+    tts = run(ws_server.load_tts(args(no_route=True)))
+    assert sorted(FakeEngine.started[-1].loras) == sorted(ADAPTER_NAMES) and sorted(tts.dialects) == ADAPTER_NAMES
+    caches = [ws_server.audio_cache(args(**kw), 48000) for kw in ({}, {"route": ["najdi=najdi"]}, {"no_route": True})]
+    assert len({c.namespace for c in caches}) == 3  # another table, another audio: no file shared
 
 
 def test_dispatch_adapters_tags_and_base():
@@ -337,3 +387,14 @@ def test_server_routes_by_default(models, monkeypatch):
     FakeEngine.started = []
     run(serve(openai_server.build_app(server_args(models / "adapters-model", no_route=True)), []))
     assert sorted(FakeEngine.started[0].loras) == sorted(ADAPTER_NAMES)  # --no-route: every adapter, no teacher-v3
+    FakeEngine.started = []  # --route: najdi on its adapter, egyptian on teacher-v3
+    asgi = openai_server.build_app(server_args(models / "adapters-model", no_route=False, route=["najdi=najdi",
+                                                                                                 "egyptian=teacher"],
+                                               tagged_model=str(models / "tagged-model")))
+    out = run(serve(asgi, [{"input": "هلا", "dialect": "najdi"}, {"input": "هلا", "dialect": "egyptian"}]))
+    assert [status for status, _ in out] == [200, 200]
+    (e,) = FakeEngine.started
+    assert sorted(e.loras) == ["@tagged", "hejazi", "hindi_english", "najdi", "qatari", "saudi"]
+    reqs = [r for r in e.requests if r["text"] != "Warm up." and r.get("voice") != "_warmup"]
+    assert (reqs[0]["lora_name"], reqs[0]["text"]) == ("najdi", "هلا")
+    assert (reqs[1]["lora_name"], reqs[1]["text"]) == (TAGGED_ADAPTER, V3["tags"]["egyptian"] + "هلا")

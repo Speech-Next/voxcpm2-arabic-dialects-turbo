@@ -274,6 +274,7 @@ python examples/streaming_benchmark.py       # requests arriving at random
 | option | default | other |
 |---|---|---|
 | engine | `RoutedDialectTTS`: each dialect on its best model | `DialectTTS` / `--no-route`: the adapters only |
+| a dialect's LoRA | the README's LoRA table | `--route DIALECT=ADAPTER` or `DIALECT=teacher` (both servers, `voice_clone.py`; Python: `routes=`); only the adapters in use are loaded |
 | LocDiT (`dit=`, `--dit`) | distilled, 3 steps | `None` / `none`: the model's own, 10 steps (slower) |
 | precision | int8 | `--precision bf16` (benchmark.py) |
 | first chunk delay (ws_server) | `--pace-start-ms 0` | `150`: the first chunk 150 ms later, more time for the engine (the default until #79) |
