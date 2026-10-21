@@ -23,12 +23,19 @@ client.
 
 17 dialects x 40 sentences x 2 seeds. CER / WER: lower is better; UTMOS: naturalness, 1-5.
 
+## Models
+
+| model | Hugging Face id |
+|---|---|
+| VoxCPM2 with 11 dialect LoRA adapters | [`VoxCPM-Kernel/VoxCPM2-Arabic-Dialects`](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Dialects) |
+| teacher-v3: one LoRA for every dialect, with the dialect's tag | [`VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3`](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3) |
+| distilled LocDiT, 3 steps | [`VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT`](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT) |
+| reference voices of the examples (dataset) | [`VoxCPM-Kernel/Arabic-Hindi-Reference-Voices`](https://huggingface.co/datasets/VoxCPM-Kernel/Arabic-Hindi-Reference-Voices) |
+
 ## LoRA
 
-Each dialect is spoken by one LoRA: an adapter of
-[VoxCPM2-Arabic-Dialects](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Dialects), or
-[teacher-v3](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3) (one LoRA for every dialect, with the
-dialect's tag). The default is the better of the two on the quality set:
+Each dialect is spoken by one LoRA: an adapter of `VoxCPM-Kernel/VoxCPM2-Arabic-Dialects`, or teacher-v3
+(`VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3`). The default is the better of the two on the quality set:
 
 | dialect | default LoRA |
 |---|---|
@@ -44,7 +51,7 @@ The adapters: ab, egyptian, emirati, hejazi, hindi_english, iraqi, jordanian, na
 ```bash
 git clone https://github.com/Speech-Next/voxcpm2-arabic-dialects-turbo && cd voxcpm2-arabic-dialects-turbo
 ./setup.sh && source .venv/bin/activate
-hf auth login   # the models are gated on Hugging Face: request access first
+hf auth login   # the models are gated on Hugging Face: request access to the ones above first
 ```
 
 ```python
@@ -52,7 +59,11 @@ import asyncio
 from nanovllm_voxcpm import RoutedDialectTTS
 
 async def main():
-    tts = await RoutedDialectTTS.load()
+    tts = await RoutedDialectTTS.load(
+        model="VoxCPM-Kernel/VoxCPM2-Arabic-Dialects",                            # the 11 adapters
+        tagged_model="VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3",                   # teacher-v3
+        dit="VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k3.pt",  # the distilled LocDiT
+    )
     await tts.add_voice("ahmed", "ahmed.wav")
     audio = await tts.synthesize("هلا والله، كيف حالك اليوم؟", dialect="najdi", voice="ahmed")  # float32, 48 kHz
     await tts.close()
@@ -63,10 +74,14 @@ if __name__ == "__main__":
 
 ```bash
 # WebSocket server: ws://127.0.0.1:8092/api/tts/stream?dialect=egyptian
-python -m nanovllm_voxcpm.entrypoints.ws_server --voice default=ahmed.wav --dialect egyptian
+python -m nanovllm_voxcpm.entrypoints.ws_server --model VoxCPM-Kernel/VoxCPM2-Arabic-Dialects \
+  --tagged-model VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3 \
+  --dit VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k3.pt --voice default=ahmed.wav --dialect egyptian
 
 # HTTP server (OpenAI-compatible): http://127.0.0.1:8092
-python -m nanovllm_voxcpm.entrypoints.openai_server
+python -m nanovllm_voxcpm.entrypoints.openai_server --model VoxCPM-Kernel/VoxCPM2-Arabic-Dialects \
+  --tagged-model VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3 \
+  --dit VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k3.pt
 curl -F name=ahmed -F audio_sample=@ahmed.wav http://127.0.0.1:8092/v1/audio/voices
 curl http://127.0.0.1:8092/v1/audio/speech -H 'Content-Type: application/json' \
   -d '{"input": "هلا والله", "voice": "ahmed", "dialect": "najdi", "response_format": "wav"}' -o out.wav
@@ -75,14 +90,19 @@ curl http://127.0.0.1:8092/v1/audio/speech -H 'Content-Type: application/json' \
 cp .env.example .env && docker compose --profile http up -d
 
 # Choose a dialect's LoRA (both servers): an adapter (DIALECT=ADAPTER) or teacher-v3 (DIALECT=teacher)
-python -m nanovllm_voxcpm.entrypoints.ws_server --voice default=ahmed.wav --route najdi=najdi --route egyptian=teacher
+python -m nanovllm_voxcpm.entrypoints.ws_server --model VoxCPM-Kernel/VoxCPM2-Arabic-Dialects \
+  --tagged-model VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3 \
+  --dit VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k3.pt --voice default=ahmed.wav \
+  --route najdi=najdi --route egyptian=teacher
+
 # The adapters only, no teacher-v3
-python -m nanovllm_voxcpm.entrypoints.openai_server --no-route
+python -m nanovllm_voxcpm.entrypoints.openai_server --model VoxCPM-Kernel/VoxCPM2-Arabic-Dialects \
+  --dit VoxCPM-Kernel/VoxCPM2-Arabic-Dialects-Distilled-DiT:student_k3.pt --no-route
 ```
 
-In Python: `RoutedDialectTTS.load(routes={**DEFAULT_ROUTES, "najdi": "najdi", "egyptian": "teacher"})`
-(`DEFAULT_ROUTES` from `nanovllm_voxcpm.dialect_routing`), or `DialectTTS.load()` for the adapters only. Only the
-adapters in use are loaded; all 11 with teacher-v3 need `--kv-blocks 500` on an A10.
+In Python: `RoutedDialectTTS.load(..., routes={**DEFAULT_ROUTES, "najdi": "najdi", "egyptian": "teacher"})`
+(`DEFAULT_ROUTES` from `nanovllm_voxcpm.dialect_routing`), or `DialectTTS.load(model="VoxCPM-Kernel/VoxCPM2-Arabic-Dialects")`
+for the adapters only. Only the adapters in use are loaded; all 11 with teacher-v3 need `--kv-blocks 500` on an A10.
 
 Dialects: msa, egyptian, palestinian, lebanese, syrian, iraqi, saudi, najdi, hejazi, gulf, bahraini, yemeni, sudanese,
 libyan, tunisian, algerian, moroccan, hindi_english. Every option: `--help`, and [docs/details.md](docs/details.md).
