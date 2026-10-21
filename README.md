@@ -4,9 +4,6 @@ Fast Arabic dialect text-to-speech with voice cloning, built on [VoxCPM2](https:
 
 ## Results
 
-One NVIDIA A10 (24 GB), default settings, the WebSocket server with the benchmark of
-[`VoxCPM-Kernel/benchmark-test-data-ar`](https://huggingface.co/datasets/VoxCPM-Kernel/benchmark-test-data-ar):
-
 | requests at once | TTFA p99 | TTFB p95 | TTFB max | stalls | underruns |
 |---:|---:|---:|---:|---:|---:|
 | 1 | 27-29 ms | 30-33 ms | 30-33 ms | 0 | 0 |

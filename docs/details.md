@@ -5,7 +5,7 @@ production and Docker.
 
 ## Benchmark
 
-The README's WebSocket table: the scripts and `text.txt` of
+The README's WebSocket table: one NVIDIA A10 (24 GB), default settings, the WebSocket server; the scripts and `text.txt` of
 [`VoxCPM-Kernel/benchmark-test-data-ar`](https://huggingface.co/datasets/VoxCPM-Kernel/benchmark-test-data-ar),
 unchanged; four runs (three of the underruns script, one of the original), a fresh server each, the range over the
 runs, without the audio cache (`--audio-cache-mb 0`). The script prints no p99 for TTFB; its max is the upper bound.
