@@ -9,7 +9,7 @@ adapters (see LoRA below).
 Endpoints (request shapes follow vLLM-Omni's, so one client can drive both servers):
 
     POST   /v1/audio/voices         multipart: audio_sample (file), name, ref_text (optional), consent (ignored),
-                                    normalize (default true)
+                                    normalize (default true), private (default false)
     GET    /v1/audio/voices
     DELETE /v1/audio/voices/{name}
     POST   /v1/audio/speech         JSON: input, voice, stream, response_format ("pcm" | "wav" | "mp3" | "opus" |
@@ -64,7 +64,10 @@ beyond that many speech requests at once (one A10: 150);
 input with nothing to speak (punctuation, symbols or emoji only) is a 400. A speech request whose client disconnects
 ends its engine request. /health is 503 once the engine process has died or hung (``--hang-timeout``: nothing from it
 for that long while requests wait), and the server then exits with code 1, for its supervisor to start it again. On
-SIGTERM the requests in progress get ``--shutdown-timeout`` seconds to end. A voice in use is not deleted (409). The
+SIGTERM the requests in progress get ``--shutdown-timeout`` seconds to end. A voice in use is not deleted (409). A
+voice belongs to the client that registered it: another client's DELETE is a 403 (an ``admin=true`` client, and
+--api-key's, may delete any; a voice with no owner, from before or from --voices, only they), and a ``private`` voice
+is its owner's (and the admins') alone: to anyone else it is not there (404, not listed). The
 audio cache (``--audio-cache-mb``, nanovllm_voxcpm.audio_cache) gives a sentence asked again in the same voice and
 settings the audio it got first, at any load, without the engine; requests for a sentence in progress share its
 generation, and ``--audio-cache-dir`` keeps the sentences as files (restarts, replicas on a shared disk).
@@ -94,7 +97,7 @@ from contextlib import asynccontextmanager
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
@@ -163,13 +166,14 @@ def _write_whole(path: str, data: bytes) -> None:
 
 
 def save_voice(voice_dir: str, name: str, latents: bytes, text: str | None, audio: bytes, audio_format: str,
-               normalize: bool = True) -> VoiceSig | None:
-    """The voice's files, its .json last; returns its signature (voice_sig)."""
+               normalize: bool = True, owner: str | None = None, private: bool = False) -> VoiceSig | None:
+    """The voice's files, its .json last; returns its signature (voice_sig). owner, private: build_app's may_use and
+    may_delete (an older .json has neither: no owner, not private)."""
     os.makedirs(voice_dir, exist_ok=True)
     _write_whole(os.path.join(voice_dir, f"{name}.latents"), latents)
     _write_whole(os.path.join(voice_dir, f"{name}.{audio_format}"), audio)
     meta = {"name": name, "text": text, "normalize": normalize, "audio": f"{name}.{audio_format}",
-            "created_at": int(time.time())}  # text: the transcript as written
+            "created_at": int(time.time()), "owner": owner, "private": private}  # text: the transcript as written
     _write_whole(os.path.join(voice_dir, f"{name}.json"), json.dumps(meta, ensure_ascii=False).encode())
     return voice_sig(voice_dir, name)
 
@@ -530,28 +534,32 @@ def build_app(args: argparse.Namespace):
         return buf.getvalue()
 
     async def register(name: str, audio: bytes, audio_format: str, text: str | None, normalize: bool = True,
-                       upload: bool = False) -> dict:
+                       upload: bool = False, owner: str | None = None, private: bool = False) -> dict:
         # encoded once and kept inside the engine: a request then sends only the voice name
         clip, fmt = (await asyncio.to_thread(uploaded_clip, audio), "wav") if upload else (audio, audio_format)
         latents = await state["pool"].encode_latents(clip, fmt)
         await register_voice(name, latents, text or None, normalize)
-        entry = voice_entry(latents, text or None, int(time.time()), normalize)
+        entry = voice_entry(latents, text or None, int(time.time()), normalize, owner, private)
         if args.voice_dir:  # (where the other replicas find it)
             entry["file"] = await asyncio.to_thread(save_voice, args.voice_dir, name, latents, text or None, audio,
-                                                    audio_format, normalize)
+                                                    audio_format, normalize, owner, private)
         state["voices"][name] = entry
         await warm_up([name])
-        return {"name": name, "has_transcript": bool(text), "created_at": state["voices"][name]["created_at"]}
+        out = {"name": name, "has_transcript": bool(text), "created_at": state["voices"][name]["created_at"]}
+        return {**out, "owner": owner, "private": private} if owner is not None else out
 
     async def register_voice(name: str, latents: bytes, text: str | None, normalize: bool) -> None:
         """The engine gets the transcript as target text is read (no dialect: colloquial)."""
         await state["pool"].register_voice(name, latents, read_as(text) if text and normalize else text)
 
-    def voice_entry(latents: bytes, text: str | None, created_at, normalize: bool = True) -> dict:
+    def voice_entry(latents: bytes, text: str | None, created_at, normalize: bool = True, owner: str | None = None,
+                    private: bool = False) -> dict:
         # digest: the voice in the audio cache's key, by its content (a voice registered again under its name with
-        # other audio is another voice; its files in --audio-cache-dir are read by every replica that has it)
+        # other audio is another voice; its files in --audio-cache-dir are read by every replica that has it);
+        # owner (the client that registered it, None: none) and private: may_use, may_delete
         digest = hashlib.sha256(latents + json.dumps([text, normalize]).encode()).hexdigest()[:16]
-        v = {"text": text, "created_at": created_at, "normalize": normalize, "digest": digest}
+        v = {"text": text, "created_at": created_at, "normalize": normalize, "digest": digest, "owner": owner,
+             "private": private}
         if state["tags"] is not None and text:
             v["latents"] = latents  # its per-dialect copies are registered from these
         return v
@@ -564,7 +572,18 @@ def build_app(args: argparse.Namespace):
     async def add_voice(name: str, meta: dict, latents: bytes, sig: VoiceSig | None) -> None:
         norm = meta.get("normalize", True)
         await register_voice(name, latents, meta.get("text"), norm)
-        state["voices"][name] = {**voice_entry(latents, meta.get("text"), meta.get("created_at"), norm), "file": sig}
+        state["voices"][name] = {**voice_entry(latents, meta.get("text"), meta.get("created_at"), norm,
+                                               meta.get("owner"), bool(meta.get("private"))), "file": sig}
+
+    # A voice belongs to the client that registered it (its owner; None: registered before --api-keys-file, from
+    # --voices, or by a server without keys). Every client may speak with it, unless it is private: then only its
+    # owner and the admins may, and to the others it is not there (404, not listed). Only its owner and the admins
+    # may delete it; a voice with no owner, only the admins. No keys at all (client None): every voice, as before.
+    def may_use(client: Client | None, v: dict) -> bool:
+        return not v.get("private") or client is None or client.admin or v.get("owner") == client.name
+
+    def may_delete(client: Client | None, v: dict) -> bool:
+        return client is None or client.admin or (v.get("owner") is not None and v.get("owner") == client.name)
 
     async def drop_voice(name: str) -> None:
         del state["voices"][name]
@@ -747,12 +766,15 @@ def build_app(args: argparse.Namespace):
 
     @app.post("/v1/audio/voices")
     async def upload_voice(
+        request: Request,
         name: str = Form(...),
         audio_sample: UploadFile = File(...),
         ref_text: str | None = Form(None),
         consent: str | None = Form(None),
         normalize: bool = Form(True),
+        private: bool = Form(False),
     ):
+        client: Client | None = request.scope.get("voxcpm.client")  # (its owner: may_use, may_delete)
         try:
             if not VOICE_NAME.match(name):
                 raise HTTPException(400, "voice name: 1-64 characters from A-Z a-z 0-9 . _ -")
@@ -765,36 +787,62 @@ def build_app(args: argparse.Namespace):
             audio_format = os.path.splitext(audio_sample.filename or "")[1].lstrip(".") or "wav"
             state["registering"].add(name)
             try:
-                out = await register(name, await audio_sample.read(), audio_format, ref_text, normalize, upload=True)
+                out = await register(name, await audio_sample.read(), audio_format, ref_text, normalize, upload=True,
+                                     owner=client.name if client is not None else None, private=private)
             finally:
                 state["registering"].discard(name)
         except HTTPException as e:
             logger.info("voice %r not registered: %d %s", name[:64], e.status_code, brief(e.detail))
             raise
-        logger.info("voice %r registered", name)
+        logger.info("voice %r registered%s%s", name, f" by {client.name}" if client is not None else "",
+                    " (private)" if private else "")
         return out
 
     @app.get("/v1/audio/voices")
-    async def list_voices():
-        voices = {k: bool(v["text"]) for k, v in state["voices"].items()}
+    async def list_voices(request: Request):
+        """The voices the client may speak with (may_use); its own (an admin: all) with their owner and privacy."""
+        client: Client | None = request.scope.get("voxcpm.client")
+        voices = dict(state["voices"])
         if args.voice_dir:  # the directory's voices as the replicas left them (this one follows within --voice-sync-s)
             on_disk = await asyncio.to_thread(voice_names, args.voice_dir)
-            voices = {k: t for k, t in voices.items() if k in on_disk or "file" not in state["voices"][k]}
+            voices = {k: v for k, v in voices.items() if k in on_disk or "file" not in v}
             for name in sorted(on_disk.keys() - voices.keys()):
                 voice = await asyncio.to_thread(read_voice, args.voice_dir, name)
                 if voice is not None:
-                    voices[name] = bool(voice[0].get("text"))
-        return {"voices": [{"name": k, "has_transcript": t} for k, t in voices.items()]}
+                    voices[name] = voice[0]
+        out = []
+        for k, v in voices.items():
+            if not may_use(client, v):
+                continue
+            item = {"name": k, "has_transcript": bool(v.get("text"))}
+            if client is not None and (client.admin or v.get("owner") == client.name):
+                item.update(owner=v.get("owner"), private=bool(v.get("private")))
+            out.append(item)
+        return {"voices": out}
+
+    def deletable(client: Client | None, name: str, v: dict | None) -> None:
+        """404 for a voice that is not there for ``client`` (none, or another client's private one), 403 for one it
+        may not delete (may_delete)."""
+        if v is None or not may_use(client, v):
+            raise HTTPException(404, f"voice '{name}' not found")
+        if not may_delete(client, v):
+            who = f"client {client.name}" if client is not None else "this client"
+            logger.info("voice %r not deleted: %s is not its owner (403)", name, who)
+            raise HTTPException(403, f"voice '{name}': only its owner or an admin may delete it")  # (no owner named)
 
     @app.delete("/v1/audio/voices/{name}")
-    async def delete_voice(name: str):
+    async def delete_voice(name: str, request: Request):
+        client: Client | None = request.scope.get("voxcpm.client")
         if name not in state["voices"]:
             if args.voice_dir and VOICE_NAME.match(name) and voice_sig(args.voice_dir, name) is not None:
                 # another replica's, not used here yet: its files go; the replicas drop it at their next sync
+                voice = await asyncio.to_thread(read_voice, args.voice_dir, name)
+                deletable(client, name, voice[0] if voice is not None else {})  # (left half written: no owner)
                 await asyncio.to_thread(delete_voice_files, args.voice_dir, name)
                 logger.info("voice %r deleted from --voice-dir", name)
                 return {"deleted": name}
             raise HTTPException(404, f"voice '{name}' not found")
+        deletable(client, name, state["voices"][name])
         if state["voice_users"].get(name):  # (its next sentence would fail, and its response stop after a 200)
             logger.info("voice %r not deleted: in use by %d speech requests (409)", name, state["voice_users"][name])
             raise HTTPException(409, f"voice '{name}' is in use by {state['voice_users'][name]} speech requests; "
@@ -1024,6 +1072,8 @@ def build_app(args: argparse.Namespace):
                 raise HTTPException(503, f"busy: {state['active']} speech requests in progress (--max-streams)")
             if req.voice is not None and req.voice not in state["voices"]:
                 await shared_voice(req.voice)  # (another replica's, in --voice-dir: registered here now)
+            if req.voice is not None and not may_use(client, state["voices"].get(req.voice, {})):
+                raise HTTPException(404, f"voice '{req.voice}' not found")  # (another client's private voice)
             why, retry = clients.acquire(client)  # (counted from here: released when the response ends)
             if why is not None:
                 limited = True

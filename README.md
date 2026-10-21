@@ -151,7 +151,7 @@ and a speed other than 1.0 are a 400. `cfg_value` has no effect with the distill
 | a client that leaves | its engine request ends (pings every `--ping-interval`, 20 s, find dead connections) | its engine request ends |
 | the engine process dies, or hangs (sends nothing for `--hang-timeout`, 60 s, while requests wait) | the server exits with code 1 | the server exits with code 1 |
 | SIGTERM | no new connection or utterance; those in progress get `--shutdown-timeout` (10 s) to end, then are cut; the connections close with 1001 | no new connection; requests in progress get `--shutdown-timeout` (10 s) to end, then are cut |
-| `DELETE /v1/audio/voices/{name}` | | 409 while a speech request uses the voice |
+| `DELETE /v1/audio/voices/{name}` | | 409 while a speech request uses the voice; with `--api-keys-file`, 403 for another client's voice (an `admin=true` client may delete any) |
 | logs (`--log-level`, `info`) | a line per connection opened and closed (code, reason) and per utterance not spoken; shutdown, engine death | a line per speech request refused or failed (status, why) and per voice registered or deleted; shutdown, engine death |
 | metrics | `GET /metrics` on the same port, behind the API key (with `--api-keys-file`: a client with `metrics=true`) | `GET /metrics`, behind the API key (with `--api-keys-file`: a client with `metrics=true`) |
 | audio cache (`--audio-cache-mb`, 512; `0`: off) | each sentence's first audio, by sentence, dialect, voice (its file's content) and `cfg_value` | each sentence's first audio, by sentence as read, voice (its latents and transcript), dialect, `seed`, `cfg_value` and `max_tokens` |
@@ -179,10 +179,11 @@ share a cache directory.
 `--api-keys-file` gives each client its own key and limits, in lines (or JSON, `nanovllm_voxcpm/entrypoints/clients.py`):
 
 ```
-# name    key              limits (optional)
+# name    key              limits and rights (optional)
 acme      sk-acme-7f3a...  max_streams=20 rpm=600
 beta      sk-beta-91c2...  rpm=60
 monitor   sk-prom-0d4e...  metrics=true
+ops       sk-ops-5b1f...   admin=true
 ```
 
 - `max_streams`: the client's requests at once. `rpm`: its requests a minute, a token bucket of a minute's worth.
@@ -196,6 +197,13 @@ monitor   sk-prom-0d4e...  metrics=true
   read before, and logs an error.
 - Keys are compared in constant time and never logged. Logs and `voxcpm_client_requests_total{client,outcome}` carry
   the client's name.
+- A voice registered over HTTP belongs to the client that registered it (its `owner`, kept in `--voice-dir` too, so
+  every replica knows it). Every client may speak with it, unless it was uploaded with `private=true`: then only its
+  owner and the admins may, and to every other client it does not exist (404, not in `GET /v1/audio/voices`). Only
+  its owner and the admins may delete it (others: 403). `admin=true` makes a client an admin, and so is `--api-key`'s
+  `default`; a voice with no owner (registered before `--api-keys-file`, or by `--voices`) is the admins' to delete.
+  The listing shows a client its own voices' (an admin: every voice's) `owner` and `private`. Without
+  `--api-keys-file` nothing changes: every voice is every caller's.
 
 `/metrics` is Prometheus' text format; with an API key, scrape it with the key as a bearer token
 (`authorization: {credentials: <key>}` in the scrape config). Both servers export:
