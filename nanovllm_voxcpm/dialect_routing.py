@@ -33,8 +33,10 @@ the result.
 An alias follows the tagged model's dialects.json (qatari, emirati and khaliji are gulf there; jordanian, ab and
 levantine palestinian), so "qatari" is Gulf Arabic on teacher-v3, and the qatari adapter speaks "bahraini" (the #2
 Bahraini group was measured with it). A route keyed by a name wins over one keyed by its dialect:
-``routes={**DEFAULT_ROUTES, "qatari": "qatari"}`` sends "qatari" alone to the qatari adapter. Only the adapters the
-table uses are loaded.
+``routes={**DEFAULT_ROUTES, "qatari": "qatari"}`` sends "qatari" alone to the qatari adapter. A route to ``TEACHER``
+("teacher") sends a name to the tagged model with its tag: ``{**DEFAULT_ROUTES, "egyptian": "teacher"}``. The servers'
+``--route DIALECT=ADAPTER`` / ``DIALECT=teacher`` options change the default table the same way (parse_routes). Only
+the adapters the table uses are loaded.
 
 Cost (one A10, int8, 600 KV blocks): the speed of the unrouted engine and less memory than it (5 adapters instead
 of 11, plus teacher-v3's merged MLP weights, 1 GB; README). In int8 the tagged requests run the merged int8 weights
@@ -58,6 +60,7 @@ DEFAULT_TAGGED_MODEL = "VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3"
 # dialect (or name) -> adapter
 DEFAULT_ROUTES = {"bahraini": "qatari", "egyptian": "egyptian", "saudi": "saudi", "hejazi": "hejazi"}
 ADAPTERS, TAGGED = "adapters", "tagged"
+TEACHER = "teacher"  # a route's target: the tagged model with the name's tag (no adapter is named so)
 TAGGED_ADAPTER = "@tagged"  # the tagged model's name in the engine (no adapter directory is named so)
 # the files of a tagged model a routed engine reads (not its merged weights)
 TAGGED_FILES = ["lora/*", "dialects.json", "tokenizer*", "special_tokens_map.json", "config.json"]
@@ -73,22 +76,49 @@ class Route:
 
 def route_table(adapters: list[str], tags: DialectTags, routes: dict[str, str]) -> dict[str, Route]:
     """name -> Route for every name of both models (and of ``routes``). A name is looked up in ``routes`` first, then
-    its tagged dialect (aliases resolved): found, that adapter; else the tagged model when it knows the name; else
-    the adapters model, the name being one of its adapters."""
-    unknown = sorted({a for a in routes.values() if a not in adapters})
+    its tagged dialect (aliases resolved): found, that adapter (TEACHER: the tagged model); else the tagged model when
+    it knows the name; else the adapters model, the name being one of its adapters."""
+    unknown = sorted({a for a in routes.values() if a not in adapters and a != TEACHER})
     if unknown:
-        raise ValueError(f"routes name adapters the adapters model lacks: {unknown}; adapters: {', '.join(adapters)}")
+        raise ValueError(f"routes name adapters the adapters model lacks: {unknown}; adapters: {', '.join(adapters)}"
+                         f" (or {TEACHER}: the tagged model)")
     table = {}
     for name in sorted(set(adapters) | set(tags.names) | set(routes)):
         dialect = tags.canonical(name) if name in tags.names else None
         adapter = routes.get(name, routes.get(dialect) if dialect else None)
-        if adapter is not None:
+        if adapter == TEACHER:
+            if dialect is None:
+                raise ValueError(f"routes send {name!r} to {TEACHER}, which does not speak it; its dialects: "
+                                 f"{', '.join(sorted(tags.names))}")
+            table[name] = Route(TAGGED, dialect)
+        elif adapter is not None:
             table[name] = Route(ADAPTERS, adapter)
         elif dialect is not None:
             table[name] = Route(TAGGED, dialect)
         else:
             table[name] = Route(ADAPTERS, name)
     return table
+
+
+def parse_routes(specs: list[str] | None, base: dict[str, str] | None = None) -> dict[str, str]:
+    """``base`` (DEFAULT_ROUTES) changed by ``--route`` options, each DIALECT=ADAPTER (that adapter of the adapters
+    model) or DIALECT=teacher (the tagged model, with the dialect's tag): ["najdi=najdi", "egyptian=teacher"]."""
+    routes = dict(DEFAULT_ROUTES if base is None else base)
+    for spec in specs or ():
+        name, sep, target = spec.partition("=")
+        name, target = name.strip(), target.strip()
+        if not sep or not name or not target:
+            raise ValueError(f"--route {spec!r}: DIALECT=ADAPTER or DIALECT={TEACHER}")
+        routes[name] = target
+    return routes
+
+
+def describe(table: dict[str, Route]) -> str:
+    """The table in a line for the logs: the names on adapters (name->adapter when they differ), then the tagged
+    model's count."""
+    on = [n if r.dialect == n else f"{n}->{r.dialect}" for n, r in sorted(table.items()) if r.model == ADAPTERS]
+    tagged = sum(r.model == TAGGED for r in table.values())
+    return f"adapters: {', '.join(on) or 'none'}; {TEACHER}: {tagged} names"
 
 
 def used_adapters(table: dict[str, Route]) -> list[str]:

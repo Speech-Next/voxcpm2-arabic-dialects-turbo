@@ -23,6 +23,22 @@ client.
 
 17 dialects x 40 sentences x 2 seeds. CER / WER: lower is better; UTMOS: naturalness, 1-5.
 
+## LoRA
+
+Each dialect is spoken by one LoRA: an adapter of
+[VoxCPM2-Arabic-Dialects](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Dialects), or
+[teacher-v3](https://huggingface.co/VoxCPM-Kernel/VoxCPM2-Arabic-Teacher-v3) (one LoRA for every dialect, with the
+dialect's tag). The default is the better of the two on the quality set:
+
+| dialect | default LoRA |
+|---|---|
+| egyptian, saudi, hejazi, hindi_english | its adapter |
+| bahraini | the qatari adapter |
+| msa, palestinian, lebanese, syrian, iraqi, najdi, gulf, yemeni, sudanese, libyan, tunisian, algerian, moroccan | teacher-v3 |
+| emirati, qatari, khaliji (as gulf); jordanian, ab, levantine (as palestinian) | teacher-v3 |
+
+The adapters: ab, egyptian, emirati, hejazi, hindi_english, iraqi, jordanian, najdi, palestinian, qatari, saudi.
+
 ## Usage
 
 ```bash
@@ -57,7 +73,16 @@ curl http://127.0.0.1:8092/v1/audio/speech -H 'Content-Type: application/json' \
 
 # Docker (HF_TOKEN in .env)
 cp .env.example .env && docker compose --profile http up -d
+
+# Choose a dialect's LoRA (both servers): an adapter (DIALECT=ADAPTER) or teacher-v3 (DIALECT=teacher)
+python -m nanovllm_voxcpm.entrypoints.ws_server --voice default=ahmed.wav --route najdi=najdi --route egyptian=teacher
+# The adapters only, no teacher-v3
+python -m nanovllm_voxcpm.entrypoints.openai_server --no-route
 ```
+
+In Python: `RoutedDialectTTS.load(routes={**DEFAULT_ROUTES, "najdi": "najdi", "egyptian": "teacher"})`
+(`DEFAULT_ROUTES` from `nanovllm_voxcpm.dialect_routing`), or `DialectTTS.load()` for the adapters only. Only the
+adapters in use are loaded; all 11 with teacher-v3 need `--kv-blocks 500` on an A10.
 
 Dialects: msa, egyptian, palestinian, lebanese, syrian, iraqi, saudi, najdi, hejazi, gulf, bahraini, yemeni, sudanese,
 libyan, tunisian, algerian, moroccan, hindi_english. Every option: `--help`, and [docs/details.md](docs/details.md).

@@ -50,7 +50,7 @@ dialect (``/v1/models`` lists them), whose tag token is put in front of the text
 Dialect routing (the default for a model with ``adapters/``, ``--no-route`` turns it off; see dialect_routing): the
 engine serves the adapters the routes use and ``--tagged-model``'s LoRA (teacher-v3) as one more adapter; a request's
 ``"dialect"`` (or ``"lora"``, or a dialect named as ``"model"``) picks its adapter, or teacher-v3 with the dialect's
-tag. ``/v1/models`` lists the dialects.
+tag. ``--route DIALECT=ADAPTER`` / ``DIALECT=teacher`` changes the default table. ``/v1/models`` lists the dialects.
 
 Arabic input and ref_text are read as the model was trained on them (dialect_tts.read_as: digits, dates, times, amounts
 as words; formal when the request's dialect or adapter, aliases resolved, is msa); hindi_english and text without
@@ -103,7 +103,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from nanovllm_voxcpm import warmup
 from nanovllm_voxcpm.audio_cache import AudioCache, namespace
-from nanovllm_voxcpm.dialect_routing import (DEFAULT_ROUTES, DEFAULT_TAGGED_MODEL, TAGGED, TAGGED_ADAPTER,
+from nanovllm_voxcpm.dialect_routing import (DEFAULT_TAGGED_MODEL, TAGGED, TAGGED_ADAPTER, describe, parse_routes,
                                              resolve_tagged, route_table, routed_lora_config, used_adapters)
 from nanovllm_voxcpm.dialect_tts import (DEFAULT_DIT, DEFAULT_MODEL, DialectTags, adapters_lora_config, find_adapters,
                                          read_as, resolve, speakable, turbo_config, use_model_calibration)
@@ -454,6 +454,7 @@ def audio_cache(args) -> AudioCache | None:
 
     settings = {k: getattr(args, k, None) for k in ("model", "dit", "dit_cache", "head_tokens", "inference_timesteps",
                                                      "tagged_model", "no_route", "lora_dir", "lora", "default_lora")}
+    settings["routes"] = parse_routes(getattr(args, "route", None))  # (which adapter speaks a dialect)
     return AudioCache(int(mb * 2**20), directory=getattr(args, "audio_cache_dir", None),
                       dir_max_bytes=int(getattr(args, "audio_cache_dir_mb", 0) * 2**20),
                       namespace=namespace(server="openai_server", revisions=HUB_REVISIONS, **settings))
@@ -656,12 +657,16 @@ def build_app(args: argparse.Namespace):
             lora_dir = os.path.join(model_path, "adapters")
         adapters = find_adapters(lora_dir, args.lora)
         lora_config = None
-        if not args.no_route and state["tags"] is None and args.lora_dir is None and not args.lora and adapters:
+        routing = not args.no_route and state["tags"] is None and args.lora_dir is None and not args.lora and adapters
+        if getattr(args, "route", None) and not routing:
+            raise SystemExit("--route changes the dialect routing, which --no-route, --lora-dir, --lora or a model "
+                             "without adapters/ turns off")
+        if routing:
             # dialect routing: the adapters the routes use and the tagged model's LoRA in this one engine
             tagged_path = resolve_tagged(args.tagged_model)
             with open(os.path.join(tagged_path, "dialects.json"), encoding="utf-8") as f:
                 state["tags"] = DialectTags(json.load(f))
-            state["route"] = route_table(sorted(adapters), state["tags"], DEFAULT_ROUTES)
+            state["route"] = route_table(sorted(adapters), state["tags"], parse_routes(getattr(args, "route", None)))
             adapters = {a: adapters[a] for a in used_adapters(state["route"])}
             lora_config = routed_lora_config(adapters, tagged_path, args.max_lora_rank)
             adapters[TAGGED_ADAPTER] = tagged_path
@@ -704,7 +709,8 @@ def build_app(args: argparse.Namespace):
         await warm_up_kernels()
         if args.hang_timeout and hasattr(pool, "watch_hangs"):  # (from now on: no more kernels to compile)
             pool.watch_hangs(args.hang_timeout)
-        dialects = (f"{len(state['route'])} dialects (routed), " if state["route"] is not None else
+        dialects = (f"{len(state['route'])} dialects (routed: {describe(state['route'])}), "
+                    if state["route"] is not None else
                     f"{len(state['tags'].names)} dialects (tagged model), " if state["tags"] else "")
         print(f"[server] ready: {len(state['voices'])} voices, {dialects}{len(state['adapters'])} LoRA adapters, "
               f"sample rate {state['sample_rate']}", flush=True)
@@ -1247,6 +1253,9 @@ def main():
                                            "routing, a dialect")
     ap.add_argument("--no-route", action="store_true", help="no dialect routing: every adapter of the model, no "
                                                              "tagged model (the engine before routing)")
+    ap.add_argument("--route", action="append", metavar="DIALECT=ADAPTER",
+                    help="routing: speak DIALECT with that adapter, or with teacher-v3 (DIALECT=teacher), instead of "
+                         "the default table (repeatable; nanovllm_voxcpm.dialect_routing)")
     ap.add_argument("--tagged-model", default=DEFAULT_TAGGED_MODEL, help="routing: the tagged model whose LoRA "
                                                                           "serves the routed-away dialects")
     ap.add_argument("--max-lora-rank", type=int, help="LoRA slot rank (default: the largest adapter rank)")
@@ -1280,6 +1289,12 @@ def main():
     ap.add_argument("--audio-cache-dir-mb", type=float, default=4096.0,
                     help="--audio-cache-dir's size: the files used longest ago removed beyond it")
     args = ap.parse_args()
+    if args.route and (args.no_route or args.lora_dir or args.lora):
+        ap.error("--route changes the dialect routing, which --no-route, --lora-dir and --lora turn off")
+    try:
+        parse_routes(args.route)
+    except ValueError as e:
+        ap.error(str(e))
     os.environ.setdefault("NANOVLLM_SUBMIT_FLUSH_EVERY", "4")  # requests reach the engine as a steady stream
     listener = setup_logging("openai_server", args.log_level)
     app = build_app(args)
