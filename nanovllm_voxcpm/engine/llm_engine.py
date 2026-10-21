@@ -40,12 +40,11 @@ the interface by subclassing and providing:
 - :meth:`preprocess_seq` to build model inputs from a :class:`Sequence`
 - :meth:`postprocess_seq` to update the :class:`Sequence` from runner outputs
 
-See the model packages under ``nanovllm_voxcpm/models/*`` for concrete
-implementations.
+See ``nanovllm_voxcpm/model`` (VoxCPM2) for the concrete implementation.
 
 Concrete example: VoxCPM
 ------------------------
-``nanovllm_voxcpm/models/voxcpm2/engine.py`` implements an audio generation loop
+``nanovllm_voxcpm/model/engine.py`` implements an audio generation loop
 on top of this base engine:
 
 - ``Sequence.token_ids`` is used as a hashable prefix stream (ints for text token
@@ -65,12 +64,12 @@ from collections import deque
 
 import torch.multiprocessing as mp
 
-from nanovllm_voxcpm.config import Config
-from nanovllm_voxcpm.engine.lora_manager import LoRAManager, LoRAModelPayload
+from nanovllm_voxcpm.engine.config import Config
+from nanovllm_voxcpm.lora.manager import LoRAManager, LoRAModelPayload
 from nanovllm_voxcpm.engine.sequence import Sequence
 from nanovllm_voxcpm.engine.scheduler import Scheduler
 from nanovllm_voxcpm.engine.model_runner import RunnerTask, BaseModelRunner, select_lora_payload_for_rank
-from nanovllm_voxcpm.utils import profile as _profile
+from nanovllm_voxcpm.engine import utils as _profile
 import socket
 import torch
 
@@ -333,7 +332,7 @@ class LLMEngineBase:
 
         Concrete example: VoxCPM
         ------------------------
-        See ``nanovllm_voxcpm/models/voxcpm2/engine.py``:
+        See ``nanovllm_voxcpm/model/engine.py``:
 
         - Prefill (``is_prefill=True``):
           ``RunnerTask.num_cached_tokens = seq.num_cached_tokens`` and the engine
@@ -383,7 +382,7 @@ class LLMEngineBase:
 
         Concrete example: VoxCPM
         ------------------------
-        In ``nanovllm_voxcpm/models/voxcpm2/engine.py``:
+        In ``nanovllm_voxcpm/model/engine.py``:
 
         - The runner returns ``latents`` (one patch), ``stop_flag``, and a decoded
           waveform chunk ``waveforms``.

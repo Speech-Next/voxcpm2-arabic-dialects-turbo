@@ -6,7 +6,7 @@ This project builds on the code below; those parts keep their licenses, reproduc
 |---|---|---|
 | [Nano-vLLM-VoxCPM](https://github.com/a710128/nanovllm-voxcpm) | the engine (`nanovllm_voxcpm/`) | MIT |
 | [Nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm) | the engine (`nanovllm_voxcpm/`) | MIT |
-| [vLLM](https://github.com/vllm-project/vllm) | the LoRA Triton kernels (`nanovllm_voxcpm/lora_ops/`) | Apache-2.0 |
+| [vLLM](https://github.com/vllm-project/vllm) | the LoRA Triton kernels (`nanovllm_voxcpm/lora/triton.py`) | Apache-2.0 |
 
 ## Nano-vLLM-VoxCPM and Nano-vLLM (MIT)
 

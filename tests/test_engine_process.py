@@ -1,4 +1,4 @@
-"""The engine process's link to its server (models/voxcpm2/server.py), CPU only: the engine ends with the process that
+"""The engine process's link to its server (model/server.py), CPU only: the engine ends with the process that
 started it, also when that one is killed (SIGKILL: the OOM killer, a container's stop timeout), instead of staying
 behind with the GPU; an engine command's error reaches the caller as a ValueError (the request's fault) or a
 RuntimeError without the engine's traceback."""
@@ -10,7 +10,7 @@ import textwrap
 import time
 from pathlib import Path
 
-from nanovllm_voxcpm.models.voxcpm2.server import _engine_exception
+from nanovllm_voxcpm.model.server import _engine_exception
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -21,7 +21,7 @@ PARENT = textwrap.dedent("""
 
     def engine(q_in, q_out):  # main_loop on an engine with no model: it waits for commands
         os.environ["NANOVLLM_BUSY_POLL_S"] = "0"
-        from nanovllm_voxcpm.models.voxcpm2 import server
+        from nanovllm_voxcpm.model import server
 
         class Impl:
             def __init__(self, *a, **k):
@@ -32,7 +32,7 @@ PARENT = textwrap.dedent("""
 
 
     if __name__ == "__main__":
-        from nanovllm_voxcpm.models.voxcpm2.server import _Channel
+        from nanovllm_voxcpm.model.server import _Channel
 
         ctx = mp.get_context("spawn")
         q_in, q_out = _Channel(ctx), _Channel(ctx)
@@ -87,7 +87,7 @@ def test_a_second_cancel_leaves_no_stream_behind():
 
     import numpy as np
 
-    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+    from nanovllm_voxcpm.model.server import AsyncVoxCPM2Server
 
     async def main():
         srv = object.__new__(AsyncVoxCPM2Server)
@@ -143,7 +143,7 @@ FLOOD = textwrap.dedent("""
 
 
     async def client(q_in, q_out, blocking):
-        from nanovllm_voxcpm.models.voxcpm2.server import _PipeWriter
+        from nanovllm_voxcpm.model.server import _PipeWriter
 
         loop = asyncio.get_running_loop()
         done, reader = loop.create_future(), q_out._q._reader
@@ -164,7 +164,7 @@ FLOOD = textwrap.dedent("""
 
 
     if __name__ == "__main__":
-        from nanovllm_voxcpm.models.voxcpm2.server import _Channel
+        from nanovllm_voxcpm.model.server import _Channel
 
         ctx = mp.get_context("spawn")
         q_in, q_out = _Channel(ctx), _Channel(ctx)
@@ -190,7 +190,7 @@ def _watched(open_streams: set, hang_timeout: float | None):
     import asyncio
     from types import SimpleNamespace
 
-    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+    from nanovllm_voxcpm.model.server import AsyncVoxCPM2Server
 
     class Process:
         exitcode, killed = None, False

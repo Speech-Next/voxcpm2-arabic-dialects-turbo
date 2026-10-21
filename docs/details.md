@@ -247,7 +247,7 @@ docker run -d --gpus '"device=0"' --shm-size=1g --stop-timeout 30 -p 8092:8092 -
   - `/voices`: the HTTP server's `--voice-dir`.
   - After the first download, `-e HF_HUB_OFFLINE=1` keeps a start off the Hub.
 - **GPU:**
-  - The CUDA kernels are built at `docker build` for `--build-arg CUDA_ARCH`, a list such as `8.6,8.9,9.0` (A10, L4 / RTX 4090, H100). There is no GPU at build time, so `voxcpm_kernels.cuda_ext` builds for `VOXCPM_CUDA_ARCH`; a start then loads its GPU's build without nvcc.
+  - The CUDA kernels are built at `docker build` for `--build-arg CUDA_ARCH`, a list such as `8.6,8.9,9.0` (A10, L4 / RTX 4090, H100). There is no GPU at build time, so `nanovllm_voxcpm.kernels.cuda_ext` builds for `VOXCPM_CUDA_ARCH`; a start then loads its GPU's build without nvcc.
   - Another GPU builds its own at its first start, ~2 min (nvcc is in the image).
   - One GPU per container: an A10 holds one engine. `docker-compose.yml` has a commented second replica on a second GPU.
 - **Shared memory:** the engine streams audio through 128 MiB of shared memory, so `--shm-size=1g`. Docker's default of 64 MiB is too small.
@@ -268,6 +268,19 @@ python examples/voice_clone.py --voice ahmed.wav --dialect najdi --text "هلا 
 python examples/benchmark.py                 # first audio per level (the table above)
 python examples/streaming_benchmark.py       # requests arriving at random
 ```
+
+## Code layout
+
+| path | what |
+|---|---|
+| `nanovllm_voxcpm/__init__.py` | the API: `DialectTTS`, `RoutedDialectTTS`, `VoxCPM` |
+| `dialect_tts.py`, `dialect_routing.py` | `DialectTTS` (the adapters), `RoutedDialectTTS` (each dialect's LoRA, `--route`) |
+| `arabic_text.py`, `hub.py`, `streaming.py` | the text normalizer, the pinned Hugging Face downloads, the WebSocket pacer |
+| `entrypoints/` | the WebSocket and HTTP servers, API keys, metrics, the audio cache, the warm-up |
+| `engine/` | the engine core: scheduler, KV blocks, sequences, the step loop, the model runner, its helpers |
+| `model/` | VoxCPM2: the model, its layers and VAE, its engine and runner, the engine process and its clients |
+| `lora/` | LoRA: the backend, the LoRA layers, the adapters' slots, the Triton kernels (from vLLM) |
+| `kernels/` | the Triton and CUDA kernels (int8 GEMMs, fused layers, attention, the streaming VAE) |
 
 ## Options
 

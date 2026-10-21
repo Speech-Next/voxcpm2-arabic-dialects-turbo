@@ -128,7 +128,7 @@ def used_adapters(table: dict[str, Route]) -> list[str]:
 
 def resolve_tagged(spec: str) -> str:
     """A tagged model's directory (local, or the TAGGED_FILES of a Hugging Face repo) with lora/ and dialects.json."""
-    from nanovllm_voxcpm.models.voxcpm2.lora_loader import is_tagged_adapter
+    from nanovllm_voxcpm.model.lora_loader import is_tagged_adapter
 
     path = os.path.expanduser(spec)
     if not os.path.exists(path):
@@ -149,8 +149,8 @@ def routed_lora_config(adapters: dict[str, str], tagged_path: str, max_rank: int
     """The engine's LoRAConfig for ``adapters`` (name -> directory) and the tagged model's adapter: the union of their
     target modules per LM (the tagged LoRA trains base_lm only), merged MLP weights for the adapters with MLP LoRA,
     the tags' embedding rows."""
-    from nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig
-    from nanovllm_voxcpm.models.voxcpm2.lora_loader import tagged_adapter_state
+    from nanovllm_voxcpm.model.config import LoRAConfig
+    from nanovllm_voxcpm.model.lora_loader import tagged_adapter_state
 
     state = tagged_adapter_state(tagged_path)
     cfgs = [json.load(open(os.path.join(p, "lora_config.json"), encoding="utf-8")).get("lora_config", {})

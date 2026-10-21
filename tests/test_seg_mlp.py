@@ -10,9 +10,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 
 @pytest.mark.parametrize("M", [3, 64, 200, 300])
 def test_seg_swiglu_and_down_follow_the_remap(M):
-    from voxcpm_kernels.fused_layer import _gemm, swiglu_gemm_quant, swiglu_weights
-    from voxcpm_kernels.int8_linear import W8A8Linear, quantize_rows
-    from voxcpm_kernels.seg_gemm import build_tiles, seg_gemm, seg_swiglu_gemm_quant
+    from nanovllm_voxcpm.kernels.fused_layer import _gemm, swiglu_gemm_quant, swiglu_weights
+    from nanovllm_voxcpm.kernels.int8_linear import W8A8Linear, quantize_rows
+    from nanovllm_voxcpm.kernels.seg_gemm import build_tiles, seg_gemm, seg_swiglu_gemm_quant
 
     torch.manual_seed(M)
     H, I, slots = 256, 384, 3

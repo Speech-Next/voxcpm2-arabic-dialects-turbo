@@ -82,7 +82,7 @@ def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | 
     jump to 0, t = [1.0, 0.7071, 0.0]: the 2-step student's grid (the 3-step one was trained from it and shares its
     first step); 200 requests at once: TTFB -12 ms (#31).
     dit_cache: with the original LocDiT (``dit`` None), reuse its middle layers on some solver steps ("light",
-    "medium" or a plan, see models/voxcpm2/dit_cache.py).
+    "medium" or a plan, see model/dit_cache.py).
     w8a8=False: bf16 layers (quality measurements of a model whose SmoothQuant statistics were not calibrated)."""
     cfg = {"pcm16_output": True, "head_tokens": head_tokens, "lead_silence_patches": 2,
            "stream_guard_ms": 100, "head_patches_max": 7, "mix_decode": True, "mix_heads": True, "step_cap_ms": 130,
@@ -95,7 +95,7 @@ def turbo_config(dit: str | None, head_tokens: int = 8, dit_cache: str | dict | 
         cfg["dit_checkpoint"] = resolve(dit)
         cfg["dit_first_t_span"] = [1.0, 0.7071, 0.0]
     if dit_cache:
-        from nanovllm_voxcpm.models.voxcpm2.dit_cache import plan
+        from nanovllm_voxcpm.model.dit_cache import plan
 
         cfg["dit_cache"] = plan(dit_cache)
     return cfg
@@ -134,7 +134,7 @@ def adapters_lora_config(adapters: dict[str, str], max_rank: int | None = None):
     number), the largest rank, and the targets of their ``lora_config.json`` (they must agree)."""
     if not adapters:
         return None
-    from nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig
+    from nanovllm_voxcpm.model.config import LoRAConfig
 
     keys = ("enable_lm", "enable_dit", "enable_proj", "target_modules_lm", "target_modules_dit", "target_proj_modules")
     shared, ranks = None, []

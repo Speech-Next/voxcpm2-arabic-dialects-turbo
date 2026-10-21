@@ -16,10 +16,10 @@ import numpy as np
 import pytest
 import torch
 
-import nanovllm_voxcpm.engine.lora_manager as lm
+import nanovllm_voxcpm.lora.manager as lm
 from nanovllm_voxcpm.engine.block_manager import BlockManager
 from nanovllm_voxcpm.engine.llm_engine import LLMEngineBase
-from nanovllm_voxcpm.engine.lora_manager import (
+from nanovllm_voxcpm.lora.manager import (
     LoRAManager,
     LoRAModelPayload,
     LoRARuntime,
@@ -31,7 +31,7 @@ from nanovllm_voxcpm.engine.lora_manager import (
 from nanovllm_voxcpm.engine.model_runner import HostPack, RunnerTask, expand_dit_lora_slots
 from nanovllm_voxcpm.engine.scheduler import Scheduler
 from nanovllm_voxcpm.engine.sequence import Sequence
-from nanovllm_voxcpm.utils.context import (
+from nanovllm_voxcpm.engine.utils import (
     DIT_LORA_DOMAIN,
     LM_LORA_DOMAIN,
     PROJ_LORA_DOMAIN,
@@ -39,7 +39,7 @@ from nanovllm_voxcpm.utils.context import (
     get_lora_context,
     reset_all_contexts,
 )
-from nanovllm_voxcpm.utils.seed import derive_step_seed, derive_step_seeds
+from nanovllm_voxcpm.engine.utils import derive_step_seed, derive_step_seeds
 
 DOMAINS = (LM_LORA_DOMAIN, PROJ_LORA_DOMAIN, DIT_LORA_DOMAIN)
 
@@ -209,7 +209,7 @@ BS = 4  # small KV blocks: prefixes end inside blocks, sequences span several
 
 
 def _runner(n_adapters=3, max_loras=3, graphs=False):
-    from nanovllm_voxcpm.models.voxcpm2.runner import VoxCPM2Runner
+    from nanovllm_voxcpm.model.runner import VoxCPM2Runner
 
     r = object.__new__(VoxCPM2Runner)
     r.block_size, r.world_size, r.rank = BS, 1, 0
@@ -304,7 +304,7 @@ def test_prefill_context_matches_the_per_token_loop(seed, warmup, graphs, adapte
 
 
 def _payload_tasks(rng, n, feat_dim=3, patch=2):
-    from nanovllm_voxcpm.models.voxcpm2.runner import VoxCPM2Payload
+    from nanovllm_voxcpm.model.runner import VoxCPM2Payload
 
     tasks = _tasks(rng, n)
     for t in tasks:
@@ -368,7 +368,7 @@ def _old_noise_seeds(tasks):
 
 @pytest.mark.parametrize("seed", range(3))
 def test_prefill_inputs_and_noise_seeds_match_the_per_tensor_path(seed, monkeypatch):
-    import voxcpm_kernels
+    import nanovllm_voxcpm.kernels
 
     rng = np.random.default_rng(seed)
     tasks = _payload_tasks(rng, 8)
@@ -379,7 +379,7 @@ def test_prefill_inputs_and_noise_seeds_match_the_per_tensor_path(seed, monkeypa
         seen["seed_t"] = seed_t.clone()
         return torch.zeros(len(seeds), *row_shape, dtype=dtype)
 
-    monkeypatch.setattr(voxcpm_kernels, "seeded_randn", fake_randn)
+    monkeypatch.setattr(nanovllm_voxcpm.kernels, "seeded_randn", fake_randn)
     r._run_with_inputs = lambda seqs, inputs, is_prefill, prof: seen.update(inputs=inputs)
     random.seed(seed)
     r._run(tasks, True)
@@ -632,7 +632,7 @@ class _FakeRunner:
 
 
 def _voxcpm2_engine(max_num_seqs=8, blocks=64):
-    from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
+    from nanovllm_voxcpm.model.engine import VoxCPM2Engine
 
     eng = object.__new__(VoxCPM2Engine)
     eng.n_decode_pad_frames, eng.feat_dim, eng.patch_size = 12, FEAT, PATCH
@@ -757,7 +757,7 @@ def test_steps_upload_through_one_page_locked_buffer():
 
 
 def test_a_text_twice_in_a_registration_batch_is_tokenized_once():
-    from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
+    from nanovllm_voxcpm.model.engine import VoxCPM2Engine
 
     batches, singles = [], []
 
@@ -807,8 +807,8 @@ def test_the_client_tokenizes_a_batch_with_the_engines_tokenizer():
     CJK texts and other commands are left to the engine, and the engine registers with the client's ids."""
     from tokenizers import Tokenizer
 
-    from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
-    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, _request_text
+    from nanovllm_voxcpm.model.engine import VoxCPM2Engine
+    from nanovllm_voxcpm.model.server import AsyncVoxCPM2Server, _request_text
 
     backend = _tiny_tokenizer()
     client = object.__new__(AsyncVoxCPM2Server)
@@ -836,7 +836,7 @@ def test_the_client_follows_the_engines_tokenizer_when_it_changes():
     the client gets the new one with a new version, and ids from the old one are not used (the engine tokenizes)."""
     from tokenizers import AddedToken
 
-    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, _TokenizerSync
+    from nanovllm_voxcpm.model.server import AsyncVoxCPM2Server, _TokenizerSync
 
     base, tagged = _tiny_tokenizer(), _tiny_tokenizer()
     tagged.add_special_tokens([AddedToken("<eg>", normalized=False)])
@@ -891,7 +891,7 @@ def test_a_bursts_first_flush_is_small():
     again."""
     import asyncio
 
-    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+    from nanovllm_voxcpm.model.server import AsyncVoxCPM2Server
 
     async def run():
         sent = []
@@ -916,7 +916,7 @@ def test_a_bursts_first_flush_is_small():
 def test_a_prefill_steps_first_audio_reaches_the_client_as_its_chunks():
     """Equal chunks travel through the ring as one block; the client hands each stream its own
     chunk (the same bytes, in order); chunks that differ, or a single one, keep the per-chunk items."""
-    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, _AudioRing, _block_item
+    from nanovllm_voxcpm.model.server import AsyncVoxCPM2Server, _AudioRing, _block_item
 
     ring = _AudioRing(size=1 << 16)
     try:
@@ -944,7 +944,7 @@ def _run_main_loop(monkeypatch, feed, window):
     """server.main_loop on a VoxCPM2 engine with a fake runner; ``feed(put)`` sends commands from a thread;
     ``window``: admission-window constants to override."""
     import gc
-    import nanovllm_voxcpm.models.voxcpm2.server as server
+    import nanovllm_voxcpm.model.server as server
 
     eng = _voxcpm2_engine(max_num_seqs=16)
     eng.register_voice("v", np.random.default_rng(3).standard_normal((PATCH * 4, FEAT)).astype(np.float32))
@@ -1036,7 +1036,7 @@ def test_get_by_waits_until_its_deadline_not_to_the_next_millisecond():
     import multiprocessing as mp
     import statistics
 
-    from nanovllm_voxcpm.models.voxcpm2.server import _get_by
+    from nanovllm_voxcpm.model.server import _get_by
 
     q = mp.Queue()
     for wait in (0.0003, 0.0025):

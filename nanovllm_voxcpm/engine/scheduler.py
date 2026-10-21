@@ -67,7 +67,7 @@ returned sequences via the model runner. Model-specific postprocessing sets
 
 from collections import deque
 
-from nanovllm_voxcpm.config import Config
+from nanovllm_voxcpm.engine.config import Config
 from nanovllm_voxcpm.engine.sequence import Sequence, SequenceStatus
 from nanovllm_voxcpm.engine.block_manager import BlockManager
 
@@ -81,7 +81,7 @@ _RIDE_MARGIN = 0.15
 
 def _by_adapter(seqs: list[Sequence]) -> list[Sequence]:
     """A step's sequences grouped by LoRA adapter (stable; base-model sequences last): every adapter's rows are
-    one contiguous segment, which the segmented GEMMs of merged adapter weights (voxcpm_kernels.seg_gemm) need.
+    one contiguous segment, which the segmented GEMMs of merged adapter weights (nanovllm_voxcpm.kernels.seg_gemm) need.
     Base rows last: a CUDA graph's padding rows (base, -1) then extend the base segment instead of adding one, so a
     step with base rows and all max_loras adapters stays within the captured max_loras + 1 segments (2x for CFG)."""
     if len(seqs) < 2 or all(seq.adapter_id is None for seq in seqs):

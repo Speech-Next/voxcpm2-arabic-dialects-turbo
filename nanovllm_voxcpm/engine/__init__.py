@@ -17,5 +17,5 @@ memory management, and execution.
 Reference implementation
 ------------------------
 For a complete, working example of how to plug a model family into this runtime,
-see ``nanovllm_voxcpm/models/voxcpm``.
+see ``nanovllm_voxcpm/model`` (VoxCPM2).
 """

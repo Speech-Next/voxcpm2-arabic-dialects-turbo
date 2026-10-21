@@ -13,11 +13,11 @@ import torch
 
 from nanovllm_voxcpm.engine.block_manager import BlockManager
 from nanovllm_voxcpm.engine.llm_engine import LLMEngineBase
-from nanovllm_voxcpm.engine.lora_manager import LoRAManager
+from nanovllm_voxcpm.lora.manager import LoRAManager
 from nanovllm_voxcpm.engine.model_runner import BaseModelRunner, RunnerTask, expand_dit_lora_slots
 from nanovllm_voxcpm.engine.scheduler import Scheduler, _by_adapter
 from nanovllm_voxcpm.engine.sequence import Sequence, SequenceStatus
-from nanovllm_voxcpm.utils.context import DIT_LORA_DOMAIN, LM_LORA_DOMAIN, LoRAContext, reset_all_contexts
+from nanovllm_voxcpm.engine.utils import DIT_LORA_DOMAIN, LM_LORA_DOMAIN, LoRAContext, reset_all_contexts
 
 
 def _config(max_num_seqs=4, blocks=64, block_size=4, max_tokens=4096):
@@ -62,7 +62,7 @@ def _padded(slots, rows):
 
 
 def test_mixed_batch_with_base_and_all_adapters_fits_the_captured_segments():
-    from voxcpm_kernels.seg_gemm import SegTables
+    from nanovllm_voxcpm.kernels.seg_gemm import SegTables
 
     sample_slots, graph_bs = _mixed_step()
     max_bs = 32  # the domain buffers' rows: the largest captured batch
@@ -88,7 +88,7 @@ def test_mixed_batch_with_base_and_all_adapters_fits_the_captured_segments():
 @pytest.mark.parametrize("bm", [64, 128])
 def test_captured_grid_covers_every_row_with_its_weight(bm):
     """The graph's grid (max_tiles over the replayed rows) reaches every row of the base-last layout."""
-    from voxcpm_kernels.seg_gemm import build_tiles, max_tiles
+    from nanovllm_voxcpm.kernels.seg_gemm import build_tiles, max_tiles
 
     sample_slots, graph_bs = _mixed_step()
     max_bs = 32
@@ -120,7 +120,7 @@ class _FakeEvent:
 
 
 def test_seg_tables_wait_for_the_staging_copy_and_reset_to_base(monkeypatch):
-    import voxcpm_kernels.seg_gemm as sg
+    import nanovllm_voxcpm.kernels.seg_gemm as sg
 
     _FakeEvent.made = []
     monkeypatch.setattr(sg.torch.cuda, "Event", _FakeEvent)
@@ -143,7 +143,7 @@ def test_seg_tables_wait_for_the_staging_copy_and_reset_to_base(monkeypatch):
 
 
 def test_graph_lora_context_resets_the_tables_of_a_domain_without_adapters(monkeypatch):
-    import voxcpm_kernels.seg_gemm as sg
+    import nanovllm_voxcpm.kernels.seg_gemm as sg
 
     calls = []
 
@@ -676,7 +676,7 @@ FEAT, PATCH = 4, 2
 
 
 def _voxcpm2_engine(max_model_len=64, max_num_seqs=4):
-    from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
+    from nanovllm_voxcpm.model.engine import VoxCPM2Engine
 
     eng = object.__new__(VoxCPM2Engine)
     eng.n_decode_pad_frames, eng.feat_dim, eng.patch_size = 12, FEAT, PATCH
@@ -937,7 +937,7 @@ def test_a_paced_stream_s_leading_silence_goes_out_when_its_front_would_run_dry(
 
 
 def test_the_engine_s_counting_pacer_keeps_the_real_one_s_times():
-    from nanovllm_voxcpm.models.voxcpm2.engine import _ByteCount
+    from nanovllm_voxcpm.model.engine import _ByteCount
     from nanovllm_voxcpm.streaming import ChunkPacer
 
     real, counted = (ChunkPacer(4096, 32000, alpha=0.9, alpha_last=0.92, reserve_ms=1000.0, min_gap_ms=8.0)
@@ -1076,7 +1076,7 @@ def test_muted_leading_silence_holds_back_no_new_request(monkeypatch):
     """#47: a front without pacing (the HTTP server, the library) gets nothing while its stream's leading silence is
     muted; stream_guard_ms took that for a player running dry and held every new request back until the sound
     began (24 steps instead of 1 behind 30 silent patches)."""
-    from nanovllm_voxcpm.models.voxcpm2 import engine as em
+    from nanovllm_voxcpm.model import engine as em
 
     clock = [1000.0]
     monkeypatch.setattr(em, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
@@ -1119,7 +1119,7 @@ def test_cancel_while_the_head_ends_also_cancels_its_continuation():
 
 
 def test_overwritten_audio_fails_the_stream_and_cancels_it():
-    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+    from nanovllm_voxcpm.model.server import AsyncVoxCPM2Server
 
     async def scenario():
         srv = object.__new__(AsyncVoxCPM2Server)
@@ -1189,7 +1189,7 @@ def test_register_lora_rolls_back_the_runner_when_the_manager_refuses():
 
 
 def test_cuda_ext_failure_is_cached_and_reported_without_a_message(monkeypatch, capsys):
-    from voxcpm_kernels import cuda_ext
+    from nanovllm_voxcpm.kernels import cuda_ext
 
     attempts = []
 
@@ -1238,7 +1238,7 @@ def test_turbo_config_rejects_unknown_keys_and_accepts_the_repos_own():
     from pydantic import ValidationError
 
     from nanovllm_voxcpm.dialect_tts import turbo_config
-    from nanovllm_voxcpm.models.voxcpm2.config import TurboConfig
+    from nanovllm_voxcpm.model.config import TurboConfig
 
     with pytest.raises(ValidationError):
         TurboConfig.model_validate_json('{"head_token": 8}')
@@ -1296,7 +1296,7 @@ def test_head_and_stage_splits_are_unchanged_by_the_shared_scan():
 
     from tokenizers import Tokenizer, models, normalizers
 
-    from nanovllm_voxcpm.models.voxcpm2.engine import RegisteredVoice, VoxCPM2Engine
+    from nanovllm_voxcpm.model.engine import RegisteredVoice, VoxCPM2Engine
 
     tokenizers = []
     snaps = glob.glob(os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
@@ -1373,7 +1373,7 @@ def test_a_cancel_in_the_admission_window_waits_for_the_step():
 def test_only_the_last_patch_audio_is_kept():
     # each patch's audio is a row of its step's page-locked buffer: kept for the whole stream, every step's buffer
     # stayed alive as long as any of its streams
-    from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine, VoxCPM2SeqPayload
+    from nanovllm_voxcpm.model.engine import VoxCPM2Engine, VoxCPM2SeqPayload
 
     eng = object.__new__(VoxCPM2Engine)
     eng.n_decode_pad_frames, eng.feat_dim, eng.lead_silence_patches = 12, 4, -1
@@ -1391,7 +1391,7 @@ def test_only_the_last_patch_audio_is_kept():
 def test_text_ids_past_the_vocabulary_are_the_requests_fault():
     # "<|fim_suffix|>" typed in a text: the tokenizer's added special token 73449, past the model's 73448 embedding
     # rows; its lookup was a device-side assert that ended the engine process and every stream with it
-    from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
+    from nanovllm_voxcpm.model.engine import VoxCPM2Engine
 
     eng = object.__new__(VoxCPM2Engine)
     eng.vocab_size, eng.head_tokens = 10, 0
@@ -1405,8 +1405,8 @@ def test_text_ids_past_the_vocabulary_are_the_requests_fault():
 
 def test_layers_with_the_same_rope_settings_share_one_table():
     # each of the 52 rotary layers built its own [32768, 128] fp32 cos and sin: 1.6 GiB of GPU memory, all equal
-    from nanovllm_voxcpm.models.voxcpm2.model import MiniCPMLongRoPE
-    from nanovllm_voxcpm.models.voxcpm2.model_utils import build_rope_cos_sin_cache
+    from nanovllm_voxcpm.model.model import MiniCPMLongRoPE
+    from nanovllm_voxcpm.model.utils import build_rope_cos_sin_cache
 
     long = [1.0 + i / 8 for i in range(4)]
     a, b = (MiniCPMLongRoPE(8, 8, 64, 10000.0, [1.0] * 4, long, 32) for _ in range(2))

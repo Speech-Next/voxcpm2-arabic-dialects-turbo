@@ -15,8 +15,8 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
 def _tiny_layer():
-    from nanovllm_voxcpm.models.voxcpm2.config import MiniCPM4Config, RopeScalingConfig
-    from nanovllm_voxcpm.models.voxcpm2.model import Cpm4DecoderLayer
+    from nanovllm_voxcpm.model.config import MiniCPM4Config, RopeScalingConfig
+    from nanovllm_voxcpm.model.model import Cpm4DecoderLayer
 
     rope = RopeScalingConfig(type="longrope", long_factor=[1.0] * 64, short_factor=[1.0] * 64,
                              original_max_position_embeddings=64)
@@ -30,7 +30,7 @@ def _tiny_layer():
 def test_int8_layer_refuses_an_attention_bias_its_kernels_would_drop():
     """o_proj's int8 GEMM fuses the residual and adds no bias (the adapters' segmented one dropped it): such a layer
     is refused when it is quantized, not run with a wrong output. A q/k/v bias without adapters is applied."""
-    from voxcpm_kernels.fused_layer import FusedCpm4Layer
+    from nanovllm_voxcpm.kernels.fused_layer import FusedCpm4Layer
 
     layer = _tiny_layer()
     assert FusedCpm4Layer(layer, True, 512, "plain").q8 is not None
@@ -80,8 +80,8 @@ def test_int8_gemm_epilogues_match_the_dequantized_product(M):
     GEMM's row quantization, and qkv with bias, the LoRA addend and RoPE on the q/k heads: each against the fp32
     product of the dequantized int8 operands (the int32 accumulation is exact; what differs is the output's
     rounding)."""
-    from voxcpm_kernels.fused_layer import _gemm, qkv_rope_gemm, rope_weights, swiglu_gemm_quant, swiglu_weights
-    from voxcpm_kernels.int8_linear import W8A8Linear, quantize_rows, w8a8_gemm
+    from nanovllm_voxcpm.kernels.fused_layer import _gemm, qkv_rope_gemm, rope_weights, swiglu_gemm_quant, swiglu_weights
+    from nanovllm_voxcpm.kernels.int8_linear import W8A8Linear, quantize_rows, w8a8_gemm
 
     torch.manual_seed(M)
     H, I, heads, kv = 2048, 6144, 16, 2
@@ -121,9 +121,9 @@ def test_int8_gemm_epilogues_match_the_dequantized_product(M):
 def test_segmented_qkv_rope_and_residual_gemms_take_each_segment_s_weights(M):
     """The adapters' segmented GEMMs (rows grouped by adapter, one merged int8 weight per slot): qkv with RoPE and
     the o GEMM with the residual, each segment against the fp32 product with its own weights."""
-    from voxcpm_kernels.fused_layer import rope_weights
-    from voxcpm_kernels.int8_linear import W8A8Linear, quantize_rows
-    from voxcpm_kernels.seg_gemm import build_tiles, seg_gemm, seg_qkv_rope_gemm
+    from nanovllm_voxcpm.kernels.fused_layer import rope_weights
+    from nanovllm_voxcpm.kernels.int8_linear import W8A8Linear, quantize_rows
+    from nanovllm_voxcpm.kernels.seg_gemm import build_tiles, seg_gemm, seg_qkv_rope_gemm
 
     torch.manual_seed(M)
     H, n_qkv, n_rope = 1024, 2560, 18
@@ -181,7 +181,7 @@ def _check_quant(out, ref, what):
 def test_paged_prefill_attention_over_a_cached_prefix(quant):
     """Prefill of new tokens after a cached prefix, K/V read through scattered 256-token pages: a sequence without
     prefix, one with 293 cached tokens (two pages), one single-token prefill after 260."""
-    from voxcpm_kernels.prefill_attn import paged_prefill_attention
+    from nanovllm_voxcpm.kernels.prefill_attn import paged_prefill_attention
 
     torch.manual_seed(1)
     H, HK, D, page = 16, 2, 128, 256
@@ -212,7 +212,7 @@ def test_paged_prefill_attention_over_a_cached_prefix(quant):
 def test_short_attention_kernels(quant):
     """A burst's short causal prefills (1-32 tokens per sequence, packed) and the non-causal attention of short rows
     (LocEnc / LocDiT, <= 16 tokens), against the plain softmax attention."""
-    from voxcpm_kernels.short_attn import short_attention, short_causal_attention
+    from nanovllm_voxcpm.kernels.short_attn import short_attention, short_causal_attention
 
     torch.manual_seed(2)
     H, HK, D = 16, 2, 128
@@ -240,7 +240,7 @@ def test_short_attention_kernels(quant):
 @CUDA
 def test_kv_store_writes_each_token_to_its_slot():
     """The decode path's KV store (flash-attn reads the pages): each row lands at its slot; slot -1 is skipped."""
-    from nanovllm_voxcpm.layers.attention import store_kvcache
+    from nanovllm_voxcpm.model.layers import store_kvcache
 
     torch.manual_seed(3)
     HK, D, page = 2, 128, 256
@@ -277,7 +277,7 @@ def _stream(op, x, chunks, idx):
 
 
 def _ext(name):
-    from voxcpm_kernels.cuda_ext import available
+    from nanovllm_voxcpm.kernels.cuda_ext import available
 
     if not available(name):
         pytest.skip(f"CUDA extension {name} not built")
@@ -291,8 +291,8 @@ def test_cuda_residual_unit_matches_the_module(C, dilation):
     """cuda/resunit_fused.cu (snake, dilated depthwise conv, snake, 1x1 conv on tensor cores, residual) streamed in
     3 chunks on slots 2 and 0, against the module's forward over the whole input in fp32."""
     _ext("resunit_fused")
-    from nanovllm_voxcpm.layers.audio_vae_v2 import CausalResidualUnit
-    from voxcpm_kernels.resunit import CudaResidualUnit
+    from nanovllm_voxcpm.model.vae import CausalResidualUnit
+    from nanovllm_voxcpm.kernels.resunit import CudaResidualUnit
 
     torch.manual_seed(C + dilation)
     mod = _plain(CausalResidualUnit(C, dilation=dilation, groups=C))  # depthwise, as the decoder's
@@ -308,8 +308,8 @@ def test_cuda_output_head_matches_the_module():
     """cuda/head_fused.cu (snake -> 32 -> 1 channel causal conv, kernel 7 -> tanh), streamed in 4 chunks, against
     the modules over the whole input in fp32."""
     _ext("head_fused")
-    from nanovllm_voxcpm.layers.audio_vae_v2 import CausalConv1d, Snake1d
-    from voxcpm_kernels.resunit import SnakeConvTanhHead
+    from nanovllm_voxcpm.model.vae import CausalConv1d, Snake1d
+    from nanovllm_voxcpm.kernels.resunit import SnakeConvTanhHead
 
     torch.manual_seed(4)
     snake, conv = Snake1d(32).cuda().half(), CausalConv1d(32, 1, kernel_size=7, padding=3).cuda().half()
@@ -329,8 +329,8 @@ def test_fused_snake_transposed_conv_matches_the_modules(c_in, stride, t):
     """The decoder blocks' snake + causal transposed conv (tconv.py; the VAE's widths and strides, a latent chunk's
     input length and a one-frame chunk at the first block), streamed in 3 chunks of ``t`` steps, against the modules
     over the whole input in fp32."""
-    from nanovllm_voxcpm.layers.audio_vae_v2 import CausalTransposeConv1d, Snake1d
-    from voxcpm_kernels.tconv import FusedSnakeTransposeConv
+    from nanovllm_voxcpm.model.vae import CausalTransposeConv1d, Snake1d
+    from nanovllm_voxcpm.kernels.tconv import FusedSnakeTransposeConv
 
     torch.manual_seed(c_in + t)
     snake = Snake1d(c_in).cuda().half()
@@ -349,8 +349,8 @@ def test_slot_streaming_decoder_matches_the_whole_decode():
     """The engine's slot-streaming VAE decoder (fused kernels, the model's config: 2048 -> 32 channels, strides 8 6 5
     2 2 2, sample-rate conditioning), two streams decoded in 4-frame chunks plus a 1-frame one, against the decoder
     module over the whole latent sequence in fp32."""
-    from nanovllm_voxcpm.layers.audio_vae_v2 import AudioVAEConfigV2, AudioVAEV2
-    from voxcpm_kernels import SlotStreamingVAEDecoder
+    from nanovllm_voxcpm.model.vae import AudioVAEConfigV2, AudioVAEV2
+    from nanovllm_voxcpm.kernels import SlotStreamingVAEDecoder
 
     torch.manual_seed(5)
     cfg = AudioVAEConfigV2(encoder_dim=128, encoder_rates=[2, 5, 8, 8], latent_dim=64, decoder_dim=2048,

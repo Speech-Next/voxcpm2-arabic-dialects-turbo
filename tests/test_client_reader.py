@@ -7,7 +7,7 @@ import multiprocessing as mp
 import os
 import threading
 
-from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, _Channel
+from nanovllm_voxcpm.model.server import AsyncVoxCPM2Server, _Channel
 
 
 class _NonBlockingReaderLoop(asyncio.SelectorEventLoop):

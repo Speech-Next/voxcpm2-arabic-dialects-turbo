@@ -22,7 +22,7 @@ GPU inputs:
 BaseModelRunner
 ---------------
 :class:`BaseModelRunner` owns the actual ``torch.nn.Module`` and the KV-cache
-tensors stored inside causal :class:`~nanovllm_voxcpm.layers.attention.Attention`
+tensors stored inside causal :class:`~nanovllm_voxcpm.model.layers.Attention`
 modules. Key responsibilities:
 
 - Initialize NCCL process group and set the CUDA device for the current rank.
@@ -30,7 +30,7 @@ modules. Key responsibilities:
 - Allocate the KV-cache block pool based on available GPU memory and
   ``gpu_memory_utilization``.
 - Prepare attention metadata ("context") for flash-attn kernels via
-  :func:`nanovllm_voxcpm.utils.context.set_context`.
+  :func:`nanovllm_voxcpm.engine.utils.set_context`.
   * Prefill context supports prefix caching by distinguishing query length
     (new tokens) vs key length (full context).
   * Decode context writes one token per sequence into the KV cache.
@@ -58,7 +58,7 @@ Concrete model families subclass :class:`BaseModelRunner` and implement:
 
 Concrete example: VoxCPM
 ------------------------
-``nanovllm_voxcpm/models/voxcpm2/runner.py`` shows a typical implementation:
+``nanovllm_voxcpm/model/runner.py`` shows a typical implementation:
 
 - Prefill: the engine slices away ``num_cached_tokens`` and sends the remaining
   prompt segment (text tokens + audio features + masks) to the runner.
@@ -80,13 +80,13 @@ import tempfile
 import numpy as np
 import torch
 
-from nanovllm_voxcpm.utils import profile as _profile
+from nanovllm_voxcpm.engine import utils as _profile
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
-from nanovllm_voxcpm.config import Config
-from nanovllm_voxcpm.engine.lora_manager import (
+from nanovllm_voxcpm.engine.config import Config
+from nanovllm_voxcpm.lora.manager import (
     LoRAModelPayload,
     LoRARuntime,
     build_lora_context_from_batch_plan,
@@ -94,10 +94,10 @@ from nanovllm_voxcpm.engine.lora_manager import (
     materialize_lora_context,
     stage_lora_context,
 )
-from nanovllm_voxcpm.layers.attention import Attention
-from nanovllm_voxcpm.layers.lora import iter_lora_modules
-from nanovllm_voxcpm.lora import is_available as is_lora_available
-from nanovllm_voxcpm.utils.context import (
+from nanovllm_voxcpm.model.layers import Attention
+from nanovllm_voxcpm.lora.layers import iter_lora_modules
+from nanovllm_voxcpm.lora.backend import is_available as is_lora_available
+from nanovllm_voxcpm.engine.utils import (
     DIT_LORA_DOMAIN,
     LM_LORA_DOMAIN,
     PROJ_LORA_DOMAIN,
@@ -591,7 +591,7 @@ class BaseModelRunner:
             fused.refresh_lora(slot_id, payload)
 
     def _fused_lora_layers(self) -> list:
-        """Fused decoder layers holding merged per-adapter weights (voxcpm_kernels FusedCpm4Layer.stacks)."""
+        """Fused decoder layers holding merged per-adapter weights (nanovllm_voxcpm.kernels FusedCpm4Layer.stacks)."""
         cache = getattr(self, "_fused_lora_cache", None)
         if cache is None:
             model = getattr(self, "model", None)
@@ -1101,7 +1101,7 @@ class BaseModelRunner:
     def _set_graph_lora_context(self, graph_vars: dict, domain: str, context: LoRAContext) -> None:
         self._copy_lora_domain_to_graph_vars(graph_vars, domain, context)
         if self._fused_lora_layers():  # segmented GEMMs' tile tables for this step
-            from voxcpm_kernels.seg_gemm import SEG_TABLES
+            from nanovllm_voxcpm.kernels.seg_gemm import SEG_TABLES
 
             rows = graph_vars["lora_domains"][domain]["token_to_slot"].numel()
             if context.no_lora_flag:  # a LoRA graph replayed for another domain's adapters reads these tables too
@@ -1161,7 +1161,7 @@ class BaseModelRunner:
         graph_bs_candidates = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16)) + [max_bs]
         self.graph_bs = sorted({bs for bs in graph_bs_candidates if 1 <= bs <= max_bs})
         if self._fused_lora_layers():  # static tile tables of the segmented GEMMs, before any capture
-            from voxcpm_kernels.seg_gemm import SEG_TABLES
+            from nanovllm_voxcpm.kernels.seg_gemm import SEG_TABLES
 
             SEG_TABLES.reserve(LM_LORA_DOMAIN, max_bs, max_lora_buckets)
             SEG_TABLES.reserve(DIT_LORA_DOMAIN, max_dit_lora_rows, max_lora_buckets,

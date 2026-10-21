@@ -41,7 +41,7 @@ management never touches model tensors directly.
 
 Concrete example: VoxCPM
 ------------------------
-The VoxCPM implementation under ``nanovllm_voxcpm/models/voxcpm`` uses
+The VoxCPM2 implementation under ``nanovllm_voxcpm/model`` uses
 ``Sequence.token_ids`` primarily for *prefix caching* rather than for feeding the
 model:
 

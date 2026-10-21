@@ -2,8 +2,8 @@
 import pytest
 import torch
 
-from nanovllm_voxcpm.layers import audio_vae_v2
-from nanovllm_voxcpm.layers.audio_vae_v2 import AudioVAEConfigV2, AudioVAEV2
+from nanovllm_voxcpm.model import vae as audio_vae_v2
+from nanovllm_voxcpm.model.vae import AudioVAEConfigV2, AudioVAEV2
 
 
 @pytest.fixture
