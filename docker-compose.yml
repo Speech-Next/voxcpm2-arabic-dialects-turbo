@@ -1,4 +1,4 @@
-# One server per GPU (an A10 holds one engine, ~21 GB), README "Docker":
+# One server per GPU (an A10 holds one engine, ~21 GB), docs/details.md "Docker":
 #   cp .env.example .env            (HF_TOKEN, VOXCPM_API_KEY, COMPOSE_PROFILES)
 #   docker compose build
 #   docker compose --profile http up -d     the HTTP server on :8092

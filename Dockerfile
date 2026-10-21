@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Either server, one GPU per container (README, Docker):
+# Either server, one GPU per container (docs/details.md, Docker):
 #   docker build -t voxcpm2-turbo --build-arg CUDA_ARCH=8.6 .
 #   docker run -d --gpus '"device=0"' --shm-size=1g --stop-timeout 30 -p 8092:8092 -e HF_TOKEN -e VOXCPM_API_KEY \
 #     -v voxcpm-cache:/cache -v voxcpm-voices:/voices voxcpm2-turbo http --max-streams 150 --voice-dir /voices
