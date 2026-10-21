@@ -15,8 +15,8 @@ from collections.abc import Callable, Iterator
 
 CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 OUTCOMES = ("ok", "client_error", "server_error", "busy", "limited", "cancelled")
-# time to first audio, seconds: the engine's is 25-100 ms up to 150 streams at once (README), a paced first chunk
-# 150 ms later
+# time to first audio, seconds: the engine's is 25-150 ms up to 150 streams at once (README), a paced first chunk
+# --pace-start-ms later
 FIRST_AUDIO_BUCKETS = (0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1.0, 2.0, 5.0)
 
 
