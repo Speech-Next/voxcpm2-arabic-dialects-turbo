@@ -14,23 +14,26 @@ One NVIDIA A10 (24 GB), default settings.
 
 | requests at once | TTFA p99 | TTFB p95 | TTFB max | stalls | underruns |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 24-29 ms | 178-185 ms | 178-185 ms | 0 | 0 |
-| 10 | 29-36 ms | 187-195 ms | 187-196 ms | 0 | 0 |
-| 40 | 58-70 ms | 219-239 ms | 219-245 ms | 0 | 0 |
-| 80 | 69-73 ms | 241-256 ms | 241-256 ms | 0 | 0 |
-| 100 | 76-81 ms | 257-270 ms | 257-270 ms | 0 | 0 |
-| 150 | 94-148 ms | 275-330 ms | 288-330 ms | 0 | 0 |
+| 1 | 27-29 ms | 30-33 ms | 30-33 ms | 0 | 0 |
+| 10 | 36-71 ms | 45-76 ms | 45-76 ms | 0 | 0 |
+| 40 | 58-81 ms | 73-97 ms | 74-108 ms | 0 | 0 |
+| 80 | 85-104 ms | 111-155 ms | 112-156 ms | 0 | 0 |
+| 100 | 99-126 ms | 119-180 ms | 119-181 ms | 0 | 0 |
+| 150 | 131-160 ms | 165-228 ms | 166-253 ms | 0 | 0 |
 
-Three runs (both scripts of the dataset), the range over the runs, without the audio cache (`--audio-cache-mb 0`).
-The script prints no p99 for TTFB; its max is the upper bound. Results and the check against the server's own timestamps:
+Four runs (three of the underruns script, one of the original), a fresh server each, the range over the runs,
+without the audio cache (`--audio-cache-mb 0`). The script prints no p99 for TTFB; its max is the upper bound.
+Earlier results (with the 150 ms first-chunk hold) and their check against the server's own timestamps:
 [`results/`](https://huggingface.co/datasets/VoxCPM-Kernel/benchmark-test-data-ar/tree/main/results).
 
 - TTFA: time to first audio, from the text arriving at the server to the engine's first audio (server side).
 - TTFB: time to the first 4096-byte chunk (128 ms of audio) at the client, as the benchmark measures it. The server
-  holds the first chunk 150 ms (`--pace-start-ms`); this buys the engine the time for no stalls.
+  sends the first chunk as soon as it is complete. `--pace-start-ms 150` (the default until #79) holds it 150 ms:
+  TTFB 150 ms later, and with the same stalls (0) and quality (Whisper CER / WER, UTMOS at 100 and 150 at once, #79).
 - Stalls: gaps between two chunks longer than one chunk's audio. Underruns: a player starting at the first chunk
   runs dry for more than 50 ms.
-- 150 requests at once is the limit of one A10: at 200 at once there were 24-84 stalls per run (no underruns).
+- 150 requests at once is the limit of one A10: at 200 at once there were 24-84 stalls per run (no underruns; measured
+  with the 150 ms hold).
 
 **First audio of the engine** (`python examples/benchmark.py`, no network, p99 of 3 runs):
 
@@ -292,7 +295,7 @@ python examples/streaming_benchmark.py       # requests arriving at random
 | engine | `RoutedDialectTTS`: each dialect on its best model | `DialectTTS` / `--no-route`: the adapters only |
 | LocDiT (`dit=`, `--dit`) | distilled, 3 steps | `None` / `none`: the model's own, 10 steps (slower) |
 | precision | int8 | `--precision bf16` (benchmark.py) |
-| first chunk delay (ws_server) | `--pace-start-ms 150` | `0`: TTFB p99 0.20-0.22 s at 150 at once, rare stalls |
+| first chunk delay (ws_server) | `--pace-start-ms 0` | `150`: the first chunk 150 ms later, more time for the engine (the default until #79) |
 
 ## License
 
